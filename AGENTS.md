@@ -34,3 +34,15 @@
 - For non-trivial changes, prefer:
   `planning-and-task-breakdown`, `incremental-implementation`,
   `test-driven-development`, and `code-review-and-quality`.
+
+## Reasoning Effort Selection
+
+- Keep routine, narrow tasks on the default reasoning effort. Do not ask the
+  user to switch modes for ordinary edits, UI wiring, validation, or simple
+  glue code.
+- For complex algorithms, API integrations, performance work, difficult
+  debugging, or broad multi-file changes, tell the user that the task looks
+  complex and suggest Plan Mode or `--profile deep` before implementation.
+- If a task starts simple but turns into architectural work, pause briefly and
+  tell the user that higher reasoning effort would be useful instead of
+  continuing silently.
