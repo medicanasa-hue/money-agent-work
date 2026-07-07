@@ -38,3 +38,6 @@ streamlit.log
 /docs/superpowers
 .understand-anything
 graphify-out/
+.codex/
+NEXT_CODEX_HANDOFF.md
+OpenMontage/
