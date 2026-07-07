@@ -71,6 +71,7 @@ def _normalize_entry(entry: dict[str, Any]) -> dict[str, Any]:
     normalized.setdefault("materials", [])
     normalized.setdefault("material_attributions", None)
     normalized.setdefault("metadata", None)
+    normalized.setdefault("viral_analysis", None)
     normalized.setdefault("cooldown", None)
     normalized.setdefault("pending_uploads", None)
     normalized.setdefault("error", "")

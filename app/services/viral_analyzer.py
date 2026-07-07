@@ -12,6 +12,7 @@ MAX_ANALYSIS_SUBJECT_LENGTH = 500
 MAX_ANALYSIS_SCRIPT_LENGTH = 8000
 MAX_ANALYSIS_TITLE_LENGTH = 200
 MAX_ANALYSIS_LANGUAGE_LENGTH = 64
+MAX_ANALYSIS_CONTEXT_LENGTH = 500
 
 
 def _clamp_text(value: Any, max_length: int) -> str:
@@ -54,6 +55,33 @@ def _normalize_string_list(value: Any, limit: int = 5, max_length: int = 140) ->
         if len(result) >= limit:
             break
     return result
+
+
+def _normalize_hashtag_context(value: Any) -> str:
+    hashtags = _normalize_string_list(value, limit=12, max_length=40)
+    return " ".join(hashtags)
+
+
+def _normalize_material_context(value: Any) -> str:
+    if not isinstance(value, (list, tuple)):
+        return ""
+
+    lines = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        parts = [
+            _clamp_text(item.get("title"), 100),
+            _clamp_text(item.get("attribution"), 120),
+            _clamp_text(item.get("license"), 80),
+            _clamp_text(item.get("provider"), 60),
+        ]
+        line = " | ".join(part for part in parts if part)
+        if line:
+            lines.append(line)
+        if len(lines) >= 5:
+            break
+    return _clamp_text("; ".join(lines), MAX_ANALYSIS_CONTEXT_LENGTH)
 
 
 def _normalize_platforms(platforms: list[str] | tuple[str, ...] | str | None) -> list[str]:
@@ -132,6 +160,11 @@ def build_viral_analysis_prompt(
     video_duration_sec: int | float | None = None,
     target_platforms: list[str] | tuple[str, ...] | str | None = None,
     language: str = "auto",
+    social_caption: str = "",
+    hashtags: list[str] | tuple[str, ...] | str | None = None,
+    material_attributions: (
+        list[dict[str, Any]] | tuple[dict[str, Any], ...] | None
+    ) = None,
 ) -> str:
     subject = _clamp_text(video_subject, MAX_ANALYSIS_SUBJECT_LENGTH)
     script = _clamp_text(video_script, MAX_ANALYSIS_SCRIPT_LENGTH)
@@ -139,6 +172,9 @@ def build_viral_analysis_prompt(
     language = _clamp_text(language or "auto", MAX_ANALYSIS_LANGUAGE_LENGTH) or "auto"
     platforms = _normalize_platforms(target_platforms)
     duration = video_duration_sec or "unknown"
+    social_caption = _clamp_text(social_caption, MAX_ANALYSIS_CONTEXT_LENGTH)
+    hashtags_text = _normalize_hashtag_context(hashtags)
+    material_context = _normalize_material_context(material_attributions)
 
     return f"""
 # Role: Short-Video Pre-Publish Analyst
@@ -173,6 +209,9 @@ Title: {title}
 Duration seconds: {duration}
 Target platforms: {", ".join(platforms)}
 Language: {language}
+Social caption: {social_caption or "none"}
+Hashtags: {hashtags_text or "none"}
+Material credits: {material_context or "none"}
 
 Script:
 {script}
@@ -314,6 +353,11 @@ def analyze_viral_potential(
     video_duration_sec: int | float | None = None,
     target_platforms: list[str] | tuple[str, ...] | str | None = None,
     language: str = "auto",
+    social_caption: str = "",
+    hashtags: list[str] | tuple[str, ...] | str | None = None,
+    material_attributions: (
+        list[dict[str, Any]] | tuple[dict[str, Any], ...] | None
+    ) = None,
 ) -> dict[str, Any]:
     platforms = _normalize_platforms(target_platforms)
     subject = _clamp_text(video_subject, MAX_ANALYSIS_SUBJECT_LENGTH)
@@ -327,6 +371,9 @@ def analyze_viral_potential(
         video_duration_sec=video_duration_sec,
         target_platforms=platforms,
         language=language,
+        social_caption=social_caption,
+        hashtags=hashtags,
+        material_attributions=material_attributions,
     )
 
     response = ""

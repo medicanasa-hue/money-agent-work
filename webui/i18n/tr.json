@@ -334,6 +334,27 @@
     "Royalty-Free Music Library": "Telifsiz Müzik Kütüphanesi",
     "Royalty-Free Music Track": "Telifsiz Müzik Parçası",
     "No Royalty-Free Music Found": "Telifsiz müzik dosyası bulunamadı",
-    "Video Encoder Help": "Gelişmiş seçenek. libx264 en güvenli varsayılandır. Donanım kodlayıcı seçildiğinde mevcut FFmpeg, GPU veya sürücü bunu kullanamıyorsa uygulama libx264'ye geri döner."
+    "Video Encoder Help": "Gelişmiş seçenek. libx264 en güvenli varsayılandır. Donanım kodlayıcı seçildiğinde mevcut FFmpeg, GPU veya sürücü bunu kullanamıyorsa uygulama libx264'ye geri döner.",
+    "Content Preflight": "??erik ?n Kontrol?",
+    "Content Preflight Help": "?retimden ?nce konu ve senaryo i?in h?zl? kontrol ?al??t?r?r. Sadece uyar?r, ?retimi engellemez.",
+    "Analyze Topic": "Konuyu Analiz Et",
+    "Generating Content Preflight": "??erik ?n kontrol? ?retiliyor...",
+    "Content Preflight Missing Warning": "Mevcut girdiler i?in i?erik ?n kontrol? ?al??t?r?lmad?. ?retim devam edecek.",
+    "Content Preflight Stale Warning": "??erik ?n kontrol? eski girdiler i?in ?retilmi?. ?retim devam edecek.",
+    "Content Preflight Source": "?n kontrol kayna??",
+    "Preflight Repeat Matches": "Yak?ndaki benzer konular",
+    "Preflight Content Ideas": "?n kontrol i?erik fikirleri",
+    "Preflight Script Analysis": "?n kontrol senaryo analizi",
+    "Viral Quality Gate Enabled": "D???k viral skorda uyar",
+    "Viral Quality Gate Enabled Help": "A??ksa d???k ?n kontrol viral skoru sadece uyar? g?sterir. ?retim engellenmez.",
+    "Viral Quality Gate Threshold": "Viral skor uyar? e?i?i",
+    "Viral Quality Gate Threshold Help": "Son g?ncel ?n kontrol skoru bu de?erin alt?ndaysa uyar? g?sterir.",
+    "Viral Quality Gate Warning": "Viral skor {score}/100, {threshold}/100 uyar? e?i?inin alt?nda. ?retim devam edecek.",
+    "Chatterbox API Key": "Chatterbox API Anahtar?",
+    "Chatterbox Base URL": "Chatterbox Base URL",
+    "Chatterbox Model": "Chatterbox Modeli",
+    "Chatterbox Voices": "Chatterbox Sesleri",
+    "Match Materials to Script Order": "Materyalleri Senaryo S?ras?yla E?le",
+    "Match Materials to Script Order Help": "A??ksa materyal aramas? senaryo s?ras? ve sahne ak???n? daha yak?ndan takip eder."
   }
 }

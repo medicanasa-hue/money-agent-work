@@ -98,6 +98,28 @@ class TestViralAnalyzer(unittest.TestCase):
         )
         self.assertIn("z" * viral_analyzer.MAX_ANALYSIS_TITLE_LENGTH, prompt)
 
+    def test_build_prompt_includes_social_and_material_context(self):
+        prompt = viral_analyzer.build_viral_analysis_prompt(
+            video_subject="Budget planning",
+            video_script="Save this checklist before payday.",
+            title="Budget checklist",
+            social_caption="Caption with a clear save CTA.",
+            hashtags=["#budget", "#money"],
+            material_attributions=[
+                {
+                    "provider": "wikimedia",
+                    "title": "Budget image",
+                    "attribution": "Example Creator",
+                    "license": "CC BY-SA",
+                }
+            ],
+        )
+
+        self.assertIn("Social caption: Caption with a clear save CTA.", prompt)
+        self.assertIn("Hashtags: #budget #money", prompt)
+        self.assertIn("Budget image", prompt)
+        self.assertIn("CC BY-SA", prompt)
+
 
 if __name__ == "__main__":
     unittest.main()

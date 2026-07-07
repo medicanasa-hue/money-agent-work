@@ -8,6 +8,11 @@ api_key = ""
 # 是否隐藏配置面板
 hide_config = false
 
+# Optional warning-only viral quality gate for WebUI preflight analysis.
+# Disabled by default; when enabled it warns below the threshold but never blocks generation.
+viral_quality_gate_enabled = false
+viral_quality_gate_threshold = 60
+
 # Azure TTS V1(edge_tts) 单次流式请求超时时间，单位秒。
 # 网络异常、服务端限流或 voice 与文本语言不匹配时，edge_tts 可能长期卡住。
 # 默认 30 秒可避免 WebUI 任务无反馈；慢网络或代理环境可适当调大。

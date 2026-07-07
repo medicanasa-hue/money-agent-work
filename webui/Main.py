@@ -25,6 +25,7 @@ from app.models.schema import (
     VideoTransitionMode,
 )
 from app.services import (
+    content_quality,
     content_intelligence,
     history,
     llm,
@@ -293,6 +294,8 @@ if "batch_script_blocks" not in st.session_state:
     st.session_state["batch_script_blocks"] = ""
 if "content_plan" not in st.session_state:
     st.session_state["content_plan"] = None
+if "content_preflight_report" not in st.session_state:
+    st.session_state["content_preflight_report"] = None
 if "content_niche" not in st.session_state:
     st.session_state["content_niche"] = ""
 if "content_target_audience" not in st.session_state:
@@ -339,6 +342,20 @@ if "viral_analysis" not in st.session_state:
     st.session_state["viral_analysis"] = None
 if "auto_viral_analysis_after_video" not in st.session_state:
     st.session_state["auto_viral_analysis_after_video"] = False
+if "viral_quality_gate_enabled" not in st.session_state:
+    st.session_state["viral_quality_gate_enabled"] = _config_bool(
+        config.app.get("viral_quality_gate_enabled", False)
+    )
+if "viral_quality_gate_threshold" not in st.session_state:
+    st.session_state["viral_quality_gate_threshold"] = _normalize_int_range(
+        config.app.get(
+            "viral_quality_gate_threshold",
+            content_quality.DEFAULT_QUALITY_GATE_THRESHOLD,
+        ),
+        content_quality.DEFAULT_QUALITY_GATE_THRESHOLD,
+        0,
+        100,
+    )
 if "manual_video_selection_enabled" not in st.session_state:
     st.session_state["manual_video_selection_enabled"] = False
 if "manual_video_candidates" not in st.session_state:
@@ -955,6 +972,9 @@ def _generate_viral_analysis_for_result(
         video_duration_sec=None,
         target_platforms=[platform] if platform else None,
         language=run_params.video_language or "auto",
+        social_caption=metadata.get("caption", ""),
+        hashtags=metadata.get("hashtags"),
+        material_attributions=(result or {}).get("material_attributions"),
     )
 
 
@@ -1015,6 +1035,105 @@ def _render_viral_analysis(analysis, key_prefix):
             score_value = min(1.0, max(0.0, float(score)))
             st.caption(f"{platform}: {score_value:.0%}")
             st.progress(score_value)
+
+
+def _content_preflight_warning_text(
+    report,
+    video_subject,
+    video_script,
+    platform,
+    language,
+):
+    if not report:
+        return tr("Content Preflight Missing Warning")
+    if content_quality.is_preflight_report_stale(
+        report,
+        video_subject=video_subject,
+        video_script=video_script,
+        platform=platform,
+        language=language,
+    ):
+        return tr("Content Preflight Stale Warning")
+    return ""
+
+
+def _preflight_input_values(params, batch_items=None):
+    batch_items = batch_items or []
+    if batch_items and not getattr(params, "video_subject", ""):
+        subjects = [
+            item.get("subject", "").strip()
+            for item in batch_items
+            if item.get("subject", "").strip()
+        ]
+        scripts = [
+            item.get("script", "").strip()
+            for item in batch_items
+            if item.get("script", "").strip()
+        ]
+        return {
+            "video_subject": "\n".join(subjects[:5]),
+            "video_script": "\n\n".join(scripts[:5]),
+            "language": getattr(params, "video_language", "") or "auto",
+        }
+    return {
+        "video_subject": getattr(params, "video_subject", ""),
+        "video_script": getattr(params, "video_script", ""),
+        "language": getattr(params, "video_language", "") or "auto",
+    }
+
+
+def _quality_gate_warning_text(gate):
+    if not gate or not gate.get("warn"):
+        return ""
+    return tr("Viral Quality Gate Warning").format(
+        score=gate.get("score", 0),
+        threshold=gate.get("threshold", content_quality.DEFAULT_QUALITY_GATE_THRESHOLD),
+    )
+
+
+def _render_content_preflight_report(report, key_prefix):
+    if not report:
+        return
+
+    content_plan = report.get("content_plan") or {}
+    source = content_plan.get("source")
+    if source:
+        st.caption(f"{tr('Content Preflight Source')}: {source}")
+
+    repeat_matches = report.get("repeat_matches") or []
+    if repeat_matches:
+        st.write(tr("Preflight Repeat Matches"))
+        for match in repeat_matches[:3]:
+            subject = match.get("subject") or match.get("task_id") or tr("Untitled")
+            similarity = match.get("similarity")
+            created_at = match.get("created_at", "")
+            similarity_text = (
+                f" ({float(similarity):.0%})"
+                if isinstance(similarity, (int, float))
+                else ""
+            )
+            st.caption(f"{subject}{similarity_text} {created_at}".strip())
+
+    warnings = content_plan.get("warnings") or []
+    if warnings:
+        st.write(tr("Planning Warnings"))
+        for warning in warnings[:3]:
+            st.caption(warning)
+
+    ideas = content_plan.get("ideas") or []
+    if ideas:
+        st.write(tr("Preflight Content Ideas"))
+        for index, idea in enumerate(ideas[:3], start=1):
+            subject = idea.get("subject", "")
+            hook = idea.get("hook", "")
+            st.caption(f"{index}. {subject}")
+            if hook:
+                st.write(f"- {hook}")
+
+    script_analysis = report.get("script_analysis")
+    if script_analysis:
+        st.write(tr("Preflight Script Analysis"))
+        _render_viral_analysis(script_analysis, f"{key_prefix}_viral")
 
 
 def _record_history(
@@ -3460,12 +3579,78 @@ with st.expander(tr("Publishing Settings"), expanded=False):
         "upload_post_allow_public_youtube"
     ]
 
+with st.expander(tr("Content Preflight"), expanded=False):
+    st.caption(tr("Content Preflight Help"))
+    preflight_batch_items = _get_batch_items()
+    preflight_inputs = _preflight_input_values(params, preflight_batch_items)
+
+    if st.button(tr("Analyze Topic"), key="analyze_content_preflight"):
+        if (
+            not preflight_inputs["video_subject"]
+            and not preflight_inputs["video_script"]
+        ):
+            st.error(tr("Please Enter the Video Subject or Script"))
+        else:
+            with st.spinner(tr("Generating Content Preflight")):
+                st.session_state["content_preflight_report"] = (
+                    content_quality.build_preflight_report(
+                        video_subject=preflight_inputs["video_subject"],
+                        video_script=preflight_inputs["video_script"],
+                        platform=selected_social_platform,
+                        language=preflight_inputs["language"],
+                        target_audience=st.session_state.get(
+                            "content_target_audience", ""
+                        ),
+                        tone=st.session_state.get("content_tone", ""),
+                        use_trend_context=st.session_state.get(
+                            "content_use_trend_context", False
+                        ),
+                        trend_source=st.session_state.get(
+                            "content_trend_source",
+                            content_intelligence.TREND_SOURCE_STATIC,
+                        ),
+                    )
+                )
+
+    preflight_report = st.session_state.get("content_preflight_report")
+    preflight_warning = _content_preflight_warning_text(
+        preflight_report,
+        preflight_inputs["video_subject"],
+        preflight_inputs["video_script"],
+        selected_social_platform,
+        preflight_inputs["language"],
+    )
+    if preflight_report and preflight_warning:
+        st.warning(preflight_warning)
+    _render_content_preflight_report(
+        preflight_report,
+        key_prefix="current_preflight",
+    )
+
 with st.expander(tr("Viral Analysis"), expanded=False):
     st.checkbox(
         tr("Auto Viral Analysis After Video"),
         key="auto_viral_analysis_after_video",
         help=tr("Auto Viral Analysis After Video Help"),
     )
+    st.checkbox(
+        tr("Viral Quality Gate Enabled"),
+        key="viral_quality_gate_enabled",
+        help=tr("Viral Quality Gate Enabled Help"),
+    )
+    st.slider(
+        tr("Viral Quality Gate Threshold"),
+        min_value=0,
+        max_value=100,
+        key="viral_quality_gate_threshold",
+        help=tr("Viral Quality Gate Threshold Help"),
+    )
+    config.app["viral_quality_gate_enabled"] = st.session_state[
+        "viral_quality_gate_enabled"
+    ]
+    config.app["viral_quality_gate_threshold"] = st.session_state[
+        "viral_quality_gate_threshold"
+    ]
 
     if st.button(tr("Generate Viral Analysis"), key="generate_viral_analysis"):
         if not params.video_subject and not params.video_script:
@@ -3480,6 +3665,8 @@ with st.expander(tr("Viral Analysis"), expanded=False):
                     video_duration_sec=None,
                     target_platforms=[selected_social_platform],
                     language=params.video_language or "auto",
+                    social_caption=current_metadata.get("caption", ""),
+                    hashtags=current_metadata.get("hashtags"),
                 )
 
     _render_viral_analysis(
@@ -3546,6 +3733,35 @@ if start_button or batch_button:
         st.error(tr("Please Select at Least One Video Candidate"))
         scroll_to_bottom()
         st.stop()
+
+    current_preflight_inputs = _preflight_input_values(
+        params,
+        batch_items if batch_button else [],
+    )
+    current_preflight_report = st.session_state.get("content_preflight_report")
+    preflight_warning = _content_preflight_warning_text(
+        current_preflight_report,
+        current_preflight_inputs["video_subject"],
+        current_preflight_inputs["video_script"],
+        selected_social_platform,
+        current_preflight_inputs["language"],
+    )
+    if preflight_warning:
+        st.warning(preflight_warning)
+
+    fresh_preflight_report = None if preflight_warning else current_preflight_report
+    quality_gate_warning = _quality_gate_warning_text(
+        content_quality.evaluate_quality_gate(
+            fresh_preflight_report,
+            enabled=st.session_state.get("viral_quality_gate_enabled", False),
+            threshold=st.session_state.get(
+                "viral_quality_gate_threshold",
+                content_quality.DEFAULT_QUALITY_GATE_THRESHOLD,
+            ),
+        )
+    )
+    if quality_gate_warning:
+        st.warning(quality_gate_warning)
 
     repeat_warning_days = history.DEFAULT_SUBJECT_LOOKBACK_DAYS
     repeat_matches = []

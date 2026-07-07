@@ -218,6 +218,63 @@ class TestWebuiI18n(unittest.TestCase):
         self.assertIn("Budget mistakes beginners make", suggestion)
         self.assertEqual(helpers["_subject_repeat_suggestion_text"](""), "")
 
+    def test_content_preflight_warning_helpers(self):
+        helpers = _load_webui_helpers(
+            "_content_preflight_warning_text",
+            "_quality_gate_warning_text",
+        )
+
+        class FakeContentQuality:
+            DEFAULT_QUALITY_GATE_THRESHOLD = 60
+
+            @staticmethod
+            def is_preflight_report_stale(
+                report,
+                video_subject="",
+                video_script="",
+                platform="tiktok",
+                language="auto",
+            ):
+                return report.get("stale", False)
+
+        translations = {
+            "Content Preflight Missing Warning": "missing preflight",
+            "Content Preflight Stale Warning": "stale preflight",
+            "Viral Quality Gate Warning": (
+                "score {score} below threshold {threshold}"
+            ),
+        }
+        helpers["content_quality"] = FakeContentQuality
+        helpers["tr"] = lambda key: translations.get(key, key)
+
+        self.assertEqual(
+            helpers["_content_preflight_warning_text"](
+                None,
+                "Budget mistakes",
+                "Save this.",
+                "tiktok",
+                "en",
+            ),
+            "missing preflight",
+        )
+        self.assertEqual(
+            helpers["_content_preflight_warning_text"](
+                {"stale": True},
+                "Budget mistakes",
+                "Save this.",
+                "tiktok",
+                "en",
+            ),
+            "stale preflight",
+        )
+        self.assertEqual(
+            helpers["_quality_gate_warning_text"](
+                {"warn": True, "score": 45, "threshold": 60}
+            ),
+            "score 45 below threshold 60",
+        )
+        self.assertEqual(helpers["_quality_gate_warning_text"]({"warn": False}), "")
+
     def test_video_quality_helper_applies_values_to_task_params(self):
         helpers = _load_webui_helpers(
             "_normalize_int_range",

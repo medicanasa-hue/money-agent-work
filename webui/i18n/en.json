@@ -340,6 +340,21 @@
     "Hook Suggestions": "Hook Suggestions",
     "Title Variants": "Title Variants",
     "Thumbnail Concepts": "Thumbnail Concepts",
-    "Platform Fit": "Platform Fit"
+    "Platform Fit": "Platform Fit",
+    "Content Preflight": "Content Preflight",
+    "Content Preflight Help": "Run a quick topic and script check before generating. This is advisory and never blocks generation.",
+    "Analyze Topic": "Analyze Topic",
+    "Generating Content Preflight": "Generating content preflight...",
+    "Content Preflight Missing Warning": "Content preflight has not been run for the current inputs. Generation will continue.",
+    "Content Preflight Stale Warning": "Content preflight was generated for older inputs. Generation will continue.",
+    "Content Preflight Source": "Preflight source",
+    "Preflight Repeat Matches": "Recent similar subjects",
+    "Preflight Content Ideas": "Preflight content ideas",
+    "Preflight Script Analysis": "Preflight script analysis",
+    "Viral Quality Gate Enabled": "Warn on low viral score",
+    "Viral Quality Gate Enabled Help": "When enabled, low preflight viral scores show a warning only. Generation is not blocked.",
+    "Viral Quality Gate Threshold": "Viral score warning threshold",
+    "Viral Quality Gate Threshold Help": "Warn when the latest fresh preflight score is below this value.",
+    "Viral Quality Gate Warning": "Viral score is {score}/100, below the warning threshold of {threshold}/100. Generation will continue."
   }
 }

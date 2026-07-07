@@ -36,6 +36,7 @@ class TestProductionHistory(unittest.TestCase):
                 self.assertEqual(entries[0]["status"], "failed")
                 self.assertEqual(entries[1]["videos"], ["/tmp/first.mp4"])
                 self.assertIsNone(entries[1]["cooldown"])
+                self.assertIsNone(entries[1]["viral_analysis"])
                 self.assertIn("created_at", entries[0])
 
                 history.clear_history()
@@ -122,6 +123,26 @@ class TestProductionHistory(unittest.TestCase):
                 entries = history.list_history()
 
         self.assertEqual(entries[0]["pending_uploads"], pending_uploads)
+
+    def test_history_preserves_viral_analysis(self):
+        viral_analysis = {
+            "overall_score": 74,
+            "warnings": ["Add a sharper CTA."],
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with patch("app.services.history.utils.storage_dir", return_value=temp_dir):
+                history.add_history(
+                    {
+                        "task_id": "task-viral",
+                        "subject": "viral",
+                        "viral_analysis": viral_analysis,
+                    }
+                )
+
+                entries = history.list_history()
+
+        self.assertEqual(entries[0]["viral_analysis"], viral_analysis)
 
     def test_update_pending_upload_result_marks_uploaded(self):
         with tempfile.TemporaryDirectory() as temp_dir:
