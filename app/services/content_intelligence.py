@@ -278,6 +278,20 @@ def _normalize_search_terms(value: Any, fallback_subject: str) -> list[str]:
     return terms
 
 
+def _normalize_warning_items(value: Any) -> list[str]:
+    if isinstance(value, str):
+        raw_warnings = [value]
+    elif isinstance(value, list):
+        raw_warnings = value
+    else:
+        raw_warnings = []
+    return [
+        _clean_text(item, 300)
+        for item in raw_warnings
+        if _clean_text(item, 300)
+    ]
+
+
 def _trend_disclaimer(extra_warnings: Sequence[str] | None = None) -> str:
     warnings_text = " ".join(extra_warnings or [])
     if "RSS trend context" in warnings_text:
@@ -410,11 +424,7 @@ def _normalize_plan_payload(
     if len(calendar) < total_calendar_items:
         calendar = _build_calendar_from_ideas(ideas, days, daily_count)
 
-    warnings = [
-        _clean_text(item, 300)
-        for item in (payload.get("warnings") or [])
-        if _clean_text(item, 300)
-    ]
+    warnings = _normalize_warning_items(payload.get("warnings"))
     disclaimer = _trend_disclaimer(extra_warnings)
     if disclaimer not in warnings:
         warnings.insert(0, disclaimer)

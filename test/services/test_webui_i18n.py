@@ -275,6 +275,38 @@ class TestWebuiI18n(unittest.TestCase):
         )
         self.assertEqual(helpers["_quality_gate_warning_text"]({"warn": False}), "")
 
+    def test_preflight_inputs_fall_back_to_current_session_values(self):
+        helpers = _load_webui_helpers(
+            "_session_text_value",
+            "_preflight_input_values",
+        )
+        helpers["st"] = SimpleNamespace(
+            session_state={
+                "video_subject": " Current subject ",
+                "video_script": " Current script ",
+            }
+        )
+
+        values = helpers["_preflight_input_values"](
+            SimpleNamespace(video_subject="", video_script="", video_language="")
+        )
+
+        self.assertEqual(values["video_subject"], "Current subject")
+        self.assertEqual(values["video_script"], "Current script")
+        self.assertEqual(values["language"], "auto")
+
+        values = helpers["_preflight_input_values"](
+            SimpleNamespace(
+                video_subject="Param subject",
+                video_script="Param script",
+                video_language="tr-TR",
+            )
+        )
+
+        self.assertEqual(values["video_subject"], "Param subject")
+        self.assertEqual(values["video_script"], "Param script")
+        self.assertEqual(values["language"], "tr-TR")
+
     def test_video_quality_helper_applies_values_to_task_params(self):
         helpers = _load_webui_helpers(
             "_normalize_int_range",

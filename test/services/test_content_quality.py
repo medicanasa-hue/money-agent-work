@@ -144,6 +144,69 @@ class TestContentQuality(unittest.TestCase):
             )["warn"]
         )
 
+    def test_script_improvement_prompt_includes_analysis_context(self):
+        prompt = content_quality.build_script_improvement_prompt(
+            video_subject="Coffee prices",
+            video_script="Coffee is expensive. Follow for more.",
+            viral_analysis={
+                "overall_score": 42,
+                "hook_score": 30,
+                "pacing_score": 55,
+                "warnings": ["No clear hook."],
+                "hook_suggestions": ["Coffee changed overnight."],
+            },
+            platform="tiktok",
+            language="en",
+        )
+
+        self.assertIn("Coffee prices", prompt)
+        self.assertIn("Coffee is expensive", prompt)
+        self.assertIn("No clear hook", prompt)
+        self.assertIn("Coffee changed overnight", prompt)
+        self.assertIn("Return ONLY the improved script text", prompt)
+
+    def test_suggest_improved_script_preserves_original_and_returns_suggestion(self):
+        original = "Coffee is expensive. Follow for more."
+        improved = "Coffee prices did not jump by accident. Here is the simple chain. Save this before your next grocery run."
+
+        with patch.object(
+            content_quality.llm,
+            "_generate_response",
+            return_value=improved,
+        ) as generate:
+            suggestion = content_quality.suggest_improved_script(
+                video_subject="Coffee prices",
+                video_script=original,
+                viral_analysis={"warnings": ["Weak hook."]},
+                platform="tiktok",
+                language="en",
+            )
+
+        generate.assert_called_once()
+        self.assertEqual(suggestion["original_script"], original)
+        self.assertEqual(suggestion["improved_script"], improved)
+        self.assertEqual(suggestion["source"], "llm")
+        self.assertEqual(suggestion["error"], "")
+
+    def test_suggest_improved_script_rejects_empty_or_same_output(self):
+        self.assertEqual(
+            content_quality.suggest_improved_script(video_script="")["source"],
+            "unavailable",
+        )
+
+        with patch.object(
+            content_quality.llm,
+            "_generate_response",
+            return_value="Same script.",
+        ):
+            suggestion = content_quality.suggest_improved_script(
+                video_script="Same script.",
+                viral_analysis={"warnings": ["Weak hook."]},
+            )
+
+        self.assertEqual(suggestion["improved_script"], "")
+        self.assertIn("No useful rewrite", suggestion["error"])
+
 
 if __name__ == "__main__":
     unittest.main()

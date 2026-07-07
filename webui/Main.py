@@ -340,6 +340,8 @@ if "upload_post_youtube_privacy_status" not in st.session_state:
     )
 if "viral_analysis" not in st.session_state:
     st.session_state["viral_analysis"] = None
+if "script_rewrite_suggestion" not in st.session_state:
+    st.session_state["script_rewrite_suggestion"] = None
 if "auto_viral_analysis_after_video" not in st.session_state:
     st.session_state["auto_viral_analysis_after_video"] = False
 if "viral_quality_gate_enabled" not in st.session_state:
@@ -1057,9 +1059,24 @@ def _content_preflight_warning_text(
     return ""
 
 
+def _session_text_value(key):
+    try:
+        return str(st.session_state.get(key, "") or "").strip()
+    except Exception:
+        return ""
+
+
 def _preflight_input_values(params, batch_items=None):
     batch_items = batch_items or []
-    if batch_items and not getattr(params, "video_subject", ""):
+    video_subject = str(
+        getattr(params, "video_subject", "") or _session_text_value("video_subject")
+    ).strip()
+    video_script = str(
+        getattr(params, "video_script", "") or _session_text_value("video_script")
+    ).strip()
+    language = getattr(params, "video_language", "") or "auto"
+
+    if batch_items and not video_subject:
         subjects = [
             item.get("subject", "").strip()
             for item in batch_items
@@ -1073,12 +1090,12 @@ def _preflight_input_values(params, batch_items=None):
         return {
             "video_subject": "\n".join(subjects[:5]),
             "video_script": "\n\n".join(scripts[:5]),
-            "language": getattr(params, "video_language", "") or "auto",
+            "language": language,
         }
     return {
-        "video_subject": getattr(params, "video_subject", ""),
-        "video_script": getattr(params, "video_script", ""),
-        "language": getattr(params, "video_language", "") or "auto",
+        "video_subject": video_subject,
+        "video_script": video_script,
+        "language": language,
     }
 
 
@@ -3669,10 +3686,51 @@ with st.expander(tr("Viral Analysis"), expanded=False):
                     hashtags=current_metadata.get("hashtags"),
                 )
 
+    current_viral_analysis = st.session_state.get("viral_analysis")
     _render_viral_analysis(
-        st.session_state.get("viral_analysis"),
+        current_viral_analysis,
         key_prefix="current_viral",
     )
+
+    if current_viral_analysis and params.video_script:
+        if st.button(
+            tr("Improve Script"),
+            key="improve_script",
+            help=tr("Improve Script Help"),
+        ):
+            with st.spinner(tr("Improving Script")):
+                rewrite_suggestion = content_quality.suggest_improved_script(
+                    video_subject=params.video_subject,
+                    video_script=params.video_script,
+                    viral_analysis=current_viral_analysis,
+                    platform=selected_social_platform,
+                    language=params.video_language or "auto",
+                )
+                st.session_state["script_rewrite_suggestion"] = rewrite_suggestion
+                st.session_state["script_rewrite_preview"] = rewrite_suggestion.get(
+                    "improved_script", ""
+                )
+
+    rewrite_suggestion = st.session_state.get("script_rewrite_suggestion")
+    if rewrite_suggestion:
+        rewrite_error = rewrite_suggestion.get("error")
+        if rewrite_error:
+            st.warning(tr("Improve Script Unavailable").format(error=rewrite_error))
+        else:
+            st.text_area(
+                tr("Improved Script Suggestion"),
+                value=rewrite_suggestion.get("improved_script", ""),
+                height=240,
+                key="script_rewrite_preview",
+            )
+            if st.button(tr("Apply Improved Script"), key="apply_improved_script"):
+                st.session_state["video_script"] = st.session_state.get(
+                    "script_rewrite_preview",
+                    rewrite_suggestion.get("improved_script", ""),
+                )
+                st.session_state["script_rewrite_suggestion"] = None
+                st.success(tr("Improved Script Applied"))
+                st.rerun()
 
 action_cols = st.columns(2)
 with action_cols[0]:

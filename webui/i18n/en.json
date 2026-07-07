@@ -355,6 +355,13 @@
     "Viral Quality Gate Enabled Help": "When enabled, low preflight viral scores show a warning only. Generation is not blocked.",
     "Viral Quality Gate Threshold": "Viral score warning threshold",
     "Viral Quality Gate Threshold Help": "Warn when the latest fresh preflight score is below this value.",
-    "Viral Quality Gate Warning": "Viral score is {score}/100, below the warning threshold of {threshold}/100. Generation will continue."
+    "Viral Quality Gate Warning": "Viral score is {score}/100, below the warning threshold of {threshold}/100. Generation will continue.",
+    "Improve Script": "Improve Script",
+    "Improve Script Help": "Generate an alternative script from the viral analysis. The original script is not changed until you apply it.",
+    "Improving Script": "Improving script...",
+    "Improved Script Suggestion": "Improved Script Suggestion",
+    "Apply Improved Script": "Apply Improved Script",
+    "Improved Script Applied": "Improved script applied.",
+    "Improve Script Unavailable": "Could not generate an improved script: {error}"
   }
 }

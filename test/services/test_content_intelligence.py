@@ -158,6 +158,39 @@ class TestContentIntelligence(unittest.TestCase):
         self.assertEqual(len(result["calendar"]), 7)
         self.assertIn("No live trend data was used", result["warnings"][0])
 
+    def test_generate_content_plan_normalizes_string_warning(self):
+        payload = """
+        {
+          "ideas": [
+            {
+              "subject": "Coffee prices",
+              "angle": "quick explainer",
+              "hook": "Coffee got expensive for a reason.",
+              "script_prompt": "Write about coffee prices.",
+              "search_terms": ["coffee", "inflation", "shipping"],
+              "platform": "tiktok",
+              "rationale": "Useful explainer."
+            }
+          ],
+          "calendar": [],
+          "warnings": "No live trend data was used."
+        }
+        """
+
+        with patch.object(content_intelligence.llm, "_generate_response", return_value=payload):
+            result = content_intelligence.generate_content_plan(
+                video_subject="coffee prices",
+                platform="tiktok",
+                days=7,
+                daily_count=1,
+                idea_count=1,
+            )
+
+        self.assertTrue(
+            any("No live trend data was used" in warning for warning in result["warnings"])
+        )
+        self.assertLess(len(result["warnings"]), 4)
+
     def test_generate_content_plan_adds_static_trend_context_to_prompt(self):
         payload = """
         {
