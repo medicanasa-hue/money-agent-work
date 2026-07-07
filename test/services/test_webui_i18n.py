@@ -75,6 +75,13 @@ class TestWebuiI18n(unittest.TestCase):
         quality_keys = (
             "Video Quality CRF",
             "Video Quality CRF Help",
+            "Video Quality Preset",
+            "Video Quality Preset Help",
+            "Balanced Quality Preset",
+            "Fast Draft Preset",
+            "High Quality Preset",
+            "Archive Quality Preset",
+            "Custom Quality Preset",
             "Encoder Preset",
             "Encoder Preset Help",
             "Output FPS",
@@ -199,6 +206,17 @@ class TestWebuiI18n(unittest.TestCase):
         self.assertIn("Budget mistakes beginners make", warning)
         self.assertIn("5", warning)
         self.assertEqual(helpers["_subject_repeat_warning_text"]([], days=5), "")
+
+    def test_subject_repeat_suggestion_text_mentions_subject(self):
+        helpers = _load_webui_helpers("_subject_repeat_suggestion_text")
+        helpers["tr"] = lambda key: "Fresh angles for {subject}"
+
+        suggestion = helpers["_subject_repeat_suggestion_text"](
+            "Budget mistakes beginners make"
+        )
+
+        self.assertIn("Budget mistakes beginners make", suggestion)
+        self.assertEqual(helpers["_subject_repeat_suggestion_text"](""), "")
 
     def test_video_quality_helper_applies_values_to_task_params(self):
         helpers = _load_webui_helpers(

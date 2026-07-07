@@ -1573,6 +1573,42 @@ class TestMaterialTlsVerification(unittest.TestCase):
         self.assertNotIn(private_query, messages)
 
 
+class TestMaterialAttributionFormatting(unittest.TestCase):
+    def test_append_material_attributions_adds_deduplicated_credits(self):
+        text = material.append_material_attributions(
+            "Original caption",
+            [
+                {
+                    "provider": "wikimedia",
+                    "title": "City clip",
+                    "license": "CC BY-SA 4.0",
+                    "license_url": "https://creativecommons.org/licenses/by-sa/4.0/",
+                    "attribution": "City clip - Jane Doe - CC BY-SA 4.0",
+                    "source_url": "https://commons.wikimedia.org/wiki/File:City.webm",
+                },
+                {
+                    "provider": "wikimedia",
+                    "title": "City clip",
+                    "license": "CC BY-SA 4.0",
+                    "license_url": "https://creativecommons.org/licenses/by-sa/4.0/",
+                    "attribution": "City clip - Jane Doe - CC BY-SA 4.0",
+                    "source_url": "https://commons.wikimedia.org/wiki/File:City.webm",
+                },
+            ],
+        )
+
+        self.assertIn("Original caption", text)
+        self.assertIn("Credits:", text)
+        self.assertIn("City clip - Jane Doe - CC BY-SA 4.0", text)
+        self.assertEqual(text.count("City clip - Jane Doe"), 1)
+
+    def test_append_material_attributions_keeps_caption_when_empty(self):
+        self.assertEqual(
+            material.append_material_attributions("Original caption", []),
+            "Original caption",
+        )
+
+
 class TestMaterialSearchRandomization(unittest.TestCase):
     def setUp(self):
         self.original_app_config = dict(config.app)

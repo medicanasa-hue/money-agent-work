@@ -1,5 +1,5 @@
 [app]
-video_source = "pexels" # "pexels", "pixabay", "coverr", "local", or "multi"
+video_source = "pexels" # "pexels", "pixabay", "coverr", "nasa", "wikimedia", "archive_org", "local", or "multi"
 
 # Optional API key for the local HTTP API. Leave empty for private loopback-only use.
 # Set this when listen_host is 0.0.0.0 or any non-loopback address.
@@ -271,6 +271,12 @@ litellm_model_name = "openai/gpt-4o-mini"
 # Subtitle Provider, "edge" or "whisper"
 # If empty, the subtitle will not be generated
 subtitle_provider = "edge"
+
+# Custom audio files do not include the subtitle timeline normally returned by
+# TTS providers such as Edge. Use Whisper by default so uploaded/server-side
+# audio still gets subtitles. Set to "none" to skip subtitles unless
+# subtitle_provider is explicitly "whisper".
+custom_audio_subtitle_provider = "whisper"
 
 #
 # ImageMagick

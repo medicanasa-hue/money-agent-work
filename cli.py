@@ -173,7 +173,16 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--video-source",
         default="pexels",
-        choices=["pexels", "pixabay", "coverr", "local"],
+        choices=[
+            "pexels",
+            "pixabay",
+            "coverr",
+            "nasa",
+            "wikimedia",
+            "archive_org",
+            "local",
+            "multi",
+        ],
         help="video material source",
     )
     parser.add_argument(

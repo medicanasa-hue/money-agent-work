@@ -30,7 +30,7 @@ class TestTaskService(unittest.TestCase):
     def tearDown(self):
         pass
 
-    def _run_start_with_upload_config(self, require_review):
+    def _run_start_with_upload_config(self, require_review, material_attribution_records=None):
         params = VideoParams(
             video_subject="upload review",
             video_script="",
@@ -43,6 +43,11 @@ class TestTaskService(unittest.TestCase):
             platforms=["youtube"],
             youtube_privacy_status="unlisted",
         )
+
+        def fake_get_video_materials(*_args, material_attributions=None, **_kwargs):
+            if material_attributions is not None and material_attribution_records:
+                material_attributions.extend(material_attribution_records)
+            return ["material.mp4"]
 
         with (
             patch.object(
@@ -61,7 +66,7 @@ class TestTaskService(unittest.TestCase):
                 return_value=("audio.mp3", 10, None),
             ),
             patch.object(tm, "generate_subtitle", return_value="subtitle.srt"),
-            patch.object(tm, "get_video_materials", return_value=["material.mp4"]),
+            patch.object(tm, "get_video_materials", side_effect=fake_get_video_materials),
             patch.object(
                 tm,
                 "generate_final_videos",
@@ -121,6 +126,31 @@ class TestTaskService(unittest.TestCase):
         generate_metadata.assert_called_once()
         self.assertEqual(result["cross_post_results"], [{"success": True}, {"success": True}])
         self.assertIsNone(result["pending_uploads"])
+
+    def test_start_adds_material_attributions_to_youtube_description(self):
+        attribution_records = [
+            {
+                "provider": "wikimedia",
+                "title": "City clip",
+                "license": "CC BY-SA 4.0",
+                "license_url": "https://creativecommons.org/licenses/by-sa/4.0/",
+                "attribution": "City clip - Jane Doe - CC BY-SA 4.0",
+                "source_url": "https://commons.wikimedia.org/wiki/File:City.webm",
+            }
+        ]
+        result, cross_post, _generate_metadata = self._run_start_with_upload_config(
+            require_review=False,
+            material_attribution_records=attribution_records,
+        )
+
+        self.assertEqual(result["material_attributions"], attribution_records)
+        youtube_extra = cross_post.call_args.kwargs["youtube_extra"]
+        self.assertIn("Upload caption", youtube_extra["youtube_description"])
+        self.assertIn("Credits:", youtube_extra["youtube_description"])
+        self.assertIn(
+            "City clip - Jane Doe - CC BY-SA 4.0",
+            youtube_extra["youtube_description"],
+        )
 
     def test_generate_terms_falls_back_when_smart_scene_queries_are_empty(self):
         params = VideoParams(
@@ -575,7 +605,11 @@ class TestTaskService(unittest.TestCase):
                 patch.object(
                     tm.config,
                     "app",
-                    dict(tm.config.app, subtitle_provider="edge"),
+                    dict(
+                        tm.config.app,
+                        subtitle_provider="edge",
+                        custom_audio_subtitle_provider="none",
+                    ),
                 ),
                 patch.object(tm.voice, "create_subtitle") as create_subtitle,
                 patch.object(tm.subtitle, "create") as whisper_create,
@@ -593,6 +627,51 @@ class TestTaskService(unittest.TestCase):
         self.assertEqual(subtitle_path, "")
         create_subtitle.assert_not_called()
         whisper_create.assert_not_called()
+
+    def test_generate_subtitle_uses_whisper_for_custom_audio_by_default(self):
+        task_id = "test-custom-audio-default-whisper"
+        task_dir = utils.task_dir(task_id)
+        audio_file = os.path.join(task_dir, "custom-audio.mp3")
+        Path(audio_file).write_bytes(b"fake audio")
+        params = VideoParams(
+            video_subject="custom audio",
+            video_script="Hello world.",
+            subtitle_enabled=True,
+        )
+
+        def fake_whisper_create(audio_file, subtitle_file):
+            Path(subtitle_file).write_text(
+                "1\n00:00:00,000 --> 00:00:01,000\nHello world.\n\n",
+                encoding="utf-8",
+            )
+
+        app_config = dict(tm.config.app, subtitle_provider="edge")
+        app_config.pop("custom_audio_subtitle_provider", None)
+        try:
+            with (
+                patch.object(tm.config, "app", app_config),
+                patch.object(
+                    tm.subtitle, "create", side_effect=fake_whisper_create
+                ) as create,
+                patch.object(tm.subtitle, "correct") as correct,
+                patch.object(tm.voice, "create_subtitle") as create_subtitle,
+            ):
+                subtitle_path = tm.generate_subtitle(
+                    task_id=task_id,
+                    params=params,
+                    video_script="Hello world.",
+                    sub_maker=None,
+                    audio_file=audio_file,
+                )
+        finally:
+            shutil.rmtree(task_dir, ignore_errors=True)
+
+        self.assertTrue(subtitle_path.endswith("subtitle.srt"))
+        create.assert_called_once_with(audio_file=audio_file, subtitle_file=subtitle_path)
+        correct.assert_called_once_with(
+            subtitle_file=subtitle_path, video_script="Hello world."
+        )
+        create_subtitle.assert_not_called()
 
     def test_get_video_materials_uses_selected_online_materials(self):
         selected_materials = [

@@ -72,6 +72,11 @@ class TestCli(unittest.TestCase):
         params = cli.build_video_params(args)
         self.assertEqual(params.video_source, "coverr")
 
+    def test_multi_video_source_accepted(self):
+        args = cli.parse_args(["--video-subject", "test", "--video-source", "multi"])
+        params = cli.build_video_params(args)
+        self.assertEqual(params.video_source, "multi")
+
     def test_run_cli_applies_video_quality_config(self):
         def start_with_quality_context(**_kwargs):
             self.assertEqual(vd._get_configured_video_codec(), "h264_nvenc")

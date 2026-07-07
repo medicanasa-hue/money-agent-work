@@ -215,14 +215,23 @@ def generate_subtitle(task_id, params, video_script, sub_maker, audio_file):
     logger.info(f"\n\n## generating subtitle, provider: {subtitle_provider}")
 
     if sub_maker is None and subtitle_provider != "whisper":
-        # 自定义音频不会经过 TTS，因此没有 Edge/Azure 等 TTS 返回的
-        # sub_maker 时间轴。只有 Whisper 可以直接从音频文件转写字幕；
-        # 其他字幕提供方继续保持原有行为，避免生成错误的空时间轴。
-        logger.warning(
-            "subtitle maker is missing, skip subtitle generation for provider: "
-            f"{subtitle_provider}"
+        custom_audio_subtitle_provider = (
+            config.app.get("custom_audio_subtitle_provider", "whisper")
+            .strip()
+            .lower()
         )
-        return ""
+        if custom_audio_subtitle_provider in {"whisper", "auto"}:
+            logger.warning(
+                "subtitle maker is missing for provider "
+                f"{subtitle_provider}; using whisper for custom audio subtitles"
+            )
+            subtitle_provider = "whisper"
+        else:
+            logger.warning(
+                "subtitle maker is missing, skip subtitle generation for provider: "
+                f"{subtitle_provider}"
+            )
+            return ""
 
     subtitle_fallback = False
     if subtitle_provider == "edge":
@@ -612,7 +621,10 @@ def _start(task_id, params: VideoParams, stop_at: str = "video"):
                 )
                 youtube_extra = {
                     "youtube_title": metadata.get("title", params.video_subject),
-                    "youtube_description": metadata.get("caption", ""),
+                    "youtube_description": material.append_material_attributions(
+                        metadata.get("caption", ""),
+                        material_attributions,
+                    ),
                     "tags": metadata.get("hashtags", []),
                     "privacyStatus": upload_post.upload_post_service.youtube_privacy_status,
                     "containsSyntheticMedia": True,

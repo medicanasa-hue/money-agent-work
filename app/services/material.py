@@ -716,6 +716,57 @@ def _material_attribution_record(item: MaterialInfo, video_path: str) -> dict:
     }
 
 
+def format_material_attributions(attribution_records: Optional[list]) -> str:
+    if not attribution_records:
+        return ""
+
+    lines = []
+    seen = set()
+    for record in attribution_records:
+        if not isinstance(record, dict):
+            continue
+        attribution = str(record.get("attribution") or "").strip()
+        title = str(record.get("title") or "").strip()
+        provider = str(record.get("provider") or "").strip()
+        license_name = str(record.get("license") or "").strip()
+        license_url = str(record.get("license_url") or "").strip()
+        source_url = str(record.get("source_url") or "").strip()
+
+        label = attribution or title or provider or source_url
+        if not label:
+            continue
+
+        details = []
+        if license_name and license_name not in label:
+            details.append(license_name)
+        if license_url and license_url not in label:
+            details.append(license_url)
+        if source_url and source_url not in label:
+            details.append(source_url)
+
+        line = f"- {label}"
+        if details:
+            line = f"{line} ({'; '.join(details)})"
+        if line in seen:
+            continue
+        seen.add(line)
+        lines.append(line)
+
+    if not lines:
+        return ""
+    return "Credits:\n" + "\n".join(lines)
+
+
+def append_material_attributions(text: str, attribution_records: Optional[list]) -> str:
+    attribution_text = format_material_attributions(attribution_records)
+    base_text = str(text or "").strip()
+    if not attribution_text:
+        return base_text
+    if not base_text:
+        return attribution_text
+    return f"{base_text}\n\n{attribution_text}"
+
+
 def _append_material_attribution(
     attribution_records: Optional[list],
     item: MaterialInfo,

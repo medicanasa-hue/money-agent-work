@@ -903,12 +903,17 @@ def _prepare_task_params(
 
 
 def _generate_social_metadata_for_result(run_params, result, platform):
-    return llm.generate_social_metadata(
+    metadata = llm.generate_social_metadata(
         video_subject=run_params.video_subject,
         video_script=(result or {}).get("script") or run_params.video_script,
         language=run_params.video_language or "auto",
         platform=platform,
     )
+    metadata["caption"] = material.append_material_attributions(
+        metadata.get("caption", ""),
+        (result or {}).get("material_attributions"),
+    )
+    return metadata
 
 
 def _generate_video_terms_for_ui(run_params, video_script):
@@ -1066,6 +1071,13 @@ def _subject_repeat_warning_text(matches, days):
         days=days,
         created_at=created_at,
     )
+
+
+def _subject_repeat_suggestion_text(subject):
+    subject = str(subject or "").strip()
+    if not subject:
+        return ""
+    return tr("Similar Subject Fresh Angle Suggestions").format(subject=subject)
 
 
 def _metadata_from_widget_state(key_prefix, fallback_metadata):
@@ -2146,6 +2158,65 @@ with middle_panel:
                     config.app.get("audio_bitrate", "192k"),
                 )
             )
+
+            quality_preset_options = [
+                (tr("Balanced Quality Preset"), "balanced"),
+                (tr("Fast Draft Preset"), "draft"),
+                (tr("High Quality Preset"), "high"),
+                (tr("Archive Quality Preset"), "archive"),
+                (tr("Custom Quality Preset"), "custom"),
+            ]
+            quality_preset_values = {
+                "draft": {
+                    "video_crf": 28,
+                    "video_encoder_preset": "veryfast",
+                    "video_fps": 24,
+                    "audio_bitrate_kbps": 128,
+                },
+                "balanced": {
+                    "video_crf": 20,
+                    "video_encoder_preset": "medium",
+                    "video_fps": 30,
+                    "audio_bitrate_kbps": 192,
+                },
+                "high": {
+                    "video_crf": 18,
+                    "video_encoder_preset": "slow",
+                    "video_fps": 60,
+                    "audio_bitrate_kbps": 256,
+                },
+                "archive": {
+                    "video_crf": 16,
+                    "video_encoder_preset": "slower",
+                    "video_fps": 60,
+                    "audio_bitrate_kbps": 320,
+                },
+            }
+            saved_quality_preset = config.ui.get("video_quality_preset", "balanced")
+            quality_preset_keys = [item[1] for item in quality_preset_options]
+            if saved_quality_preset not in quality_preset_keys:
+                saved_quality_preset = "balanced"
+            selected_quality_preset_index = st.selectbox(
+                tr("Video Quality Preset"),
+                options=range(len(quality_preset_options)),
+                index=quality_preset_keys.index(saved_quality_preset),
+                format_func=lambda x: quality_preset_options[x][0],
+                help=tr("Video Quality Preset Help"),
+            )
+            selected_quality_preset = quality_preset_options[
+                selected_quality_preset_index
+            ][1]
+            config.ui["video_quality_preset"] = selected_quality_preset
+            preset_values = quality_preset_values.get(selected_quality_preset)
+            if preset_values:
+                st.session_state["video_crf"] = preset_values["video_crf"]
+                st.session_state["video_encoder_preset"] = preset_values[
+                    "video_encoder_preset"
+                ]
+                st.session_state["video_fps"] = preset_values["video_fps"]
+                st.session_state["audio_bitrate_kbps"] = preset_values[
+                    "audio_bitrate_kbps"
+                ]
 
             quality_cols = st.columns(2)
             with quality_cols[0]:
@@ -3507,6 +3578,12 @@ if start_button or batch_button:
     )
     if repeat_warning:
         st.warning(repeat_warning)
+        suggestion_subject = params.video_subject if start_button else ""
+        if not suggestion_subject and repeat_matches:
+            suggestion_subject = repeat_matches[0].get("subject", "")
+        repeat_suggestions = _subject_repeat_suggestion_text(suggestion_subject)
+        if repeat_suggestions:
+            st.info(repeat_suggestions)
 
     log_container = st.empty()
     log_records = []
