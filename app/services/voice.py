@@ -143,8 +143,8 @@ def get_elevenlabs_voices(api_key: str) -> list[str]:
     if not api_key:
         return []
     try:
-        url = "https://api.elevenlabs.io/v2/voices"
-        params = {"is_favorite": "true", "page_size": 100}
+        url = "https://api.elevenlabs.io/v1/voices"
+        params = {}
         headers = {"xi-api-key": api_key}
         response = requests.get(url, params=params, headers=headers, timeout=10)
         if response.status_code != 200:
@@ -1106,7 +1106,9 @@ def gemini_tts(
             return None
         
         # 导出为MP3格式
-        audio_segment.export(voice_file, format="mp3")
+        export_handle = audio_segment.export(voice_file, format="mp3")
+        if export_handle is not None:
+            export_handle.close()
         
         logger.info(f"completed, output file: {voice_file}")
         
@@ -1626,6 +1628,220 @@ def _build_subtitle_items_from_legacy_submaker(
         )
 
     return sub_items
+
+
+def _build_karaoke_subtitle_items_from_edge_cues(sub_maker: SubMaker) -> list[str]:
+    formatter = _build_subtitle_formatter()
+    sub_items = []
+
+    for cue in getattr(sub_maker, "cues", []):
+        cue_text = unescape(getattr(cue, "content", "")).strip()
+        if not cue_text:
+            continue
+
+        start_time = int(cue.start.total_seconds() * 10000000)
+        end_time = int(cue.end.total_seconds() * 10000000)
+        if end_time <= start_time:
+            continue
+
+        sub_items.append(
+            formatter(
+                idx=len(sub_items) + 1,
+                start_time=start_time,
+                end_time=end_time,
+                sub_text=cue_text,
+            )
+        )
+
+    return sub_items
+
+
+def _build_karaoke_subtitle_items_from_legacy_submaker(
+    sub_maker: SubMaker,
+) -> list[str]:
+    formatter = _build_subtitle_formatter()
+    sub_items = []
+
+    legacy_offsets = getattr(sub_maker, "offset", [])
+    legacy_subs = getattr(sub_maker, "subs", [])
+    for offset, sub_text in zip(legacy_offsets, legacy_subs):
+        start_time, end_time = offset
+        clean_text = unescape(sub_text).strip()
+        if not clean_text or end_time <= start_time:
+            continue
+
+        sub_items.append(
+            formatter(
+                idx=len(sub_items) + 1,
+                start_time=start_time,
+                end_time=end_time,
+                sub_text=clean_text,
+            )
+        )
+
+    return sub_items
+
+
+def _ass_timestamp(seconds: float) -> str:
+    if seconds < 0:
+        seconds = 0
+
+    total_centiseconds = int(round(seconds * 100))
+    hour = total_centiseconds // 360000
+    total_centiseconds %= 360000
+    minute = total_centiseconds // 6000
+    total_centiseconds %= 6000
+    second = total_centiseconds // 100
+    centisecond = total_centiseconds % 100
+    return f"{hour}:{minute:02d}:{second:02d}.{centisecond:02d}"
+
+
+def _escape_ass_text(text: str) -> str:
+    return (
+        text.replace("\\", "")
+        .replace("{", "(")
+        .replace("}", ")")
+        .replace("\r\n", "\n")
+        .replace("\r", "\n")
+        .replace("\n", r"\N")
+    )
+
+
+def _cue_seconds(value) -> float:
+    if hasattr(value, "total_seconds"):
+        return float(value.total_seconds())
+    return float(value) / 10**7
+
+
+def _build_ass_header() -> str:
+    return "\n".join(
+        [
+            "[Script Info]",
+            "ScriptType: v4.00+",
+            "WrapStyle: 2",
+            "ScaledBorderAndShadow: yes",
+            "YCbCr Matrix: TV.709",
+            "",
+            "[V4+ Styles]",
+            (
+                "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, "
+                "OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, "
+                "ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, "
+                "Alignment, MarginL, MarginR, MarginV, Encoding"
+            ),
+            (
+                "Style: Karaoke,Arial,56,&H00FFFFFF,&H0000D7FF,&H8A000000,"
+                "&H80000000,1,0,0,0,100,100,0,0,1,3,1,2,80,80,80,1"
+            ),
+            "",
+            "[Events]",
+            "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
+        ]
+    )
+
+
+def _build_karaoke_ass_from_edge_cues(sub_maker: SubMaker) -> str:
+    events = []
+    current_tokens = []
+    current_start = None
+    current_end = None
+
+    def flush_current_line():
+        nonlocal current_tokens, current_start, current_end
+        if not current_tokens or current_start is None or current_end is None:
+            return
+
+        text_parts = []
+        previous_text = ""
+        for duration_cs, token_text in current_tokens:
+            spacing = ""
+            if (
+                text_parts
+                and token_text[:1] not in ",.!?;:)]"
+                and previous_text[-1:] not in " (["
+            ):
+                spacing = " "
+            text_parts.append(f"{spacing}{{\\kf{duration_cs}}}{token_text}")
+            previous_text = token_text
+
+        events.append(
+            (
+                f"Dialogue: 0,{_ass_timestamp(current_start)},{_ass_timestamp(current_end)},"
+                f"Karaoke,,0,0,0,,{''.join(text_parts)}"
+            )
+        )
+        current_tokens = []
+        current_start = None
+        current_end = None
+
+    for cue in getattr(sub_maker, "cues", []):
+        cue_text = _escape_ass_text(unescape(getattr(cue, "content", "")).strip())
+        if not cue_text:
+            continue
+
+        start_seconds = _cue_seconds(cue.start)
+        end_seconds = _cue_seconds(cue.end)
+        if end_seconds <= start_seconds:
+            continue
+
+        if current_start is None:
+            current_start = start_seconds
+        current_end = end_seconds
+        duration_cs = max(1, int(round((end_seconds - start_seconds) * 100)))
+        current_tokens.append((duration_cs, cue_text))
+
+        if cue_text[-1:] in ".!?;:" or len(current_tokens) >= 8:
+            flush_current_line()
+
+    flush_current_line()
+    if not events:
+        return ""
+
+    return f"{_build_ass_header()}\n" + "\n".join(events) + "\n"
+
+
+def create_karaoke_ass_subtitle(sub_maker: SubMaker, subtitle_file: str) -> bool:
+    try:
+        if not getattr(sub_maker, "cues", []):
+            logger.warning("ASS karaoke subtitle requested, but no edge cues found")
+            return False
+
+        subtitle_text = _build_karaoke_ass_from_edge_cues(sub_maker)
+        if not subtitle_text:
+            logger.warning("ASS karaoke subtitle requested, but no valid cues found")
+            return False
+
+        ensure_file_path_exists(subtitle_file)
+        with open(subtitle_file, "w", encoding="utf-8") as file:
+            file.write(subtitle_text)
+        logger.info(f"completed, ASS karaoke subtitle file created: {subtitle_file}")
+        return True
+    except Exception as e:
+        logger.error(f"failed to create ASS karaoke subtitle, error: {str(e)}")
+        if os.path.exists(subtitle_file):
+            os.remove(subtitle_file)
+        return False
+
+
+def create_karaoke_subtitle(sub_maker: SubMaker, text: str, subtitle_file: str) -> bool:
+    """
+    Create a word/phrase-timed subtitle file for karaoke-style highlighting.
+    Falls back cleanly by returning False when the TTS provider has no timing cues.
+    """
+    try:
+        if hasattr(sub_maker, "cues") and sub_maker.cues:
+            sub_items = _build_karaoke_subtitle_items_from_edge_cues(sub_maker)
+        else:
+            sub_items = _build_karaoke_subtitle_items_from_legacy_submaker(sub_maker)
+
+        if not sub_items:
+            logger.warning("karaoke subtitle requested, but no subtitle cues found")
+            return False
+
+        return _write_subtitle_items(sub_items, subtitle_file)
+    except Exception as e:
+        logger.error(f"failed to create karaoke subtitle, error: {str(e)}")
+        return False
 
 
 def create_subtitle(sub_maker: SubMaker, text: str, subtitle_file: str):

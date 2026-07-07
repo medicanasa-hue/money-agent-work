@@ -1,7 +1,10 @@
-from fastapi import Request
+from fastapi import Depends, Request
 
+from app.controllers import base
 from app.controllers.v1.base import new_router
 from app.models.schema import (
+    ContentIntelligenceRequest,
+    ContentIntelligenceResponse,
     VideoScriptRequest,
     VideoScriptResponse,
     VideoSocialMetadataRequest,
@@ -9,12 +12,12 @@ from app.models.schema import (
     VideoTermsRequest,
     VideoTermsResponse,
 )
-from app.services import llm
+from app.services import content_intelligence, llm
 from app.utils import utils
 
 # authentication dependency
 # router = new_router(dependencies=[Depends(base.verify_token)])
-router = new_router()
+router = new_router(dependencies=[Depends(base.verify_token)])
 
 
 @router.post(
@@ -65,3 +68,27 @@ def generate_video_social_metadata(
         platform=body.platform,
     )
     return utils.get_response(200, metadata)
+
+
+@router.post(
+    "/content-intelligence",
+    response_model=ContentIntelligenceResponse,
+    summary="Generate short-video content ideas and a production calendar",
+)
+def generate_content_intelligence(
+    request: Request, body: ContentIntelligenceRequest
+):
+    plan = content_intelligence.generate_content_plan(
+        video_subject=body.video_subject,
+        video_script=body.video_script,
+        language=body.language,
+        platform=body.platform,
+        target_audience=body.target_audience,
+        tone=body.tone,
+        days=body.days,
+        daily_count=body.daily_count,
+        idea_count=body.idea_count,
+        use_trend_context=body.use_trend_context,
+        trend_source=body.trend_source,
+    )
+    return utils.get_response(200, plan)

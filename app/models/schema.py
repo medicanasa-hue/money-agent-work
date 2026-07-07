@@ -1,9 +1,9 @@
 import warnings
 from enum import Enum
-from typing import Any, List, Optional, Union
+from typing import Any, List, Literal, Optional, Union
 
 import pydantic
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from app.config import config
 
@@ -53,6 +53,15 @@ class MaterialInfo:
     provider: str = "pexels"
     url: str = ""
     duration: int = 0
+    width: int = 0
+    height: int = 0
+    search_query: str = Field(default="", repr=False)
+    title: str = Field(default="", repr=False)
+    description: str = Field(default="", repr=False)
+    tags: List[str] = Field(default_factory=list, repr=False)
+    license: str = Field(default="", repr=False)
+    license_url: str = Field(default="", repr=False)
+    attribution: str = Field(default="", repr=False)
 
 
 class VideoParams(BaseModel):
@@ -73,12 +82,39 @@ class VideoParams(BaseModel):
     video_subject: str
     video_script: str = ""  # Script used to generate the video
     video_terms: Optional[str | list] = None  # Keywords used to generate the video
-    video_aspect: Optional[VideoAspect] = VideoAspect.portrait.value
-    video_concat_mode: Optional[VideoConcatMode] = VideoConcatMode.random.value
+    video_aspect: Optional[VideoAspect] = VideoAspect.portrait
+    video_concat_mode: Optional[VideoConcatMode] = VideoConcatMode.random
     video_transition_mode: Optional[VideoTransitionMode] = None
     video_clip_duration: Optional[int] = 5
     match_materials_to_script: bool = False
+    smart_scene_queries: bool = False
     video_count: Optional[int] = 1
+    video_codec: Optional[
+        Literal[
+            "libx264",
+            "h264_nvenc",
+            "h264_amf",
+            "h264_qsv",
+            "h264_mf",
+            "h264_videotoolbox",
+        ]
+    ] = None
+    video_crf: Optional[int] = Field(default=None, ge=0, le=51)
+    video_encoder_preset: Optional[
+        Literal[
+            "ultrafast",
+            "superfast",
+            "veryfast",
+            "faster",
+            "fast",
+            "medium",
+            "slow",
+            "slower",
+            "veryslow",
+        ]
+    ] = None
+    video_fps: Optional[int] = Field(default=None, ge=1, le=120)
+    audio_bitrate: Optional[str] = None
 
     video_source: Optional[str] = "pexels"
     video_materials: Optional[List[MaterialInfo]] = (
@@ -96,6 +132,7 @@ class VideoParams(BaseModel):
     bgm_volume: Optional[float] = 0.2
 
     subtitle_enabled: Optional[bool] = True
+    subtitle_style: Optional[str] = config.ui.get("subtitle_style", "classic")
     subtitle_position: Optional[str] = config.ui.get("subtitle_position", "bottom")  # top, bottom, center, custom
     custom_position: float = config.ui.get("custom_position", 70.0)
     font_name: Optional[str] = "STHeitiMedium.ttc"
@@ -110,6 +147,51 @@ class VideoParams(BaseModel):
     paragraph_number: int = Field(default=1, ge=1, le=10)
     video_script_prompt: str = Field(default="", max_length=2000)
     custom_system_prompt: str = Field(default="", max_length=8000)
+
+    @field_validator("video_crf", "video_fps", mode="before")
+    @classmethod
+    def reject_bool_video_quality_numbers(cls, value):
+        if isinstance(value, bool):
+            raise ValueError("video quality numeric fields must be numbers")
+        return value
+
+    @field_validator("video_fps", mode="before")
+    @classmethod
+    def normalize_video_fps(cls, value):
+        if not isinstance(value, str):
+            return value
+        normalized = value.strip().lower()
+        if normalized.endswith("fps"):
+            return normalized[:-3].strip()
+        return value
+
+    @field_validator("video_codec", "video_encoder_preset", mode="before")
+    @classmethod
+    def normalize_video_quality_choice_fields(cls, value):
+        if value is None or not isinstance(value, str):
+            return value
+        return value.strip().lower()
+
+    @field_validator("audio_bitrate", mode="before")
+    @classmethod
+    def normalize_audio_bitrate(cls, value):
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            raise ValueError("audio_bitrate must be between 32k and 512k")
+
+        normalized = str(value).strip().lower()
+        if normalized.endswith("kbps"):
+            normalized = normalized[:-4].strip()
+        elif normalized.endswith("k"):
+            normalized = normalized[:-1]
+        try:
+            kbps = int(normalized)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("audio_bitrate must be between 32k and 512k") from exc
+        if not 32 <= kbps <= 512:
+            raise ValueError("audio_bitrate must be between 32k and 512k")
+        return f"{kbps}k"
 
 
 class SubtitleRequest(BaseModel):
@@ -126,6 +208,7 @@ class SubtitleRequest(BaseModel):
     text_fore_color: Optional[str] = "#FFFFFF"
     text_background_color: Union[bool, str] = True
     rounded_subtitle_background: bool = False
+    subtitle_style: Optional[str] = config.ui.get("subtitle_style", "classic")
     font_size: int = 60
     stroke_color: Optional[str] = "#000000"
     stroke_width: float = 1.5
@@ -197,6 +280,34 @@ class VideoSocialMetadataParams:
     platform: Optional[str] = Field(default="tiktok", max_length=64)
 
 
+class ContentIntelligenceParams:
+    """
+    {
+      "video_subject": "personal finance for beginners",
+      "video_script": "",
+      "language": "auto",
+      "platform": "tiktok",
+      "target_audience": "young adults",
+      "tone": "practical",
+      "days": 7,
+      "daily_count": 1,
+      "idea_count": 7
+    }
+    """
+
+    video_subject: Optional[str] = Field(default="", max_length=500)
+    video_script: Optional[str] = Field(default="", max_length=8000)
+    language: Optional[str] = Field(default="auto", max_length=64)
+    platform: Optional[str] = Field(default="tiktok", max_length=64)
+    target_audience: Optional[str] = Field(default="", max_length=500)
+    tone: Optional[str] = Field(default="", max_length=128)
+    days: int = Field(default=7, ge=7, le=14)
+    daily_count: int = Field(default=1, ge=1, le=3)
+    idea_count: int = Field(default=7, ge=1, le=30)
+    use_trend_context: bool = False
+    trend_source: Optional[str] = Field(default="none", max_length=32)
+
+
 class BaseResponse(BaseModel):
     status: int = 200
     message: Optional[str] = "success"
@@ -220,6 +331,10 @@ class VideoTermsRequest(VideoTermsParams, BaseModel):
 
 
 class VideoSocialMetadataRequest(VideoSocialMetadataParams, BaseModel):
+    pass
+
+
+class ContentIntelligenceRequest(ContentIntelligenceParams, BaseModel):
     pass
 
 
@@ -317,6 +432,43 @@ class VideoSocialMetadataResponse(BaseResponse):
                     "title": "A Day in Shanghai You Should Not Miss",
                     "caption": "Save this quick Shanghai inspiration and follow for more short travel ideas.",
                     "hashtags": ["#shorts", "#travel", "#shanghai", "#viral", "#fyp"],
+                },
+            },
+        }
+
+
+class ContentIntelligenceResponse(BaseResponse):
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "status": 200,
+                "message": "success",
+                "data": {
+                    "ideas": [
+                        {
+                            "subject": "Budgeting mistakes beginners make",
+                            "angle": "common mistake",
+                            "hook": "Most beginners miss this budgeting step.",
+                            "script_prompt": "Write a concise short-form video script about budgeting mistakes.",
+                            "search_terms": ["budgeting", "money planning", "saving"],
+                            "platform": "tiktok",
+                            "rationale": "Useful planning idea without live trend claims.",
+                        }
+                    ],
+                    "calendar": [
+                        {
+                            "day": 1,
+                            "date": "2026-06-30",
+                            "subject": "Budgeting mistakes beginners make",
+                            "format": "short_video",
+                            "goal": "common mistake",
+                            "script_prompt": "Write a concise short-form video script about budgeting mistakes.",
+                        }
+                    ],
+                    "warnings": [
+                        "No live trend data was used; these are planning suggestions, not current popularity or virality claims."
+                    ],
+                    "source": "llm",
                 },
             },
         }

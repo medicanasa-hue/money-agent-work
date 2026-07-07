@@ -1,5 +1,6 @@
 """Application implementation - ASGI."""
 
+import ipaddress
 import os
 
 from fastapi import FastAPI, Request
@@ -31,6 +32,27 @@ def validation_exception_handler(request: Request, e: RequestValidationError):
     )
 
 
+def warn_if_api_unprotected(api_key: str | None, listen_host: str | None) -> str | None:
+    api_key = (api_key or "").strip()
+    if api_key:
+        return None
+
+    host = (listen_host or "").strip().lower()
+    if host == "localhost":
+        return None
+
+    try:
+        if ipaddress.ip_address(host).is_loopback:
+            return None
+    except ValueError:
+        pass
+
+    return (
+        "API authentication is disabled while listen_host is not loopback. "
+        "Set app.api_key or bind the API to 127.0.0.1/localhost for safer local use."
+    )
+
+
 def get_application() -> FastAPI:
     """Initialize FastAPI application.
 
@@ -47,6 +69,12 @@ def get_application() -> FastAPI:
     instance.include_router(root_api_router)
     instance.add_exception_handler(HttpException, exception_handler)
     instance.add_exception_handler(RequestValidationError, validation_exception_handler)
+    warning_message = warn_if_api_unprotected(
+        api_key=config.app.get("api_key", ""),
+        listen_host=config.listen_host,
+    )
+    if warning_message:
+        logger.warning(warning_message)
     return instance
 
 

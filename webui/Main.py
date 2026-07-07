@@ -1,3 +1,4 @@
+import json
 import os
 import sys
 import webbrowser
@@ -23,7 +24,16 @@ from app.models.schema import (
     VideoParams,
     VideoTransitionMode,
 )
-from app.services import llm, voice
+from app.services import (
+    content_intelligence,
+    history,
+    llm,
+    material,
+    presets,
+    upload_post,
+    viral_analyzer,
+    voice,
+)
 from app.services import task as tm
 from app.utils import utils
 
@@ -122,6 +132,93 @@ def _detect_audio_mime(audio_file: str, audio_bytes: bytes) -> str:
     }.get(ext, "audio/mp3")
 
 
+def _config_bool(value, default=False):
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "on")
+    return bool(value)
+
+
+def _normalize_int_range(value, default, min_value, max_value):
+    if isinstance(value, bool):
+        return default
+    try:
+        parsed_value = int(value)
+    except (TypeError, ValueError):
+        return default
+    if min_value <= parsed_value <= max_value:
+        return parsed_value
+    return default
+
+
+def _normalize_video_crf_value(value):
+    return _normalize_int_range(value, 20, 0, 51)
+
+
+def _normalize_video_fps_value(value):
+    if isinstance(value, str):
+        value = value.strip().lower()
+        if value.endswith("fps"):
+            value = value[:-3].strip()
+    return _normalize_int_range(value, 30, 1, 120)
+
+
+def _normalize_audio_bitrate_kbps(value):
+    if isinstance(value, bool):
+        return 192
+    if isinstance(value, str):
+        value = value.strip().lower()
+        if value.endswith("kbps"):
+            value = value[:-4].strip()
+        elif value.endswith("k"):
+            value = value[:-1]
+    return _normalize_int_range(value, 192, 32, 512)
+
+
+def _libx264_preset_options():
+    return (
+        "ultrafast",
+        "superfast",
+        "veryfast",
+        "faster",
+        "fast",
+        "medium",
+        "slow",
+        "slower",
+        "veryslow",
+    )
+
+
+def _normalize_libx264_preset(value):
+    if not isinstance(value, str):
+        return "medium"
+    preset = value.strip().lower()
+    if preset in _libx264_preset_options():
+        return preset
+    return "medium"
+
+
+def _video_codec_options():
+    return [
+        ("libx264 (CPU)", "libx264"),
+        ("NVIDIA NVENC (h264_nvenc)", "h264_nvenc"),
+        ("AMD AMF (h264_amf)", "h264_amf"),
+        ("Intel QSV (h264_qsv)", "h264_qsv"),
+        ("Windows MediaFoundation (h264_mf)", "h264_mf"),
+        ("macOS VideoToolbox (h264_videotoolbox)", "h264_videotoolbox"),
+    ]
+
+
+def _normalize_video_codec(value):
+    codec = str(value or "").strip().lower()
+    if codec in {item[1] for item in _video_codec_options()}:
+        return codec
+    return "libx264"
+
+
 if "video_subject" not in st.session_state:
     st.session_state["video_subject"] = ""
 if "video_script" not in st.session_state:
@@ -138,11 +235,123 @@ if "match_materials_to_script" not in st.session_state:
     st.session_state["match_materials_to_script"] = bool(
         config.app.get("match_materials_to_script", False)
     )
+if "smart_scene_queries" not in st.session_state:
+    st.session_state["smart_scene_queries"] = bool(
+        config.app.get("smart_scene_queries", False)
+    )
+if "material_search_max_page" not in st.session_state:
+    try:
+        st.session_state["material_search_max_page"] = max(
+            1,
+            min(50, int(config.app.get("material_search_max_page", 1) or 1)),
+        )
+    except (TypeError, ValueError):
+        st.session_state["material_search_max_page"] = 1
+if "video_cooldown_enabled" not in st.session_state:
+    video_cooldown_enabled = config.app.get("video_cooldown_enabled", False)
+    if isinstance(video_cooldown_enabled, str):
+        video_cooldown_enabled = video_cooldown_enabled.strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+    st.session_state["video_cooldown_enabled"] = bool(video_cooldown_enabled)
+if "video_cooldown_days" not in st.session_state:
+    try:
+        st.session_state["video_cooldown_days"] = max(
+            1,
+            int(config.app.get("video_cooldown_days", 7) or 7),
+        )
+    except (TypeError, ValueError):
+        st.session_state["video_cooldown_days"] = 7
+if "video_crf" not in st.session_state:
+    st.session_state["video_crf"] = _normalize_video_crf_value(
+        config.app.get("video_crf", 20)
+    )
+if "video_encoder_preset" not in st.session_state:
+    st.session_state["video_encoder_preset"] = _normalize_libx264_preset(
+        config.app.get("video_encoder_preset", "medium")
+    )
+if "video_fps" not in st.session_state:
+    st.session_state["video_fps"] = _normalize_video_fps_value(
+        config.app.get("video_fps", 30)
+    )
+if "audio_bitrate_kbps" not in st.session_state:
+    st.session_state["audio_bitrate_kbps"] = _normalize_audio_bitrate_kbps(
+        config.app.get("audio_bitrate", "192k")
+    )
 if "ui_language" not in st.session_state:
     st.session_state["ui_language"] = config.ui.get("language", system_locale)
 if "local_video_materials" not in st.session_state:
-    # 记住用户最近一次已经落盘的本地素材，避免仅修改文案后二次生成时丢失素材列表。
     st.session_state["local_video_materials"] = []
+if "batch_subjects" not in st.session_state:
+    st.session_state["batch_subjects"] = ""
+if "use_manual_batch_scripts" not in st.session_state:
+    st.session_state["use_manual_batch_scripts"] = False
+if "batch_script_blocks" not in st.session_state:
+    st.session_state["batch_script_blocks"] = ""
+if "content_plan" not in st.session_state:
+    st.session_state["content_plan"] = None
+if "content_niche" not in st.session_state:
+    st.session_state["content_niche"] = ""
+if "content_target_audience" not in st.session_state:
+    st.session_state["content_target_audience"] = ""
+if "content_tone" not in st.session_state:
+    st.session_state["content_tone"] = ""
+if "content_plan_days" not in st.session_state:
+    st.session_state["content_plan_days"] = 7
+if "content_daily_count" not in st.session_state:
+    st.session_state["content_daily_count"] = 1
+if "content_idea_count" not in st.session_state:
+    st.session_state["content_idea_count"] = 7
+if "content_use_trend_context" not in st.session_state:
+    st.session_state["content_use_trend_context"] = False
+if "content_trend_source" not in st.session_state:
+    st.session_state["content_trend_source"] = content_intelligence.TREND_SOURCE_STATIC
+if "social_metadata" not in st.session_state:
+    st.session_state["social_metadata"] = None
+if "auto_social_metadata_after_video" not in st.session_state:
+    st.session_state["auto_social_metadata_after_video"] = True
+if "upload_post_enabled" not in st.session_state:
+    st.session_state["upload_post_enabled"] = _config_bool(
+        config.app.get("upload_post_enabled", False)
+    )
+if "upload_post_auto_upload" not in st.session_state:
+    st.session_state["upload_post_auto_upload"] = _config_bool(
+        config.app.get("upload_post_auto_upload", False)
+    )
+if "upload_post_allow_public_youtube" not in st.session_state:
+    st.session_state["upload_post_allow_public_youtube"] = _config_bool(
+        config.app.get("upload_post_allow_public_youtube", False)
+    )
+if "upload_post_youtube_privacy_status" not in st.session_state:
+    st.session_state["upload_post_youtube_privacy_status"] = (
+        upload_post.normalize_youtube_privacy_status(
+            config.app.get(
+                "upload_post_youtube_privacy_status",
+                upload_post.YOUTUBE_PRIVACY_UNLISTED,
+            ),
+            allow_public=st.session_state["upload_post_allow_public_youtube"],
+        )
+    )
+if "viral_analysis" not in st.session_state:
+    st.session_state["viral_analysis"] = None
+if "auto_viral_analysis_after_video" not in st.session_state:
+    st.session_state["auto_viral_analysis_after_video"] = False
+if "manual_video_selection_enabled" not in st.session_state:
+    st.session_state["manual_video_selection_enabled"] = False
+if "manual_video_candidates" not in st.session_state:
+    st.session_state["manual_video_candidates"] = []
+if "manual_video_selected_urls" not in st.session_state:
+    st.session_state["manual_video_selected_urls"] = []
+
+pending_content_topic = st.session_state.pop("_pending_content_topic", None)
+if pending_content_topic:
+    st.session_state["video_subject"] = pending_content_topic.get("subject", "")
+    st.session_state["video_script_prompt"] = pending_content_topic.get(
+        "script_prompt", ""
+    )
 
 # 加载语言文件
 locales = utils.load_locales(i18n_dir)
@@ -209,15 +418,10 @@ def get_all_songs():
 
 def open_task_folder(task_id):
     try:
-        # task_id 应始终是服务端生成的 UUID。这里先做格式校验，避免异常值
-        # 通过路径拼接访问任务目录之外的位置，也避免后续打开目录时触发
-        # 平台 shell 对特殊字符的解释。
         normalized_task_id = str(UUID(str(task_id)))
         tasks_root = os.path.abspath(os.path.join(root_dir, "storage", "tasks"))
         path = os.path.abspath(os.path.join(tasks_root, normalized_task_id))
 
-        # 即使 UUID 校验通过，也再次确认最终路径仍在任务根目录内，避免
-        # 未来调用方调整 task_id 来源时引入路径穿越风险。
         if not path.startswith(tasks_root + os.sep):
             logger.warning(f"invalid task folder path: {path}")
             return
@@ -250,14 +454,9 @@ def init_log():
     _lvl = "DEBUG"
 
     def format_record(record):
-        # 获取日志记录中的文件全路径
         file_path = record["file"].path
-        # 将绝对路径转换为相对于项目根目录的路径
         relative_path = os.path.relpath(file_path, root_dir)
-        # 更新记录中的文件路径
         record["file"].path = f"./{relative_path}"
-        # 返回修改后的格式字符串
-        # 您可以根据需要调整这里的格式
         record["message"] = record["message"].replace(root_dir, ".")
 
         _format = (
@@ -285,6 +484,780 @@ locales = utils.load_locales(i18n_dir)
 def tr(key):
     loc = locales.get(st.session_state["ui_language"], {})
     return loc.get("Translation", {}).get(key, key)
+
+_VIDEO_SOURCE_KEYS = {
+    "pexels",
+    "pixabay",
+    "coverr",
+    "nasa",
+    "wikimedia",
+    "archive_org",
+    "local",
+}
+
+
+def _plain_value(value):
+    return getattr(value, "value", value)
+
+
+def _find_option_index(options, selected_value, default_index=0):
+    selected_value = _plain_value(selected_value)
+    for index, option in enumerate(options):
+        option_value = option[1] if isinstance(option, tuple) else option
+        if _plain_value(option_value) == selected_value:
+            return index
+    return default_index
+
+
+def _config_int(section, key, default):
+    try:
+        return int(section.get(key, default))
+    except (TypeError, ValueError):
+        return default
+
+
+def _set_ui_value(key, value):
+    if value is not None:
+        config.ui[key] = _plain_value(value)
+
+
+def _current_preset_app_config():
+    return {
+        "video_codec": _normalize_video_codec(
+            config.app.get("video_codec", "libx264")
+        ),
+        "video_cooldown_enabled": bool(
+            st.session_state.get("video_cooldown_enabled", False)
+        ),
+        "video_cooldown_days": int(
+            st.session_state.get("video_cooldown_days", 7) or 7
+        ),
+        "video_crf": _normalize_video_crf_value(
+            st.session_state.get("video_crf", config.app.get("video_crf", 20))
+        ),
+        "video_encoder_preset": _normalize_libx264_preset(
+            st.session_state.get(
+                "video_encoder_preset",
+                config.app.get("video_encoder_preset", "medium"),
+            )
+        ),
+        "video_fps": _normalize_video_fps_value(
+            st.session_state.get("video_fps", config.app.get("video_fps", 30))
+        ),
+        "audio_bitrate": "{}k".format(
+            _normalize_audio_bitrate_kbps(
+                st.session_state.get(
+                    "audio_bitrate_kbps",
+                    config.app.get("audio_bitrate", "192k"),
+                )
+            )
+        ),
+    }
+
+
+def _apply_video_quality_params(params):
+    params.video_codec = _normalize_video_codec(
+        config.app.get("video_codec", "libx264")
+    )
+    params.video_crf = _normalize_video_crf_value(
+        st.session_state.get("video_crf", config.app.get("video_crf", 20))
+    )
+    params.video_encoder_preset = _normalize_libx264_preset(
+        st.session_state.get(
+            "video_encoder_preset",
+            config.app.get("video_encoder_preset", "medium"),
+        )
+    )
+    params.video_fps = _normalize_video_fps_value(
+        st.session_state.get("video_fps", config.app.get("video_fps", 30))
+    )
+    params.audio_bitrate = "{}k".format(
+        _normalize_audio_bitrate_kbps(
+            st.session_state.get(
+                "audio_bitrate_kbps",
+                config.app.get("audio_bitrate", "192k"),
+            )
+        )
+    )
+    return params
+
+
+def _apply_video_preset(payload):
+    params_data = payload.get("params", {})
+    app_config_data = payload.get("app_config") or {}
+    preset_name = payload.get("name", "")
+
+    st.session_state["video_subject"] = params_data.get("video_subject", "")
+    st.session_state["video_script"] = params_data.get("video_script", "")
+
+    video_terms = params_data.get("video_terms", "")
+    if isinstance(video_terms, list):
+        video_terms = ", ".join(str(term) for term in video_terms)
+    st.session_state["video_terms"] = video_terms or ""
+
+    st.session_state["paragraph_number_input"] = params_data.get("paragraph_number", 1)
+    st.session_state["video_script_prompt"] = params_data.get("video_script_prompt", "")
+
+    custom_system_prompt = params_data.get("custom_system_prompt", "")
+    st.session_state["use_custom_system_prompt"] = bool(custom_system_prompt)
+    st.session_state["custom_system_prompt"] = (
+        custom_system_prompt or llm.DEFAULT_SCRIPT_SYSTEM_PROMPT
+    )
+    st.session_state["match_materials_to_script"] = bool(
+        params_data.get("match_materials_to_script", False)
+    )
+    st.session_state["custom_bgm_file_input"] = params_data.get("bgm_file", "")
+
+    if "video_cooldown_enabled" in app_config_data:
+        video_cooldown_enabled = bool(app_config_data["video_cooldown_enabled"])
+        st.session_state["video_cooldown_enabled"] = video_cooldown_enabled
+        config.app["video_cooldown_enabled"] = video_cooldown_enabled
+    if "video_cooldown_days" in app_config_data:
+        try:
+            video_cooldown_days = int(app_config_data["video_cooldown_days"])
+        except (TypeError, ValueError):
+            video_cooldown_days = 7
+        st.session_state["video_cooldown_days"] = video_cooldown_days
+        config.app["video_cooldown_days"] = video_cooldown_days
+
+    if "video_codec" in app_config_data:
+        config.app["video_codec"] = _normalize_video_codec(app_config_data["video_codec"])
+    if "video_crf" in app_config_data:
+        video_crf = _normalize_video_crf_value(app_config_data["video_crf"])
+        st.session_state["video_crf"] = video_crf
+        config.app["video_crf"] = video_crf
+    if "video_encoder_preset" in app_config_data:
+        video_encoder_preset = _normalize_libx264_preset(
+            app_config_data["video_encoder_preset"]
+        )
+        st.session_state["video_encoder_preset"] = video_encoder_preset
+        config.app["video_encoder_preset"] = video_encoder_preset
+    if "video_fps" in app_config_data:
+        video_fps = _normalize_video_fps_value(app_config_data["video_fps"])
+        st.session_state["video_fps"] = video_fps
+        config.app["video_fps"] = video_fps
+    if "audio_bitrate" in app_config_data:
+        audio_bitrate_kbps = _normalize_audio_bitrate_kbps(
+            app_config_data["audio_bitrate"]
+        )
+        st.session_state["audio_bitrate_kbps"] = audio_bitrate_kbps
+        config.app["audio_bitrate"] = f"{audio_bitrate_kbps}k"
+
+    video_source = params_data.get("video_source")
+    if video_source:
+        config.app["video_source"] = video_source
+        if video_source in _VIDEO_SOURCE_KEYS:
+            config.app["enabled_video_sources"] = [video_source]
+        elif video_source == "multi" and not config.app.get("enabled_video_sources"):
+            config.app["enabled_video_sources"] = ["pexels", "pixabay", "coverr"]
+
+    _set_ui_value("video_concat_mode", params_data.get("video_concat_mode"))
+    if params_data.get("video_transition_mode") is None:
+        config.ui.pop("video_transition_mode", None)
+    else:
+        _set_ui_value("video_transition_mode", params_data.get("video_transition_mode"))
+    _set_ui_value("video_aspect", params_data.get("video_aspect"))
+    _set_ui_value("video_clip_duration", params_data.get("video_clip_duration"))
+    _set_ui_value("video_count", params_data.get("video_count"))
+    _set_ui_value("voice_name", params_data.get("voice_name"))
+    _set_ui_value("voice_volume", params_data.get("voice_volume"))
+    _set_ui_value("voice_rate", params_data.get("voice_rate"))
+    _set_ui_value("bgm_type", params_data.get("bgm_type"))
+    _set_ui_value("bgm_file", params_data.get("bgm_file"))
+    _set_ui_value("bgm_volume", params_data.get("bgm_volume"))
+    _set_ui_value("subtitle_enabled", params_data.get("subtitle_enabled"))
+    _set_ui_value("subtitle_style", params_data.get("subtitle_style"))
+    _set_ui_value("subtitle_position", params_data.get("subtitle_position"))
+    _set_ui_value("custom_position", params_data.get("custom_position"))
+    _set_ui_value("font_name", params_data.get("font_name"))
+    _set_ui_value("text_fore_color", params_data.get("text_fore_color"))
+    _set_ui_value("font_size", params_data.get("font_size"))
+    _set_ui_value("stroke_color", params_data.get("stroke_color"))
+    _set_ui_value("stroke_width", params_data.get("stroke_width"))
+    _set_ui_value(
+        "rounded_subtitle_background",
+        params_data.get("rounded_subtitle_background"),
+    )
+
+    text_background_color = params_data.get("text_background_color", True)
+    if text_background_color is False:
+        config.ui["subtitle_background_enabled"] = False
+    else:
+        config.ui["subtitle_background_enabled"] = True
+        if isinstance(text_background_color, str):
+            config.ui["subtitle_background_color"] = text_background_color
+
+    return preset_name
+
+
+def _parse_batch_subjects(raw_subjects):
+    subjects = []
+    seen = set()
+    for line in (raw_subjects or "").splitlines():
+        subject = line.strip()
+        if not subject or subject in seen:
+            continue
+        seen.add(subject)
+        subjects.append(subject)
+    return subjects
+
+
+def _split_batch_script_blocks(raw_blocks):
+    blocks = []
+    current = []
+    for line in (raw_blocks or "").splitlines():
+        if line.strip() == "---":
+            block = "\n".join(current).strip()
+            if block:
+                blocks.append(block)
+            current = []
+        else:
+            current.append(line)
+
+    block = "\n".join(current).strip()
+    if block:
+        blocks.append(block)
+    return blocks
+
+
+def _parse_batch_script_blocks(raw_blocks):
+    items = []
+    for block in _split_batch_script_blocks(raw_blocks):
+        lines = [line.rstrip() for line in block.splitlines()]
+        while lines and not lines[0].strip():
+            lines.pop(0)
+        if not lines:
+            continue
+        subject = lines[0].strip()
+        script = "\n".join(lines[1:]).strip()
+        if subject:
+            items.append({"subject": subject, "script": script})
+    return items
+
+
+def _get_batch_items():
+    if st.session_state.get("use_manual_batch_scripts"):
+        return _parse_batch_script_blocks(
+            st.session_state.get("batch_script_blocks", "")
+        )
+    return [
+        {"subject": subject, "script": ""}
+        for subject in _parse_batch_subjects(
+            st.session_state.get("batch_subjects", "")
+        )
+    ]
+
+
+def _clone_video_params(source_params):
+    if hasattr(source_params, "model_dump"):
+        return VideoParams(**source_params.model_dump())
+    return source_params.copy(deep=True)
+
+
+def _material_to_dict(item):
+    return {
+        "provider": getattr(item, "provider", ""),
+        "url": getattr(item, "url", ""),
+        "duration": int(getattr(item, "duration", 0) or 0),
+        "width": int(getattr(item, "width", 0) or 0),
+        "height": int(getattr(item, "height", 0) or 0),
+    }
+
+
+def _material_from_dict(item):
+    m = MaterialInfo()
+    m.provider = item.get("provider", "")
+    m.url = item.get("url", "")
+    m.duration = int(item.get("duration", 0) or 0)
+    m.width = int(item.get("width", 0) or 0)
+    m.height = int(item.get("height", 0) or 0)
+    return m
+
+
+def _is_vertical_high_resolution(item):
+    width = int(item.get("width", 0) or 0)
+    height = int(item.get("height", 0) or 0)
+    return width > 0 and height > width and height >= 1080
+
+
+def _manual_recommended_candidate_url(candidates):
+    for item in candidates or []:
+        if item.get("url") and _is_vertical_high_resolution(item):
+            return item.get("url")
+    return ""
+
+
+def _manual_candidate_badges(item, is_system_recommendation=False):
+    width = int(item.get("width", 0) or 0)
+    height = int(item.get("height", 0) or 0)
+    if width <= 0 or height <= 0:
+        return []
+
+    badges = []
+    if is_system_recommendation:
+        badges.append(tr("System Recommendation Badge"))
+    if height > width:
+        badges.append(tr("Vertical Video Badge"))
+    if height < 720:
+        badges.append(tr("Low Resolution Badge"))
+    return badges
+
+
+def _manual_candidate_label(url):
+    candidates = st.session_state.get("manual_video_candidates", [])
+    recommended_url = _manual_recommended_candidate_url(candidates)
+    for index, item in enumerate(candidates, start=1):
+        if item.get("url") == url:
+            provider = item.get("provider") or "source"
+            duration = item.get("duration") or 0
+            badges = _manual_candidate_badges(
+                item,
+                is_system_recommendation=item.get("url") == recommended_url,
+            )
+            badge_text = f" - {' / '.join(badges)}" if badges else ""
+            return f"{index}. {provider} - {duration}s{badge_text}"
+    return url
+
+
+def _selected_manual_video_materials():
+    selected_urls = st.session_state.get("manual_video_selected_urls", [])
+    candidates_by_url = {
+        item.get("url"): item
+        for item in st.session_state.get("manual_video_candidates", [])
+        if item.get("url")
+    }
+    materials = []
+    for url in selected_urls:
+        item = candidates_by_url.get(url)
+        if item:
+            materials.append(_material_from_dict(item))
+    return materials
+
+
+def _list_bgm_files():
+    if not os.path.isdir(song_dir):
+        return []
+    supported_exts = (".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg")
+    return sorted(
+        file
+        for file in os.listdir(song_dir)
+        if file.lower().endswith(supported_exts)
+    )
+
+
+def _prepare_task_params(
+    task_id,
+    source_params,
+    uploaded_audio,
+    uploaded_video_files,
+):
+    run_params = _clone_video_params(source_params)
+
+    if uploaded_audio:
+        task_dir = utils.task_dir(task_id)
+        _, audio_ext = os.path.splitext(os.path.basename(uploaded_audio.name))
+        audio_ext = audio_ext.lower() or ".mp3"
+        custom_audio_path = os.path.join(task_dir, f"custom-audio{audio_ext}")
+        with open(custom_audio_path, "wb") as f:
+            f.write(uploaded_audio.getbuffer())
+        run_params.custom_audio_file = custom_audio_path
+
+    if uploaded_video_files:
+        local_videos_dir = utils.storage_dir("local_videos", create=True)
+        run_params.video_materials = []
+        persisted_local_materials = []
+        for file in uploaded_video_files:
+            file_path = os.path.join(local_videos_dir, f"{file.file_id}_{file.name}")
+            with open(file_path, "wb") as f:
+                f.write(file.getbuffer())
+            m = MaterialInfo()
+            m.provider = "local"
+            m.url = file_path
+            run_params.video_materials.append(m)
+            persisted_local_materials.append(
+                {
+                    "provider": m.provider,
+                    "url": m.url,
+                    "duration": m.duration,
+                }
+            )
+        st.session_state["local_video_materials"] = persisted_local_materials
+    elif (
+        run_params.video_source == "local"
+        and st.session_state["local_video_materials"]
+    ):
+        run_params.video_materials = []
+        for material in st.session_state["local_video_materials"]:
+            m = MaterialInfo()
+            m.provider = material.get("provider", "local")
+            m.url = material.get("url", "")
+            m.duration = material.get("duration", 0)
+            if m.url:
+                run_params.video_materials.append(m)
+
+    selected_manual_materials = _selected_manual_video_materials()
+    if run_params.video_source != "local" and selected_manual_materials:
+        run_params.video_materials = selected_manual_materials
+
+    return run_params
+
+
+def _generate_social_metadata_for_result(run_params, result, platform):
+    return llm.generate_social_metadata(
+        video_subject=run_params.video_subject,
+        video_script=(result or {}).get("script") or run_params.video_script,
+        language=run_params.video_language or "auto",
+        platform=platform,
+    )
+
+
+def _generate_video_terms_for_ui(run_params, video_script):
+    smart_scene_queries = bool(getattr(run_params, "smart_scene_queries", False))
+    ordered_materials = (
+        bool(getattr(run_params, "match_materials_to_script", False))
+        or smart_scene_queries
+    )
+    amount = 8 if ordered_materials else 5
+    if smart_scene_queries:
+        terms = llm.generate_scene_queries(
+            video_subject=run_params.video_subject,
+            video_script=video_script,
+            amount=amount,
+            language=run_params.video_language or "",
+        )
+        if terms:
+            return terms
+
+    return llm.generate_terms(
+        run_params.video_subject,
+        video_script,
+        amount=amount,
+        match_script_order=ordered_materials,
+    )
+
+
+def _generate_viral_analysis_for_result(
+    run_params,
+    result=None,
+    metadata=None,
+    platform=None,
+):
+    metadata = metadata or {}
+    return viral_analyzer.analyze_viral_potential(
+        video_subject=run_params.video_subject,
+        video_script=(result or {}).get("script") or run_params.video_script,
+        title=metadata.get("title", ""),
+        video_duration_sec=None,
+        target_platforms=[platform] if platform else None,
+        language=run_params.video_language or "auto",
+    )
+
+
+def _render_viral_analysis(analysis, key_prefix):
+    if not analysis:
+        return
+
+    score_cols = st.columns(3)
+    score_cols[0].metric(
+        tr("Viral Score"),
+        f"{analysis.get('overall_score', 0)}/100",
+    )
+    score_cols[1].metric(
+        tr("Hook Score"),
+        f"{analysis.get('hook_score', 0)}/100",
+    )
+    score_cols[2].metric(
+        tr("Pacing Score"),
+        f"{analysis.get('pacing_score', 0)}/100",
+    )
+
+    summary = analysis.get("summary")
+    if summary:
+        st.caption(summary)
+
+    warnings = analysis.get("warnings") or []
+    if warnings:
+        st.warning(" | ".join(warnings))
+
+    hook_suggestions = analysis.get("hook_suggestions") or []
+    if hook_suggestions:
+        st.write(tr("Hook Suggestions"))
+        for suggestion in hook_suggestions:
+            st.write(f"- {suggestion}")
+
+    title_variants = analysis.get("title_variants") or []
+    if title_variants:
+        st.text_area(
+            tr("Title Variants"),
+            value="\n".join(title_variants),
+            height=100,
+            key=f"{key_prefix}_title_variants",
+        )
+
+    thumbnail_concepts = analysis.get("thumbnail_concepts") or []
+    if thumbnail_concepts:
+        st.text_area(
+            tr("Thumbnail Concepts"),
+            value="\n".join(thumbnail_concepts),
+            height=100,
+            key=f"{key_prefix}_thumbnail_concepts",
+        )
+
+    platform_fit = analysis.get("platform_fit") or {}
+    if platform_fit:
+        st.write(tr("Platform Fit"))
+        for platform, score in platform_fit.items():
+            score_value = min(1.0, max(0.0, float(score)))
+            st.caption(f"{platform}: {score_value:.0%}")
+            st.progress(score_value)
+
+
+def _record_history(
+    task_id,
+    run_params,
+    result=None,
+    metadata=None,
+    viral_analysis=None,
+    error="",
+):
+    status = "failed" if error else "completed"
+    history.add_history(
+        {
+            "task_id": task_id,
+            "subject": run_params.video_subject,
+            "status": status,
+            "videos": (result or {}).get("videos", []),
+            "materials": (result or {}).get("materials", []),
+            "material_attributions": (result or {}).get("material_attributions"),
+            "terms": (result or {}).get("terms") or run_params.video_terms,
+            "metadata": metadata,
+            "viral_analysis": viral_analysis,
+            "cooldown": (result or {}).get("cooldown"),
+            "pending_uploads": (result or {}).get("pending_uploads"),
+            "error": error,
+        }
+    )
+
+
+def _cooldown_summary_text(cooldown):
+    if not cooldown:
+        return ""
+    try:
+        count = int(cooldown.get("moved_recent_count", 0) or 0)
+    except (TypeError, ValueError):
+        count = 0
+    if count <= 0:
+        return ""
+    try:
+        days = int(cooldown.get("days", 7) or 7)
+    except (TypeError, ValueError):
+        days = 7
+    return tr("Cooldown Summary").format(count=count, days=days)
+
+
+def _subject_repeat_warning_text(matches, days):
+    if not matches:
+        return ""
+    first_match = matches[0] or {}
+    subject = first_match.get("subject") or first_match.get("task_id") or tr("Untitled")
+    created_at = first_match.get("created_at") or ""
+    return tr("Similar Subject Warning").format(
+        subject=subject,
+        days=days,
+        created_at=created_at,
+    )
+
+
+def _metadata_from_widget_state(key_prefix, fallback_metadata):
+    metadata = fallback_metadata or {}
+    hashtags_value = st.session_state.get(
+        f"{key_prefix}_hashtags",
+        " ".join(metadata.get("hashtags", [])),
+    )
+    if isinstance(hashtags_value, str):
+        hashtags = [
+            tag.strip()
+            for tag in hashtags_value.replace(",", " ").split()
+            if tag.strip()
+        ]
+    else:
+        hashtags = list(metadata.get("hashtags", []))
+    return {
+        "title": st.session_state.get(
+            f"{key_prefix}_title",
+            metadata.get("title", ""),
+        ),
+        "caption": st.session_state.get(
+            f"{key_prefix}_caption",
+            metadata.get("caption", ""),
+        ),
+        "hashtags": hashtags,
+    }
+
+
+def _youtube_extra_for_upload(platforms, metadata):
+    if not any(str(platform).startswith("youtube") for platform in platforms or []):
+        return None
+    metadata = metadata or {}
+    return {
+        "youtube_title": metadata.get("title", ""),
+        "youtube_description": metadata.get("caption", ""),
+        "tags": metadata.get("hashtags", []),
+        "privacyStatus": upload_post.upload_post_service.youtube_privacy_status,
+    }
+
+
+def _sync_upload_post_service_from_config():
+    for key in (
+        "upload_post_enabled",
+        "upload_post_auto_upload",
+        "upload_post_allow_public_youtube",
+        "upload_post_youtube_privacy_status",
+    ):
+        if key in st.session_state:
+            config.app[key] = st.session_state[key]
+    upload_post.upload_post_service.reload_config()
+
+
+def _pending_upload_status_text(status):
+    if status == "uploaded":
+        return tr("Upload Status Uploaded")
+    if status == "failed":
+        return tr("Upload Status Failed")
+    return tr("Upload Status Pending")
+
+
+def _upload_button_label(platforms):
+    if not any(str(platform).startswith("youtube") for platform in platforms or []):
+        return tr("Confirm and Upload Now")
+    privacy_status = upload_post.upload_post_service.youtube_privacy_status
+    if privacy_status == upload_post.YOUTUBE_PRIVACY_PUBLIC:
+        return tr("Publish Public Now")
+    if privacy_status == upload_post.YOUTUBE_PRIVACY_UNLISTED:
+        return tr("Upload Unlisted Now")
+    return tr("Confirm and Upload Now")
+
+
+def _render_pending_uploads(job, key_prefix):
+    _sync_upload_post_service_from_config()
+    pending_uploads = job.get("pending_uploads") or []
+    if not pending_uploads:
+        return
+
+    task_id = job.get("task_id", "")
+    metadata = job.get("metadata") or {}
+    st.write(tr("Pending Uploads"))
+    if not upload_post.upload_post_service.is_configured():
+        st.caption(tr("Upload-Post Not Configured"))
+
+    for index, pending_upload in enumerate(pending_uploads):
+        if not isinstance(pending_upload, dict):
+            continue
+        video_path = pending_upload.get("video_path", "")
+        platforms = pending_upload.get("platforms") or upload_post.upload_post_service.platforms
+        status = pending_upload.get("status", "pending")
+        upload_key = f"{key_prefix}_upload_{index}"
+
+        st.caption(
+            tr("Pending Upload Card").format(
+                status=_pending_upload_status_text(status),
+                platforms=", ".join(platforms),
+                title=pending_upload.get("title") or job.get("subject") or tr("Untitled"),
+            )
+        )
+        st.code(video_path)
+
+        result = pending_upload.get("result") or {}
+        if status == "uploaded":
+            st.success(tr("Upload Successful"))
+            result_link = upload_post.extract_result_link(result)
+            if result_link:
+                st.markdown(f"[{tr('View Uploaded Video')}]({result_link})")
+            request_id = result.get("request_id")
+            if request_id:
+                st.caption(f"Request ID: {request_id}")
+            continue
+        if status == "failed":
+            st.error(
+                tr("Upload Failed").format(
+                    error=result.get("error") or result.get("message") or tr("Unknown Error")
+                )
+            )
+
+        public_youtube_upload = False
+        if any(str(platform).startswith("youtube") for platform in platforms):
+            privacy_status = upload_post.upload_post_service.youtube_privacy_status
+            st.caption(
+                tr("YouTube Upload Privacy Summary").format(
+                    privacy=privacy_status,
+                )
+            )
+            if privacy_status == upload_post.YOUTUBE_PRIVACY_PUBLIC:
+                public_youtube_upload = True
+                st.warning(tr("Public YouTube Upload Warning"))
+                st.checkbox(
+                    tr("Confirm Public Upload"),
+                    key=f"{upload_key}_public_confirm",
+                    help=tr("Confirm Public Upload Help"),
+                )
+
+        public_confirmed = st.session_state.get(f"{upload_key}_public_confirm", False)
+        video_file_exists = bool(video_path) and os.path.exists(video_path)
+        if video_path and not video_file_exists:
+            st.warning(tr("Upload Video Missing"))
+        can_upload = (
+            video_file_exists
+            and upload_post.upload_post_service.is_configured()
+            and (not public_youtube_upload or public_confirmed)
+        )
+        if st.button(
+            _upload_button_label(platforms),
+            key=upload_key,
+            disabled=not can_upload,
+        ):
+            _sync_upload_post_service_from_config()
+            upload_metadata = _metadata_from_widget_state(key_prefix, metadata)
+            upload_title = (
+                upload_metadata.get("title")
+                or pending_upload.get("title")
+                or job.get("subject")
+                or "Check out this video! #shorts #viral"
+            )
+            youtube_extra = _youtube_extra_for_upload(platforms, upload_metadata)
+            with st.spinner(tr("Uploading Video")):
+                upload_result = upload_post.cross_post_video(
+                    video_path=video_path,
+                    title=upload_title,
+                    platforms=platforms,
+                    youtube_extra=youtube_extra,
+                )
+            if task_id:
+                history.update_pending_upload_result(
+                    task_id,
+                    video_path,
+                    upload_result,
+                )
+            if upload_result.get("success"):
+                st.success(tr("Upload Successful"))
+            else:
+                st.error(
+                    tr("Upload Failed").format(
+                        error=upload_result.get("error")
+                        or upload_result.get("message")
+                        or tr("Unknown Error"),
+                    )
+                )
+            st.rerun()
+
+
+pending_video_preset = st.session_state.pop("_pending_video_preset", None)
+if pending_video_preset:
+    try:
+        applied_preset_name = _apply_video_preset(pending_video_preset)
+        st.success(f"{tr('Preset Loaded')}: {applied_preset_name}")
+    except presets.PresetError as e:
+        st.error(f"{tr('Preset Error')}: {str(e)}")
+
 
 @st.cache_data(ttl=300, show_spinner=False)
 def get_groq_model_ids(api_key: str, base_url: str) -> list[str]:
@@ -324,29 +1297,27 @@ if not config.app.get("hide_config", False):
         middle_config_panel = config_panels[1]
         right_config_panel = config_panels[2]
 
-        # 左侧面板 - 日志设置
         with left_config_panel:
-            # 是否隐藏配置面板
             hide_config = st.checkbox(
                 tr("Hide Basic Settings"), value=config.app.get("hide_config", False)
             )
             config.app["hide_config"] = hide_config
 
-            # 是否禁用日志显示
             hide_log = st.checkbox(
                 tr("Hide Log"), value=config.ui.get("hide_log", False)
             )
             config.ui["hide_log"] = hide_log
 
-        # 中间面板 - LLM 设置
-
         with middle_config_panel:
             st.write(tr("LLM Settings"))
             # 下拉框展示文本和后端 provider id 分开维护，避免 UI 文案变化
             # 污染 `config.app["llm_provider"]` 这类稳定配置值。
+            aihubmix_label = f"AIHubMix ({tr('Recommended')})"
+            if config.ui.get("language") == "zh":
+                aihubmix_label = "AIHubMix（推荐）"
             llm_provider_options = [
                 ("OpenAI", "openai"),
-                ("AIHubMix", "aihubmix"),
+                (aihubmix_label, "aihubmix"),
                 ("AIML API", "aimlapi"),
                 ("EvoLink", "evolink"),
                 ("VolcEngine", "volcengine"),
@@ -376,11 +1347,6 @@ if not config.app.get("hide_config", False):
             if saved_llm_provider not in llm_provider_ids:
                 saved_llm_provider = "openai"
 
-            # Streamlit 会把没有 key 的 selectbox 视为一个由 label/options/index
-            # 共同决定的临时控件。如果每次选择后都根据 config.app 重新计算 index，
-            # 用户第一次切换 provider 后控件可能被重建，表现为“必须选择两次才生效”。
-            # 这里用稳定的 provider id 作为真实选项，并给控件固定 key；展示文案只
-            # 通过 format_func 转换，避免 UI 文案变化影响状态。
             if st.session_state.get("llm_provider_select") not in (
                 None,
                 *llm_provider_ids,
@@ -398,9 +1364,7 @@ if not config.app.get("hide_config", False):
             config.app["llm_provider"] = llm_provider
 
             llm_api_key = config.app.get(f"{llm_provider}_api_key", "")
-            llm_secret_key = config.app.get(
-                f"{llm_provider}_secret_key", ""
-            )  # only for baidu ernie
+            llm_secret_key = config.app.get(f"{llm_provider}_secret_key", "")
             llm_base_url = config.app.get(f"{llm_provider}_base_url", "")
             llm_model_name = config.app.get(f"{llm_provider}_model_name", "")
             llm_account_id = config.app.get(f"{llm_provider}_account_id", "")
@@ -502,9 +1466,7 @@ if not config.app.get("hide_config", False):
                             """
             if llm_provider == "oneapi":
                 if not llm_model_name:
-                    llm_model_name = (
-                        "claude-3-5-sonnet-20240620"  # 默认模型，可以根据需要调整
-                    )
+                    llm_model_name = "claude-3-5-sonnet-20240620"
                 with llm_helper:
                     tips = """
                         ##### OneAPI 配置说明
@@ -728,7 +1690,6 @@ if not config.app.get("hide_config", False):
                 if st_llm_account_id:
                     config.app[f"{llm_provider}_account_id"] = st_llm_account_id
 
-        # 右侧面板 - API 密钥设置
         with right_config_panel:
 
             def get_keys_from_config(cfg_key):
@@ -773,6 +1734,7 @@ params = VideoParams(video_subject="")
 params.match_materials_to_script = bool(
     st.session_state.get("match_materials_to_script", False)
 )
+params.smart_scene_queries = bool(st.session_state.get("smart_scene_queries", False))
 uploaded_files = []
 uploaded_audio_file = None
 
@@ -793,12 +1755,8 @@ with left_panel:
         selected_index = st.selectbox(
             tr("Script Language"),
             index=0,
-            options=range(
-                len(video_languages)
-            ),  # Use the index as the internal option value
-            format_func=lambda x: video_languages[x][
-                0
-            ],  # The label is displayed to the user
+            options=range(len(video_languages)),
+            format_func=lambda x: video_languages[x][0],
         )
         params.video_language = video_languages[selected_index][1]
 
@@ -846,12 +1804,7 @@ with left_panel:
                     video_script_prompt=params.video_script_prompt,
                     custom_system_prompt=params.custom_system_prompt,
                 )
-                terms = llm.generate_terms(
-                    params.video_subject,
-                    script,
-                    amount=8 if params.match_materials_to_script else 5,
-                    match_script_order=params.match_materials_to_script,
-                )
+                terms = _generate_video_terms_for_ui(params, script)
                 if "Error: " in script:
                     st.error(tr(script))
                 elif "Error: " in terms:
@@ -860,28 +1813,23 @@ with left_panel:
                     st.session_state["video_script"] = script
                     st.session_state["video_terms"] = ", ".join(terms)
         params.video_script = st.text_area(
-            tr("Video Script"), value=st.session_state["video_script"], height=280
-        )
+            tr("Video Script"), height=280, key="video_script"
+        ).strip()
         if st.button(tr("Generate Video Keywords"), key="auto_generate_terms"):
             if not params.video_script:
                 st.error(tr("Please Enter the Video Subject"))
                 st.stop()
 
             with st.spinner(tr("Generating Video Keywords")):
-                terms = llm.generate_terms(
-                    params.video_subject,
-                    params.video_script,
-                    amount=8 if params.match_materials_to_script else 5,
-                    match_script_order=params.match_materials_to_script,
-                )
+                terms = _generate_video_terms_for_ui(params, params.video_script)
                 if "Error: " in terms:
                     st.error(tr(terms))
                 else:
                     st.session_state["video_terms"] = ", ".join(terms)
 
         params.video_terms = st.text_area(
-            tr("Video Keywords"), value=st.session_state["video_terms"]
-        )
+            tr("Video Keywords"), key="video_terms"
+        ).strip()
 
 with middle_panel:
     with st.container(border=True):
@@ -890,32 +1838,55 @@ with middle_panel:
             (tr("Sequential"), "sequential"),
             (tr("Random"), "random"),
         ]
-        video_sources = [
-            (tr("Pexels"), "pexels"),
-            (tr("Pixabay"), "pixabay"),
-            (tr("Coverr"), "coverr"),
-            (tr("Local file"), "local"),
-            (tr("TikTok"), "douyin"),
-            (tr("Bilibili"), "bilibili"),
-            (tr("Xiaohongshu"), "xiaohongshu"),
-        ]
-
-        saved_video_source_name = config.app.get("video_source", "pexels")
-        saved_video_source_index = [v[1] for v in video_sources].index(
-            saved_video_source_name
+        saved_video_concat_mode = config.ui.get(
+            "video_concat_mode", VideoConcatMode.random.value
         )
 
-        selected_index = st.selectbox(
-            tr("Video Source"),
-            options=range(len(video_sources)),
-            format_func=lambda x: video_sources[x][0],
-            index=saved_video_source_index,
+        # ── Çok Kaynaklı Video Seçimi ────────────────────────────────────
+        _API_SOURCES = {
+            "pexels":       "Pexels",
+            "pixabay":      "Pixabay",
+            "coverr":       "Coverr",
+            "nasa":         "NASA Image Library",
+            "wikimedia":    "Wikimedia Commons",
+            "archive_org":  "Internet Archive",
+        }
+        _ALL_SOURCES = {**_API_SOURCES, "local": tr("Local file")}
+
+        _saved_sources = config.app.get("enabled_video_sources", ["pexels", "pixabay", "coverr"])
+        if isinstance(_saved_sources, str):
+            _saved_sources = [_saved_sources]
+        _saved_sources = [s for s in _saved_sources if s in _ALL_SOURCES]
+        if not _saved_sources:
+            _saved_sources = ["pexels", "pixabay", "coverr"]
+
+        enabled_video_sources = st.multiselect(
+            tr("Video Sources"),
+            options=list(_ALL_SOURCES.keys()),
+            default=_saved_sources,
+            format_func=lambda x: _ALL_SOURCES[x],
+            help="Birden fazla kaynak seçildiğinde hepsi paralel aranır ve en uygun klipler otomatik seçilir.",
         )
-        params.video_source = video_sources[selected_index][1]
+        if not enabled_video_sources:
+            enabled_video_sources = ["pexels"]
+            st.caption("⚠️ En az bir kaynak seçin. Varsayılan olarak Pexels kullanılıyor.")
+
+        config.app["enabled_video_sources"] = enabled_video_sources
+
+        # task.py ile geriye dönük uyumluluk için params.video_source belirlenir
+        _api_sel = [s for s in enabled_video_sources if s in _API_SOURCES]
+        if len(_api_sel) > 1:
+            params.video_source = "multi"
+        elif len(_api_sel) == 1:
+            params.video_source = _api_sel[0]
+        elif "local" in enabled_video_sources:
+            params.video_source = "local"
+        else:
+            params.video_source = "pexels"
         config.app["video_source"] = params.video_source
 
-        if params.video_source == "local":
-            # Streamlit 的文件类型校验对扩展名大小写敏感，这里同时放行大小写两种形式。
+        # Yerel dosya yükleyici — sadece "local" seçiliyse göster
+        if "local" in enabled_video_sources:
             local_file_types = ["mp4", "mov", "avi", "flv", "mkv", "jpg", "jpeg", "png"]
             uploaded_files = st.file_uploader(
                 tr("Upload Local Files"),
@@ -925,17 +1896,14 @@ with middle_panel:
 
         selected_index = st.selectbox(
             tr("Video Concat Mode"),
-            index=1,
-            options=range(
-                len(video_concat_modes)
-            ),  # Use the index as the internal option value
-            format_func=lambda x: video_concat_modes[x][
-                0
-            ],  # The label is displayed to the user
+            index=_find_option_index(video_concat_modes, saved_video_concat_mode, 1),
+            options=range(len(video_concat_modes)),
+            format_func=lambda x: video_concat_modes[x][0],
         )
         params.video_concat_mode = VideoConcatMode(
             video_concat_modes[selected_index][1]
         )
+        config.ui["video_concat_mode"] = params.video_concat_mode.value
 
         # 视频转场模式
         video_transition_modes = [
@@ -946,52 +1914,152 @@ with middle_panel:
             (tr("SlideIn"), VideoTransitionMode.slide_in.value),
             (tr("SlideOut"), VideoTransitionMode.slide_out.value),
         ]
+        saved_video_transition_mode = config.ui.get("video_transition_mode")
         selected_index = st.selectbox(
             tr("Video Transition Mode"),
             options=range(len(video_transition_modes)),
             format_func=lambda x: video_transition_modes[x][0],
-            index=0,
+            index=_find_option_index(
+                video_transition_modes, saved_video_transition_mode, 0
+            ),
         )
         params.video_transition_mode = VideoTransitionMode(
             video_transition_modes[selected_index][1]
         )
+        if params.video_transition_mode.value is None:
+            config.ui.pop("video_transition_mode", None)
+        else:
+            config.ui["video_transition_mode"] = params.video_transition_mode.value
 
         video_aspect_ratios = [
             (tr("Portrait"), VideoAspect.portrait.value),
             (tr("Landscape"), VideoAspect.landscape.value),
         ]
-        # Coverr 库 99% 是 16:9 横屏,默认竖屏会让画面被大量黑边包围。
-        # 用 source-specific widget key 让每个 source 各自记忆 aspect 选择:
-        #   - 首次切到 coverr → 默认 Landscape(index=1)
-        #   - 其他 source 沿用 Portrait(index=0)
-        #   - 用户在某 source 下手动改过 aspect,session_state 会记住,
-        #     下次回到同一 source 时尊重用户选择,不会再被强制覆盖。
-        default_aspect_index = 1 if params.video_source == "coverr" else 0
+        # Sadece Coverr seçiliyse varsayılan Landscape (Coverr büyük çoğunlukla 16:9)
+        saved_video_aspect = config.ui.get("video_aspect")
+        default_aspect_index = _find_option_index(
+            video_aspect_ratios,
+            saved_video_aspect,
+            1 if enabled_video_sources == ["coverr"] else 0,
+        )
         selected_index = st.selectbox(
             tr("Video Ratio"),
-            options=range(
-                len(video_aspect_ratios)
-            ),  # Use the index as the internal option value
-            format_func=lambda x: video_aspect_ratios[x][
-                0
-            ],  # The label is displayed to the user
+            options=range(len(video_aspect_ratios)),
+            format_func=lambda x: video_aspect_ratios[x][0],
             index=default_aspect_index,
             key=f"video_aspect_for_{params.video_source}",
         )
         params.video_aspect = VideoAspect(video_aspect_ratios[selected_index][1])
+        config.ui["video_aspect"] = params.video_aspect.value
 
+        clip_duration_options = [2, 3, 4, 5, 6, 7, 8, 9, 10]
+        saved_video_clip_duration = _config_int(config.ui, "video_clip_duration", 3)
         params.video_clip_duration = st.selectbox(
-            tr("Clip Duration"), options=[2, 3, 4, 5, 6, 7, 8, 9, 10], index=1
+            tr("Clip Duration"),
+            options=clip_duration_options,
+            index=_find_option_index(
+                clip_duration_options, saved_video_clip_duration, 1
+            ),
         )
+        config.ui["video_clip_duration"] = params.video_clip_duration
+
+        if _api_sel:
+            st.checkbox(
+                tr("Manual Video Selection"),
+                help=tr("Manual Video Selection Help"),
+                key="manual_video_selection_enabled",
+            )
+
+            if st.session_state.get("manual_video_selection_enabled"):
+                manual_candidate_limit = st.slider(
+                    tr("Candidate Limit"),
+                    min_value=6,
+                    max_value=30,
+                    value=12,
+                    step=3,
+                    key="manual_video_candidate_limit",
+                )
+                manual_search_terms = params.video_terms or params.video_subject
+                if st.button(
+                    tr("Find Video Candidates"),
+                    key="find_manual_video_candidates",
+                    use_container_width=True,
+                ):
+                    if not manual_search_terms and not (
+                        params.smart_scene_queries and params.video_script
+                    ):
+                        st.error(tr("Please Enter the Video Subject or Script"))
+                    else:
+                        with st.spinner(tr("Finding Video Candidates")):
+                            try:
+                                candidate_search_terms = manual_search_terms
+                                if (
+                                    params.smart_scene_queries
+                                    and params.video_script
+                                    and not params.video_terms
+                                ):
+                                    candidate_search_terms = _generate_video_terms_for_ui(
+                                        params,
+                                        params.video_script,
+                                    )
+                                if (
+                                    isinstance(candidate_search_terms, str)
+                                    and "Error: " in candidate_search_terms
+                                ):
+                                    st.error(tr(candidate_search_terms))
+                                    st.stop()
+                                candidates = material.search_video_candidates(
+                                    search_terms=candidate_search_terms,
+                                    source=params.video_source,
+                                    video_aspect=params.video_aspect,
+                                    max_clip_duration=params.video_clip_duration,
+                                    limit=manual_candidate_limit,
+                                    enabled_sources=enabled_video_sources,
+                                )
+                                st.session_state["manual_video_candidates"] = [
+                                    _material_to_dict(item) for item in candidates
+                                ]
+                                st.session_state["manual_video_selected_urls"] = []
+                            except Exception as e:
+                                st.error(str(e))
+
+                candidate_urls = [
+                    item.get("url", "")
+                    for item in st.session_state.get("manual_video_candidates", [])
+                    if item.get("url")
+                ]
+                if candidate_urls:
+                    valid_candidate_urls = set(candidate_urls)
+                    st.session_state["manual_video_selected_urls"] = [
+                        url
+                        for url in st.session_state.get(
+                            "manual_video_selected_urls", []
+                        )
+                        if url in valid_candidate_urls
+                    ]
+                    selected_urls = st.multiselect(
+                        tr("Select Video Candidates"),
+                        options=candidate_urls,
+                        format_func=_manual_candidate_label,
+                        key="manual_video_selected_urls",
+                    )
+                    if selected_urls:
+                        st.caption(tr("Selected Video Preview"))
+                        for preview_url in selected_urls[:3]:
+                            st.video(preview_url)
+                elif st.session_state.get("manual_video_candidates") == []:
+                    st.caption(tr("No Video Candidates Found"))
+
+        video_count_options = [1, 2, 3, 4, 5]
+        saved_video_count = _config_int(config.ui, "video_count", 1)
         params.video_count = st.selectbox(
             tr("Number of Videos Generated Simultaneously"),
-            options=[1, 2, 3, 4, 5],
-            index=0,
+            options=video_count_options,
+            index=_find_option_index(video_count_options, saved_video_count, 0),
         )
+        config.ui["video_count"] = params.video_count
 
         with st.expander(tr("Advanced Video Settings"), expanded=False):
-            # 默认关闭，避免影响老用户的随机素材体验。开启后只改变关键词和素材
-            # 下载/拼接顺序，用于改善画面主题早于或晚于旁白的问题。
             params.match_materials_to_script = st.checkbox(
                 tr("Match Materials to Script Order"),
                 help=tr("Match Materials to Script Order Help"),
@@ -999,18 +2067,57 @@ with middle_panel:
             )
             config.app["match_materials_to_script"] = params.match_materials_to_script
 
-            video_codec_options = [
-                ("libx264 (CPU)", "libx264"),
-                ("NVIDIA NVENC (h264_nvenc)", "h264_nvenc"),
-                ("AMD AMF (h264_amf)", "h264_amf"),
-                ("Intel QSV (h264_qsv)", "h264_qsv"),
-                ("Windows MediaFoundation (h264_mf)", "h264_mf"),
-                ("macOS VideoToolbox (h264_videotoolbox)", "h264_videotoolbox"),
+            params.smart_scene_queries = st.checkbox(
+                tr("Smart B-Roll Queries"),
+                help=tr("Smart B-Roll Queries Help"),
+                key="smart_scene_queries",
+            )
+            config.app["smart_scene_queries"] = params.smart_scene_queries
+
+            st.slider(
+                tr("Video Diversity Level"),
+                min_value=1,
+                max_value=50,
+                step=1,
+                help=tr("Video Diversity Level Help"),
+                key="material_search_max_page",
+            )
+            config.app["material_search_max_page"] = st.session_state[
+                "material_search_max_page"
             ]
-            saved_video_codec = config.app.get("video_codec", "libx264")
+
+            st.checkbox(
+                tr("Avoid Recently Used Videos"),
+                help=tr("Avoid Recently Used Videos Help"),
+                key="video_cooldown_enabled",
+            )
+            config.app["video_cooldown_enabled"] = st.session_state[
+                "video_cooldown_enabled"
+            ]
+
+            cooldown_day_options = [3, 7, 14, 30]
+            current_cooldown_days = st.session_state.get("video_cooldown_days", 7)
+            if current_cooldown_days not in cooldown_day_options:
+                current_cooldown_days = 7
+                st.session_state["video_cooldown_days"] = current_cooldown_days
+            st.selectbox(
+                tr("Recently Used Video Window"),
+                options=cooldown_day_options,
+                index=cooldown_day_options.index(current_cooldown_days),
+                format_func=lambda days: tr("Cooldown Days Label").format(days=days),
+                help=tr("Recently Used Video Window Help"),
+                key="video_cooldown_days",
+                disabled=not st.session_state["video_cooldown_enabled"],
+            )
+            config.app["video_cooldown_days"] = st.session_state[
+                "video_cooldown_days"
+            ]
+
+            video_codec_options = _video_codec_options()
+            saved_video_codec = _normalize_video_codec(
+                config.app.get("video_codec", "libx264")
+            )
             saved_video_codec_values = [item[1] for item in video_codec_options]
-            if saved_video_codec not in saved_video_codec_values:
-                saved_video_codec = "libx264"
             selected_codec_index = saved_video_codec_values.index(saved_video_codec)
             selected_codec_index = st.selectbox(
                 tr("Video Encoder"),
@@ -1020,10 +2127,85 @@ with middle_panel:
                 help=tr("Video Encoder Help"),
             )
             config.app["video_codec"] = video_codec_options[selected_codec_index][1]
+
+            st.session_state["video_crf"] = _normalize_video_crf_value(
+                st.session_state.get("video_crf", config.app.get("video_crf", 20))
+            )
+            st.session_state["video_encoder_preset"] = _normalize_libx264_preset(
+                st.session_state.get(
+                    "video_encoder_preset",
+                    config.app.get("video_encoder_preset", "medium"),
+                )
+            )
+            st.session_state["video_fps"] = _normalize_video_fps_value(
+                st.session_state.get("video_fps", config.app.get("video_fps", 30))
+            )
+            st.session_state["audio_bitrate_kbps"] = _normalize_audio_bitrate_kbps(
+                st.session_state.get(
+                    "audio_bitrate_kbps",
+                    config.app.get("audio_bitrate", "192k"),
+                )
+            )
+
+            quality_cols = st.columns(2)
+            with quality_cols[0]:
+                st.slider(
+                    tr("Video Quality CRF"),
+                    min_value=0,
+                    max_value=51,
+                    step=1,
+                    help=tr("Video Quality CRF Help"),
+                    key="video_crf",
+                )
+                config.app["video_crf"] = _normalize_video_crf_value(
+                    st.session_state["video_crf"]
+                )
+            with quality_cols[1]:
+                preset_options = _libx264_preset_options()
+                current_preset = _normalize_libx264_preset(
+                    st.session_state["video_encoder_preset"]
+                )
+                st.selectbox(
+                    tr("Encoder Preset"),
+                    options=preset_options,
+                    index=preset_options.index(current_preset),
+                    help=tr("Encoder Preset Help"),
+                    key="video_encoder_preset",
+                )
+                config.app["video_encoder_preset"] = _normalize_libx264_preset(
+                    st.session_state["video_encoder_preset"]
+                )
+
+            output_cols = st.columns(2)
+            with output_cols[0]:
+                st.number_input(
+                    tr("Output FPS"),
+                    min_value=1,
+                    max_value=120,
+                    step=1,
+                    help=tr("Output FPS Help"),
+                    key="video_fps",
+                )
+                config.app["video_fps"] = _normalize_video_fps_value(
+                    st.session_state["video_fps"]
+                )
+            with output_cols[1]:
+                st.number_input(
+                    tr("Audio Bitrate"),
+                    min_value=32,
+                    max_value=512,
+                    step=16,
+                    help=tr("Audio Bitrate Help"),
+                    key="audio_bitrate_kbps",
+                )
+                audio_bitrate_kbps = _normalize_audio_bitrate_kbps(
+                    st.session_state["audio_bitrate_kbps"]
+                )
+                config.app["audio_bitrate"] = f"{audio_bitrate_kbps}k"
+            _apply_video_quality_params(params)
     with st.container(border=True):
         st.write(tr("Audio Settings"))
 
-        # 添加TTS服务器选择下拉框
         tts_servers = [
             (voice.NO_VOICE_NAME, tr("No Voice")),
             ("azure-tts-v1", "Azure TTS V1"),
@@ -1035,7 +2217,6 @@ with middle_panel:
             ("chatterbox", "Chatterbox TTS"),
         ]
 
-        # 获取保存的TTS服务器，默认为v1
         saved_tts_server = config.ui.get("tts_server", "azure-tts-v1")
         saved_tts_server_index = 0
         for i, (server_value, _) in enumerate(tts_servers):
@@ -1053,26 +2234,17 @@ with middle_panel:
         selected_tts_server = tts_servers[selected_tts_server_index][0]
         config.ui["tts_server"] = selected_tts_server
 
-        # 根据选择的TTS服务器获取声音列表
         filtered_voices = []
 
         if selected_tts_server == voice.NO_VOICE_NAME:
-            # 无配音是显式模式，只提供一个稳定 sentinel。这样普通 TTS 的空配置
-            # 不会被误判为静音，后端也能继续通过同一条音频/字幕流程生成视频。
             filtered_voices = [voice.NO_VOICE_NAME]
         elif selected_tts_server == "siliconflow":
-            # 获取硅基流动的声音列表
             filtered_voices = voice.get_siliconflow_voices()
         elif selected_tts_server == "gemini-tts":
-            # 获取Gemini TTS的声音列表
             filtered_voices = voice.get_gemini_voices()
         elif selected_tts_server == "mimo-tts":
-            # 获取 Xiaomi MiMo TTS 的预置音色列表
             filtered_voices = voice.get_mimo_voices()
         elif selected_tts_server == "elevenlabs":
-            # Read from session_state first so the API key is available before
-            # the Play Voice button runs (which is earlier in the script than
-            # the API key text_input widget).
             saved_elevenlabs_api_key = st.session_state.get(
                 "elevenlabs_api_key_input",
                 config.elevenlabs.get("api_key", ""),
@@ -1084,23 +2256,24 @@ with middle_panel:
                 st.session_state[cache_key] = voice.get_elevenlabs_voices(
                     saved_elevenlabs_api_key
                 )
+            if st.button("🔄 Sesleri Yenile", key="refresh_elevenlabs"):
+                for k in list(st.session_state.keys()):
+                    if k.startswith("elevenlabs_voices_"):
+                        del st.session_state[k]
+                st.rerun()
             filtered_voices = st.session_state[cache_key]
         elif selected_tts_server == "chatterbox":
             # 自托管 Chatterbox 服务的预置音色（来自 [chatterbox] voices 配置）
             _sync_chatterbox_config_from_session_state()
             filtered_voices = voice.get_chatterbox_voices()
         else:
-            # 获取Azure的声音列表
             all_voices = voice.get_all_azure_voices(filter_locals=None)
 
-            # 根据选择的TTS服务器筛选声音
             for v in all_voices:
                 if selected_tts_server == "azure-tts-v2":
-                    # V2版本的声音名称中包含"v2"
                     if "V2" in v:
                         filtered_voices.append(v)
                 else:
-                    # V1版本的声音名称中不包含"v2"
                     if "V2" not in v:
                         filtered_voices.append(v)
 
@@ -1124,21 +2297,17 @@ with middle_panel:
         saved_voice_name = config.ui.get("voice_name", "")
         saved_voice_name_index = 0
 
-        # 检查保存的声音是否在当前筛选的声音列表中
         if saved_voice_name in friendly_names:
             saved_voice_name_index = list(friendly_names.keys()).index(saved_voice_name)
         else:
-            # 如果不在，则根据当前UI语言选择一个默认声音
             for i, v in enumerate(filtered_voices):
                 if v.lower().startswith(st.session_state["ui_language"].lower()):
                     saved_voice_name_index = i
                     break
 
-        # 如果没有找到匹配的声音，使用第一个声音
         if saved_voice_name_index >= len(friendly_names) and friendly_names:
             saved_voice_name_index = 0
 
-        # 确保有声音可选
         if friendly_names:
             selected_friendly_name = st.selectbox(
                 tr("Speech Synthesis"),
@@ -1154,7 +2323,6 @@ with middle_panel:
             params.voice_name = voice_name
             config.ui["voice_name"] = voice_name
         else:
-            # 如果没有声音可选，显示提示信息
             st.warning(
                 tr(
                     "No voices available for the selected TTS server. Please select another server."
@@ -1164,7 +2332,6 @@ with middle_panel:
             params.voice_name = ""
             config.ui["voice_name"] = ""
 
-        # 无配音模式会生成静音占位音频，不展示试听按钮，避免用户误以为需要测试声音。
         if (
             friendly_names
             and selected_tts_server != voice.NO_VOICE_NAME
@@ -1176,8 +2343,6 @@ with middle_panel:
             if not play_content:
                 play_content = params.video_script
             if not play_content:
-                # For ElevenLabs voices, detect language from the display name
-                # so the test text matches the voice's language.
                 if voice.is_elevenlabs_voice(voice_name):
                     parts = voice_name.split(":", 2)
                     display = parts[2] if len(parts) >= 3 else ""
@@ -1198,7 +2363,6 @@ with middle_panel:
                     voice_file=audio_file,
                     voice_volume=params.voice_volume,
                 )
-                # if the voice file generation failed, try again with a default content.
                 if not sub_maker:
                     play_content = "This is a example voice. if you hear this, the voice synthesis failed with the original content."
                     sub_maker = voice.tts(
@@ -1222,7 +2386,6 @@ with middle_panel:
                     if os.path.exists(audio_file):
                         os.remove(audio_file)
 
-        # 当选择V2版本或者声音是V2声音时，显示服务区域和API key输入框
         if selected_tts_server == "azure-tts-v2" or (
             voice_name and voice.is_azure_v2_voice(voice_name)
         ):
@@ -1242,7 +2405,6 @@ with middle_panel:
             config.azure["speech_region"] = azure_speech_region
             config.azure["speech_key"] = azure_speech_key
 
-        # 当选择硅基流动时，显示API key输入框和说明信息
         if selected_tts_server == "siliconflow" or (
             voice_name and voice.is_siliconflow_voice(voice_name)
         ):
@@ -1255,7 +2417,6 @@ with middle_panel:
                 key="siliconflow_api_key_input",
             )
 
-            # 显示硅基流动的说明信息
             st.info(
                 tr("SiliconFlow TTS Settings")
                 + ":\n"
@@ -1268,8 +2429,6 @@ with middle_panel:
 
             config.siliconflow["api_key"] = siliconflow_api_key
 
-        # 当选择 Xiaomi MiMo TTS 时，复用 MiMo LLM provider 的 API Key。
-        # 这样用户如果同时使用 MiMo 生成文案和语音，只需要维护一份密钥。
         if selected_tts_server == "mimo-tts" or (
             voice_name and voice.is_mimo_voice(voice_name)
         ):
@@ -1294,7 +2453,6 @@ with middle_panel:
 
             config.app["mimo_api_key"] = mimo_api_key
 
-        # ElevenLabs API key section
         if selected_tts_server == "elevenlabs" or (
             voice_name and voice.is_elevenlabs_voice(voice_name)
         ):
@@ -1393,17 +2551,23 @@ with middle_panel:
                 "/audio/speech API has no volume field); use Speech Rate instead"
             )
 
+        voice_volume_options = [0.6, 0.8, 1.0, 1.2, 1.5, 2.0, 3.0, 4.0, 5.0]
+        saved_voice_volume = config.ui.get("voice_volume", 1.0)
         params.voice_volume = st.selectbox(
             tr("Speech Volume"),
-            options=[0.6, 0.8, 1.0, 1.2, 1.5, 2.0, 3.0, 4.0, 5.0],
-            index=2,
+            options=voice_volume_options,
+            index=_find_option_index(voice_volume_options, saved_voice_volume, 2),
         )
+        config.ui["voice_volume"] = params.voice_volume
 
+        voice_rate_options = [0.8, 0.9, 1.0, 1.1, 1.2, 1.3, 1.5, 1.8, 2.0]
+        saved_voice_rate = config.ui.get("voice_rate", 1.0)
         params.voice_rate = st.selectbox(
             tr("Speech Rate"),
-            options=[0.8, 0.9, 1.0, 1.1, 1.2, 1.3, 1.5, 1.8, 2.0],
-            index=2,
+            options=voice_rate_options,
+            index=_find_option_index(voice_rate_options, saved_voice_rate, 2),
         )
+        config.ui["voice_rate"] = params.voice_rate
 
         custom_audio_file_types = ["mp3", "wav", "m4a", "aac", "flac", "ogg"]
         uploaded_audio_file = st.file_uploader(
@@ -1424,42 +2588,69 @@ with middle_panel:
         bgm_options = [
             (tr("No Background Music"), ""),
             (tr("Random Background Music"), "random"),
+            (tr("Royalty-Free Music Library"), "library"),
             (tr("Custom Background Music"), "custom"),
         ]
+        saved_bgm_type = config.ui.get("bgm_type", "random")
         selected_index = st.selectbox(
             tr("Background Music"),
-            index=1,
-            options=range(
-                len(bgm_options)
-            ),  # Use the index as the internal option value
-            format_func=lambda x: bgm_options[x][
-                0
-            ],  # The label is displayed to the user
+            index=_find_option_index(bgm_options, saved_bgm_type, 1),
+            options=range(len(bgm_options)),
+            format_func=lambda x: bgm_options[x][0],
         )
-        # Get the selected background music type
-        params.bgm_type = bgm_options[selected_index][1]
+        selected_bgm_type = bgm_options[selected_index][1]
+        config.ui["bgm_type"] = selected_bgm_type
+        params.bgm_type = selected_bgm_type
+        params.bgm_file = ""
 
-        # Show or hide components based on the selection
-        if params.bgm_type == "custom":
+        if selected_bgm_type == "library":
+            bgm_files = _list_bgm_files()
+            if bgm_files:
+                saved_bgm_file = config.ui.get("bgm_file", "")
+                selected_bgm_file = st.selectbox(
+                    tr("Royalty-Free Music Track"),
+                    options=bgm_files,
+                    index=_find_option_index(bgm_files, saved_bgm_file, 0),
+                    key="royalty_free_bgm_select",
+                )
+                params.bgm_type = "custom"
+                params.bgm_file = selected_bgm_file
+                config.ui["bgm_file"] = selected_bgm_file
+                st.audio(os.path.join(song_dir, selected_bgm_file))
+            else:
+                params.bgm_type = ""
+                st.info(tr("No Royalty-Free Music Found"))
+        elif selected_bgm_type == "custom":
+            if "custom_bgm_file_input" not in st.session_state:
+                st.session_state["custom_bgm_file_input"] = config.ui.get(
+                    "bgm_file", ""
+                )
             custom_bgm_file = st.text_input(
-                tr("Custom Background Music File"), key="custom_bgm_file_input"
+                tr("Custom Background Music File"),
+                key="custom_bgm_file_input",
             )
             if custom_bgm_file:
-                # 这里不直接用 os.path.exists 判断，因为用户常见输入是
-                # output000.mp3，这个文件名需要由服务层映射到 resource/songs
-                # 目录后再校验。服务层会统一限制目录和文件类型，避免任意路径读取。
                 params.bgm_file = custom_bgm_file.strip()
-                # st.write(f":red[已选择自定义背景音乐]：**{custom_bgm_file}**")
+                config.ui["bgm_file"] = params.bgm_file
+        else:
+            config.ui["bgm_file"] = ""
+        bgm_volume_options = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+        saved_bgm_volume = config.ui.get("bgm_volume", 0.2)
         params.bgm_volume = st.selectbox(
             tr("Background Music Volume"),
-            options=[0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0],
-            index=2,
+            options=bgm_volume_options,
+            index=_find_option_index(bgm_volume_options, saved_bgm_volume, 2),
         )
+        config.ui["bgm_volume"] = params.bgm_volume
 
 with right_panel:
     with st.container(border=True):
         st.write(tr("Subtitle Settings"))
-        params.subtitle_enabled = st.checkbox(tr("Enable Subtitles"), value=True)
+        params.subtitle_enabled = st.checkbox(
+            tr("Enable Subtitles"),
+            value=config.ui.get("subtitle_enabled", True),
+        )
+        config.ui["subtitle_enabled"] = params.subtitle_enabled
         font_names = get_all_fonts()
         saved_font_name = config.ui.get("font_name", "MicrosoftYaHeiBold.ttc")
         saved_font_name_index = 0
@@ -1469,6 +2660,26 @@ with right_panel:
             tr("Font"), font_names, index=saved_font_name_index
         )
         config.ui["font_name"] = params.font_name
+
+        subtitle_styles = [
+            (tr("Classic"), "classic"),
+            (tr("Karaoke Word Highlight"), "karaoke"),
+        ]
+        saved_subtitle_style = config.ui.get("subtitle_style", "classic")
+        saved_style_index = 0
+        for i, (_, style_value) in enumerate(subtitle_styles):
+            if style_value == saved_subtitle_style:
+                saved_style_index = i
+                break
+        selected_style_index = st.selectbox(
+            tr("Subtitle Style"),
+            index=saved_style_index,
+            options=range(len(subtitle_styles)),
+            format_func=lambda x: subtitle_styles[x][0],
+            help=tr("Karaoke Word Highlight Help"),
+        )
+        params.subtitle_style = subtitle_styles[selected_style_index][1]
+        config.ui["subtitle_style"] = params.subtitle_style
 
         subtitle_positions = [
             (tr("Top"), "top"),
@@ -1522,9 +2733,19 @@ with right_panel:
 
         stroke_cols = st.columns([0.3, 0.7])
         with stroke_cols[0]:
-            params.stroke_color = st.color_picker(tr("Stroke Color"), "#000000")
+            params.stroke_color = st.color_picker(
+                tr("Stroke Color"),
+                config.ui.get("stroke_color", "#000000"),
+            )
+            config.ui["stroke_color"] = params.stroke_color
         with stroke_cols[1]:
-            params.stroke_width = st.slider(tr("Stroke Width"), 0.0, 10.0, 1.5)
+            params.stroke_width = st.slider(
+                tr("Stroke Width"),
+                0.0,
+                10.0,
+                float(config.ui.get("stroke_width", 1.5)),
+            )
+            config.ui["stroke_width"] = params.stroke_width
 
         subtitle_bg_cols = st.columns([0.4, 0.6])
         saved_subtitle_background_enabled = config.ui.get(
@@ -1552,8 +2773,6 @@ with right_panel:
         saved_rounded_subtitle_background = config.ui.get(
             "rounded_subtitle_background", False
         )
-        # 背景关闭时，圆角背景没有可渲染的底色。这里禁用控件并保留原配置，
-        # 用户下次重新开启字幕背景后，可以继续使用之前保存的圆角偏好。
         params.rounded_subtitle_background = st.checkbox(
             tr("Rounded Subtitle Background"),
             value=(
@@ -1639,9 +2858,6 @@ with right_panel:
         with col3:
             st.subheader(tr("Coverr API Keys"))
 
-            # 与 pexels/pixabay 不同,coverr_api_keys 是 PR 新增配置项,
-            # 老用户的 config.toml 不一定包含,这里先兜底初始化为空列表,
-            # 防止下面 .append / 索引访问触发 KeyError。
             if "coverr_api_keys" not in config.app or config.app["coverr_api_keys"] is None:
                 config.app["coverr_api_keys"] = []
 
@@ -1672,78 +2888,625 @@ with right_panel:
                     config.save_config()
                     st.success(tr("Coverr API Key deleted successfully"))
 
-start_button = st.button(tr("Generate Video"), use_container_width=True, type="primary")
-if start_button:
+with st.expander(tr("Presets"), expanded=False):
+    preset_names = presets.list_presets()
+    builtin_preset_names = presets.list_builtin_presets()
+
+    if builtin_preset_names:
+        builtin_preset_col, builtin_apply_col = st.columns([0.7, 0.3])
+        with builtin_preset_col:
+            selected_builtin_preset = st.selectbox(
+                tr("Suggested Preset"),
+                options=builtin_preset_names,
+                key="suggested_video_preset_select",
+            )
+        with builtin_apply_col:
+            if st.button(tr("Apply Suggested Preset"), key="apply_suggested_preset"):
+                try:
+                    st.session_state["_pending_video_preset"] = (
+                        presets.load_builtin_preset(selected_builtin_preset)
+                    )
+                    st.rerun()
+                except presets.PresetError as e:
+                    st.error(f"{tr('Preset Error')}: {str(e)}")
+
+    load_preset_col, save_preset_col = st.columns(2)
+
+    with load_preset_col:
+        if preset_names:
+            selected_preset_name = st.selectbox(
+                tr("Preset"),
+                options=preset_names,
+                key="video_preset_select",
+            )
+
+            try:
+                selected_preset_payload = presets.load_preset(selected_preset_name)
+                st.download_button(
+                    tr("Download Preset"),
+                    data=json.dumps(
+                        selected_preset_payload,
+                        ensure_ascii=False,
+                        indent=2,
+                    ),
+                    file_name=f"{selected_preset_name}.json",
+                    mime="application/json",
+                    key="download_video_preset",
+                )
+            except presets.PresetError as e:
+                st.error(f"{tr('Preset Error')}: {str(e)}")
+
+            preset_action_cols = st.columns(2)
+            with preset_action_cols[0]:
+                if st.button(tr("Load Preset"), key="load_video_preset"):
+                    try:
+                        st.session_state["_pending_video_preset"] = presets.load_preset(
+                            selected_preset_name
+                        )
+                        st.rerun()
+                    except presets.PresetError as e:
+                        st.error(f"{tr('Preset Error')}: {str(e)}")
+            with preset_action_cols[1]:
+                if st.button(tr("Delete Preset"), key="delete_video_preset"):
+                    try:
+                        presets.delete_preset(selected_preset_name)
+                        st.success(f"{tr('Preset Deleted')}: {selected_preset_name}")
+                        st.rerun()
+                    except presets.PresetError as e:
+                        st.error(f"{tr('Preset Error')}: {str(e)}")
+        else:
+            st.info(tr("No Presets Saved"))
+
+    with save_preset_col:
+        preset_name = st.text_input(tr("Preset Name"), key="save_video_preset_name")
+        if st.button(tr("Save Current Preset"), key="save_current_video_preset"):
+            if not preset_name.strip():
+                st.error(tr("Enter a preset name"))
+            else:
+                try:
+                    presets.save_preset(
+                        preset_name,
+                        params,
+                        app_config=_current_preset_app_config(),
+                    )
+                    st.success(f"{tr('Preset Saved')}: {presets.normalize_preset_name(preset_name)}")
+                except presets.PresetError as e:
+                    st.error(f"{tr('Preset Error')}: {str(e)}")
+
+        uploaded_preset = st.file_uploader(
+            tr("Import Preset File"),
+            type=["json"],
+            accept_multiple_files=False,
+            key="import_video_preset_file",
+        )
+        if st.button(tr("Import Preset"), key="import_video_preset"):
+            if uploaded_preset is None:
+                st.error(tr("Please choose a preset file"))
+            else:
+                try:
+                    imported_payload = presets.import_preset_payload(
+                        json.loads(uploaded_preset.getvalue().decode("utf-8"))
+                    )
+                    presets.save_preset(
+                        imported_payload["name"],
+                        imported_payload["params"],
+                        app_config=imported_payload.get("app_config"),
+                    )
+                    st.session_state["_pending_video_preset"] = imported_payload
+                    st.success(f"{tr('Preset Imported')}: {imported_payload['name']}")
+                    st.rerun()
+                except (UnicodeDecodeError, json.JSONDecodeError, presets.PresetError) as e:
+                    st.error(f"{tr('Preset Error')}: {str(e)}")
+
+with st.expander(tr("Recent Jobs"), expanded=False):
+    recent_jobs = history.list_history(limit=20)
+    if not recent_jobs:
+        st.info(tr("No Recent Jobs"))
+    else:
+        if st.button(tr("Clear Recent Jobs"), key="clear_recent_jobs"):
+            history.clear_history()
+            st.rerun()
+
+        for job in recent_jobs:
+            history_key_prefix = f"history_{job.get('task_id', '')}"
+            subject = job.get("subject") or job.get("task_id") or tr("Untitled")
+            status = job.get("status", "")
+            created_at = job.get("created_at", "")
+            with st.expander(f"{subject} - {status}", expanded=False):
+                st.caption(f"{tr('Created At')}: {created_at}")
+                videos = job.get("videos") or []
+                if videos:
+                    st.write(tr("Videos"))
+                    for url in videos:
+                        st.code(url)
+                terms = job.get("terms") or []
+                if isinstance(terms, str):
+                    terms = [term.strip() for term in terms.split(",") if term.strip()]
+                if terms:
+                    st.write(tr("Search Queries"))
+                    st.text_area(
+                        tr("Search Queries"),
+                        value="\n".join(str(term) for term in terms),
+                        height=100,
+                        key=f"history_terms_{job.get('task_id', '')}",
+                    )
+                cooldown_summary = _cooldown_summary_text(job.get("cooldown"))
+                if cooldown_summary:
+                    st.caption(cooldown_summary)
+                metadata = job.get("metadata")
+                if metadata:
+                    st.write(tr("Social Metadata"))
+                    st.text_input(
+                        tr("Social Title"),
+                        value=metadata.get("title", ""),
+                        key=f"{history_key_prefix}_title",
+                    )
+                    st.text_area(
+                        tr("Social Description"),
+                        value=metadata.get("caption", ""),
+                        height=90,
+                        key=f"{history_key_prefix}_caption",
+                    )
+                    st.text_input(
+                        tr("Social Hashtags"),
+                        value=" ".join(metadata.get("hashtags", [])),
+                        key=f"{history_key_prefix}_hashtags",
+                    )
+                _render_pending_uploads(
+                    job,
+                    key_prefix=history_key_prefix,
+                )
+                viral_analysis = job.get("viral_analysis")
+                if viral_analysis:
+                    st.write(tr("Viral Analysis"))
+                    _render_viral_analysis(
+                        viral_analysis,
+                        key_prefix=f"history_viral_{job.get('task_id', '')}",
+                    )
+                if job.get("error"):
+                    st.error(job["error"])
+
+with st.expander(tr("Batch Generation"), expanded=False):
+    use_manual_batch_scripts = st.checkbox(
+        tr("Use Manual Batch Scripts"),
+        key="use_manual_batch_scripts",
+    )
+    if use_manual_batch_scripts:
+        st.text_area(
+            tr("Batch Script Blocks"),
+            height=220,
+            help=tr("Batch Script Blocks Help"),
+            key="batch_script_blocks",
+        )
+    else:
+        st.text_area(
+            tr("Batch Subjects"),
+            height=140,
+            help=tr("Batch Subjects Help"),
+            key="batch_subjects",
+        )
+    batch_items = _get_batch_items()
+    if batch_items:
+        st.caption(f"{len(batch_items)} {tr('Batch Subjects Ready')}")
+
+with st.expander(tr("Content Intelligence"), expanded=False):
+    content_platforms = [
+        ("TikTok", "tiktok"),
+        ("YouTube Shorts", "youtube_shorts"),
+        ("Instagram Reels", "instagram_reels"),
+    ]
+    content_cols = st.columns([0.45, 0.25, 0.3])
+    with content_cols[0]:
+        st.text_input(
+            tr("Content Niche"),
+            value=st.session_state.get("content_niche") or params.video_subject,
+            key="content_niche",
+            help=tr("Content Niche Help"),
+        )
+    with content_cols[1]:
+        content_platform_index = st.selectbox(
+            tr("Content Platform"),
+            options=range(len(content_platforms)),
+            format_func=lambda x: content_platforms[x][0],
+            key="content_platform_select",
+        )
+    with content_cols[2]:
+        st.text_input(
+            tr("Target Audience"),
+            key="content_target_audience",
+        )
+
+    plan_cols = st.columns([0.24, 0.16, 0.16, 0.2, 0.24])
+    with plan_cols[0]:
+        st.text_input(
+            tr("Content Tone"),
+            key="content_tone",
+        )
+    with plan_cols[1]:
+        st.selectbox(
+            tr("Content Days"),
+            options=[7, 14],
+            key="content_plan_days",
+        )
+    with plan_cols[2]:
+        st.selectbox(
+            tr("Daily Content Count"),
+            options=[1, 2, 3],
+            key="content_daily_count",
+        )
+    with plan_cols[3]:
+        st.slider(
+            tr("Idea Count"),
+            min_value=1,
+            max_value=30,
+            key="content_idea_count",
+        )
+    with plan_cols[4]:
+        st.checkbox(
+            tr("Use Static Trend Context"),
+            key="content_use_trend_context",
+            help=tr("Use Static Trend Context Help"),
+        )
+        trend_source_options = [
+            content_intelligence.TREND_SOURCE_STATIC,
+            content_intelligence.TREND_SOURCE_RSS,
+        ]
+        if st.session_state.get("content_trend_source") not in trend_source_options:
+            st.session_state["content_trend_source"] = (
+                content_intelligence.TREND_SOURCE_STATIC
+            )
+        trend_source_labels = {
+            content_intelligence.TREND_SOURCE_STATIC: tr("Static Planning Context"),
+            content_intelligence.TREND_SOURCE_RSS: tr("RSS Headlines Context"),
+        }
+        st.selectbox(
+            tr("Trend Context Source"),
+            options=trend_source_options,
+            format_func=lambda source: trend_source_labels.get(source, source),
+            key="content_trend_source",
+            help=tr("Trend Context Source Help"),
+            disabled=not st.session_state.get("content_use_trend_context", False),
+        )
+
+    if st.button(tr("Generate Content Plan"), key="generate_content_plan"):
+        content_subject = (
+            st.session_state.get("content_niche") or params.video_subject or ""
+        ).strip()
+        if not content_subject and not params.video_script:
+            st.error(tr("Please Enter the Video Subject or Script"))
+        else:
+            with st.spinner(tr("Generating Content Plan")):
+                st.session_state["content_plan"] = (
+                    content_intelligence.generate_content_plan(
+                        video_subject=content_subject,
+                        video_script=params.video_script,
+                        language=params.video_language or "auto",
+                        platform=content_platforms[content_platform_index][1],
+                        target_audience=st.session_state.get(
+                            "content_target_audience", ""
+                        ),
+                        tone=st.session_state.get("content_tone", ""),
+                        days=st.session_state.get("content_plan_days", 7),
+                        daily_count=st.session_state.get("content_daily_count", 1),
+                        idea_count=st.session_state.get("content_idea_count", 7),
+                        use_trend_context=st.session_state.get(
+                            "content_use_trend_context", False
+                        ),
+                        trend_source=st.session_state.get(
+                            "content_trend_source",
+                            content_intelligence.TREND_SOURCE_STATIC,
+                        )
+                        if st.session_state.get("content_use_trend_context", False)
+                        else "none",
+                    )
+                )
+
+    content_plan = st.session_state.get("content_plan")
+    if content_plan:
+        warnings = content_plan.get("warnings") or []
+        if warnings:
+            st.write(tr("Planning Warnings"))
+            for warning in warnings:
+                st.caption(warning)
+
+        ideas = content_plan.get("ideas") or []
+        if ideas:
+            st.write(tr("Content Ideas"))
+            for index, idea in enumerate(ideas, start=1):
+                with st.expander(f"{index}. {idea.get('subject', '')}", expanded=False):
+                    st.caption(f"{tr('Content Angle')}: {idea.get('angle', '')}")
+                    st.text_area(
+                        tr("Content Hook"),
+                        value=idea.get("hook", ""),
+                        height=70,
+                        key=f"content_idea_hook_{index}",
+                    )
+                    st.text_area(
+                        tr("Content Script Prompt"),
+                        value=idea.get("script_prompt", ""),
+                        height=100,
+                        key=f"content_idea_prompt_{index}",
+                    )
+                    st.text_input(
+                        tr("Content Search Terms"),
+                        value=", ".join(idea.get("search_terms") or []),
+                        key=f"content_idea_terms_{index}",
+                    )
+                    st.caption(f"{tr('Content Rationale')}: {idea.get('rationale', '')}")
+
+        calendar = content_plan.get("calendar") or []
+        if calendar:
+            st.write(tr("Content Calendar"))
+            st.dataframe(
+                [
+                    {
+                        tr("Content Day"): item.get("day", ""),
+                        tr("Created At"): item.get("date", ""),
+                        tr("Content Ideas"): item.get("subject", ""),
+                        tr("Content Format"): item.get("format", ""),
+                        tr("Content Goal"): item.get("goal", ""),
+                    }
+                    for item in calendar
+                ],
+                use_container_width=True,
+                hide_index=True,
+            )
+
+            apply_cols = st.columns(2)
+            with apply_cols[0]:
+                if st.button(
+                    tr("Apply Calendar to Batch"),
+                    key="apply_content_calendar_to_batch",
+                ):
+                    st.session_state["batch_subjects"] = "\n".join(
+                        item.get("subject", "") for item in calendar if item.get("subject")
+                    )
+                    st.session_state["use_manual_batch_scripts"] = False
+                    st.success(tr("Content Plan Applied to Batch"))
+                    st.rerun()
+            with apply_cols[1]:
+                if ideas and st.button(
+                    tr("Apply First Idea to Current Topic"),
+                    key="apply_first_content_idea",
+                ):
+                    st.session_state["_pending_content_topic"] = {
+                        "subject": ideas[0].get("subject", ""),
+                        "script_prompt": ideas[0].get("script_prompt", ""),
+                    }
+                    st.success(tr("Content Topic Applied"))
+                    st.rerun()
+
+with st.expander(tr("Social Metadata"), expanded=False):
+    auto_social_metadata_after_video = st.checkbox(
+        tr("Auto Social Metadata After Video"),
+        key="auto_social_metadata_after_video",
+    )
+    social_platforms = [
+        ("TikTok", "tiktok"),
+        ("YouTube Shorts", "youtube_shorts"),
+        ("Instagram Reels", "instagram_reels"),
+    ]
+    selected_social_platform_index = st.selectbox(
+        tr("Social Platform"),
+        options=range(len(social_platforms)),
+        format_func=lambda x: social_platforms[x][0],
+        key="social_platform_select",
+    )
+    selected_social_platform = social_platforms[selected_social_platform_index][1]
+
+    if st.button(tr("Generate Social Metadata"), key="generate_social_metadata"):
+        if not params.video_subject and not params.video_script:
+            st.error(tr("Please Enter the Video Subject or Script"))
+        else:
+            with st.spinner(tr("Generating Social Metadata")):
+                st.session_state["social_metadata"] = llm.generate_social_metadata(
+                    video_subject=params.video_subject,
+                    video_script=params.video_script,
+                    language=params.video_language or "auto",
+                    platform=selected_social_platform,
+                )
+
+    social_metadata = st.session_state.get("social_metadata")
+    if social_metadata:
+        st.text_input(
+            tr("Social Title"),
+            value=social_metadata.get("title", ""),
+        )
+        st.text_area(
+            tr("Social Description"),
+            value=social_metadata.get("caption", ""),
+            height=120,
+        )
+        st.text_input(
+            tr("Social Hashtags"),
+            value=" ".join(social_metadata.get("hashtags", [])),
+        )
+
+with st.expander(tr("Publishing Settings"), expanded=False):
+    st.info(tr("Upload-Post Config Hint"))
+
+    st.checkbox(
+        tr("Upload-Post Enabled"),
+        key="upload_post_enabled",
+        help=tr("Upload-Post Enabled Help"),
+    )
+    config.app["upload_post_enabled"] = st.session_state["upload_post_enabled"]
+
+    st.checkbox(
+        tr("Auto Upload After Video"),
+        key="upload_post_auto_upload",
+        help=tr("Auto Upload After Video Help"),
+        disabled=not st.session_state["upload_post_enabled"],
+    )
+    config.app["upload_post_auto_upload"] = st.session_state[
+        "upload_post_auto_upload"
+    ]
+
+    youtube_privacy_options = [
+        upload_post.YOUTUBE_PRIVACY_PRIVATE,
+        upload_post.YOUTUBE_PRIVACY_UNLISTED,
+        upload_post.YOUTUBE_PRIVACY_PUBLIC,
+    ]
+    youtube_privacy_labels = {
+        upload_post.YOUTUBE_PRIVACY_PRIVATE: tr("Private Upload"),
+        upload_post.YOUTUBE_PRIVACY_UNLISTED: tr("Unlisted Upload"),
+        upload_post.YOUTUBE_PRIVACY_PUBLIC: tr("Public Upload"),
+    }
+    current_youtube_privacy = st.session_state.get(
+        "upload_post_youtube_privacy_status",
+        upload_post.YOUTUBE_PRIVACY_UNLISTED,
+    )
+    if current_youtube_privacy not in youtube_privacy_options:
+        current_youtube_privacy = upload_post.YOUTUBE_PRIVACY_UNLISTED
+        st.session_state["upload_post_youtube_privacy_status"] = current_youtube_privacy
+
+    st.selectbox(
+        tr("YouTube Privacy Status"),
+        options=youtube_privacy_options,
+        index=youtube_privacy_options.index(current_youtube_privacy),
+        format_func=lambda value: youtube_privacy_labels[value],
+        key="upload_post_youtube_privacy_status",
+        help=tr("YouTube Privacy Status Help"),
+        disabled=not st.session_state["upload_post_enabled"],
+    )
+
+    selected_youtube_privacy = st.session_state["upload_post_youtube_privacy_status"]
+    if selected_youtube_privacy == upload_post.YOUTUBE_PRIVACY_PUBLIC:
+        st.warning(tr("Public YouTube Upload Warning"))
+        st.checkbox(
+            tr("Allow Public YouTube Upload"),
+            key="upload_post_allow_public_youtube",
+            help=tr("Allow Public YouTube Upload Help"),
+            disabled=not st.session_state["upload_post_enabled"],
+        )
+        if not st.session_state["upload_post_allow_public_youtube"]:
+            st.caption(tr("Public YouTube Upload Blocked"))
+    else:
+        st.session_state["upload_post_allow_public_youtube"] = False
+
+    config.app["upload_post_youtube_privacy_status"] = selected_youtube_privacy
+    config.app["upload_post_allow_public_youtube"] = st.session_state[
+        "upload_post_allow_public_youtube"
+    ]
+
+with st.expander(tr("Viral Analysis"), expanded=False):
+    st.checkbox(
+        tr("Auto Viral Analysis After Video"),
+        key="auto_viral_analysis_after_video",
+        help=tr("Auto Viral Analysis After Video Help"),
+    )
+
+    if st.button(tr("Generate Viral Analysis"), key="generate_viral_analysis"):
+        if not params.video_subject and not params.video_script:
+            st.error(tr("Please Enter the Video Subject or Script"))
+        else:
+            current_metadata = st.session_state.get("social_metadata") or {}
+            with st.spinner(tr("Generating Viral Analysis")):
+                st.session_state["viral_analysis"] = viral_analyzer.analyze_viral_potential(
+                    video_subject=params.video_subject,
+                    video_script=params.video_script,
+                    title=current_metadata.get("title", ""),
+                    video_duration_sec=None,
+                    target_platforms=[selected_social_platform],
+                    language=params.video_language or "auto",
+                )
+
+    _render_viral_analysis(
+        st.session_state.get("viral_analysis"),
+        key_prefix="current_viral",
+    )
+
+action_cols = st.columns(2)
+with action_cols[0]:
+    start_button = st.button(
+        tr("Generate Video"),
+        use_container_width=True,
+        type="primary",
+    )
+with action_cols[1]:
+    batch_button = st.button(
+        tr("Generate Batch"),
+        use_container_width=True,
+    )
+
+if start_button or batch_button:
     config.save_config()
-    task_id = str(uuid4())
-    if not params.video_subject and not params.video_script:
+
+    batch_items = _get_batch_items()
+    if batch_button and not batch_items:
+        st.error(tr("Please Enter Batch Subjects"))
+        scroll_to_bottom()
+        st.stop()
+
+    if start_button and not params.video_subject and not params.video_script:
         st.error(tr("Video Script and Subject Cannot Both Be Empty"))
         scroll_to_bottom()
         st.stop()
 
-    if params.video_source not in ["pexels", "pixabay", "coverr", "local"]:
+    # ── Çok kaynaklı kaynak doğrulaması ─────────────────────────────────
+    _val_sources = config.app.get("enabled_video_sources", ["pexels"])
+    _val_api = [s for s in _val_sources if s not in ("local",)]
+    if not _val_sources or (not _val_api and "local" not in _val_sources):
         st.error(tr("Please Select a Valid Video Source"))
         scroll_to_bottom()
         st.stop()
 
-    if params.video_source == "pexels" and not config.app.get("pexels_api_keys", ""):
+    if "pexels" in _val_sources and not config.app.get("pexels_api_keys", ""):
         st.error(tr("Please Enter the Pexels API Key"))
         scroll_to_bottom()
         st.stop()
 
-    if params.video_source == "pixabay" and not config.app.get("pixabay_api_keys", ""):
+    if "pixabay" in _val_sources and not config.app.get("pixabay_api_keys", ""):
         st.error(tr("Please Enter the Pixabay API Key"))
         scroll_to_bottom()
         st.stop()
 
-    if params.video_source == "coverr" and not config.app.get("coverr_api_keys", ""):
+    if "coverr" in _val_sources and not config.app.get("coverr_api_keys", ""):
         st.error(tr("Please Enter the Coverr API Key"))
         scroll_to_bottom()
         st.stop()
+    # NASA, Wikimedia, Archive.org → API key gerektirmez, doğrulama gerekmez
 
-    if uploaded_audio_file:
-        task_dir = utils.task_dir(task_id)
-        # 上传文件名来自浏览器，不能直接拼到磁盘路径里；这里只保留扩展名，
-        # 并使用固定文件名保存到当前任务目录，避免路径穿越或特殊字符问题。
-        _, audio_ext = os.path.splitext(os.path.basename(uploaded_audio_file.name))
-        audio_ext = audio_ext.lower() or ".mp3"
-        custom_audio_path = os.path.join(task_dir, f"custom-audio{audio_ext}")
-        with open(custom_audio_path, "wb") as f:
-            f.write(uploaded_audio_file.getbuffer())
-        params.custom_audio_file = custom_audio_path
+    if (
+        st.session_state.get("manual_video_selection_enabled")
+        and _val_api
+        and not st.session_state.get("manual_video_selected_urls")
+    ):
+        st.error(tr("Please Select at Least One Video Candidate"))
+        scroll_to_bottom()
+        st.stop()
 
-    if uploaded_files:
-        local_videos_dir = utils.storage_dir("local_videos", create=True)
-        # 每次重新上传时都以本次选择的素材为准，避免旧素材不断重复追加。
-        params.video_materials = []
-        persisted_local_materials = []
-        for file in uploaded_files:
-            file_path = os.path.join(local_videos_dir, f"{file.file_id}_{file.name}")
-            with open(file_path, "wb") as f:
-                f.write(file.getbuffer())
-                m = MaterialInfo()
-                m.provider = "local"
-                m.url = file_path
-                params.video_materials.append(m)
-                persisted_local_materials.append(
-                    {
-                        "provider": m.provider,
-                        "url": m.url,
-                        "duration": m.duration,
-                    }
-                )
-        # 将已上传并保存到本地的视频素材写入会话，供后续只改文案时直接复用。
-        st.session_state["local_video_materials"] = persisted_local_materials
-    elif params.video_source == "local" and st.session_state["local_video_materials"]:
-        # 当用户没有重新上传文件时，复用最近一次已经保存到磁盘的本地素材列表。
-        params.video_materials = []
-        for material in st.session_state["local_video_materials"]:
-            m = MaterialInfo()
-            m.provider = material.get("provider", "local")
-            m.url = material.get("url", "")
-            m.duration = material.get("duration", 0)
-            if m.url:
-                params.video_materials.append(m)
+    repeat_warning_days = history.DEFAULT_SUBJECT_LOOKBACK_DAYS
+    repeat_matches = []
+    if start_button and params.video_subject:
+        repeat_matches = history.find_recent_similar_subjects(
+            params.video_subject,
+            days=repeat_warning_days,
+        )
+    elif batch_button:
+        seen_repeat_tasks = set()
+        for item in batch_items:
+            subject_matches = history.find_recent_similar_subjects(
+                item.get("subject", ""),
+                days=repeat_warning_days,
+                limit=1,
+            )
+            for match in subject_matches:
+                task_key = match.get("task_id") or match.get("created_at")
+                if task_key in seen_repeat_tasks:
+                    continue
+                seen_repeat_tasks.add(task_key)
+                repeat_matches.append(match)
+                if len(repeat_matches) >= 3:
+                    break
+            if len(repeat_matches) >= 3:
+                break
+    repeat_warning = _subject_repeat_warning_text(
+        repeat_matches,
+        days=repeat_warning_days,
+    )
+    if repeat_warning:
+        st.warning(repeat_warning)
 
     log_container = st.empty()
     log_records = []
@@ -1757,30 +3520,205 @@ if start_button:
 
     logger.add(log_received)
 
-    st.toast(tr("Generating Video"))
-    logger.info(tr("Start Generating Video"))
-    logger.info(utils.to_json(params))
+    def run_generation(run_task_id, run_params):
+        prepared_params = _prepare_task_params(
+            run_task_id,
+            run_params,
+            uploaded_audio_file,
+            uploaded_files,
+        )
+        logger.info(tr("Start Generating Video"))
+        logger.info(utils.to_json(prepared_params))
+        return tm.start(task_id=run_task_id, params=prepared_params)
+
     scroll_to_bottom()
 
-    result = tm.start(task_id=task_id, params=params)
-    if not result or "videos" not in result:
-        st.error(tr("Video Generation Failed"))
-        logger.error(tr("Video Generation Failed"))
-        scroll_to_bottom()
-        st.stop()
+    if batch_button:
+        st.toast(tr("Generating Batch Video"))
+        batch_progress = st.progress(0)
+        batch_results = []
+        failed_subjects = []
 
-    video_files = result.get("videos", [])
-    st.success(tr("Video Generation Completed"))
-    try:
-        if video_files:
-            player_cols = st.columns(len(video_files) * 2 + 1)
-            for i, url in enumerate(video_files):
-                player_cols[i * 2 + 1].video(url)
-    except Exception:
-        pass
+        for index, item in enumerate(batch_items, start=1):
+            subject = item["subject"]
+            task_id = str(uuid4())
+            run_params = _clone_video_params(params)
+            run_params.video_subject = subject
+            run_params.video_script = item.get("script", "")
+            run_params.video_terms = None
+            logger.info(
+                f"{tr('Generating Batch Video')} "
+                f"{index}/{len(batch_items)}: {subject}"
+            )
+            result = run_generation(task_id, run_params)
+            if not result or "videos" not in result:
+                failed_subjects.append(subject)
+                logger.error(f"{tr('Video Generation Failed')}: {subject}")
+                _record_history(
+                    task_id,
+                    run_params,
+                    error=tr("Video Generation Failed"),
+                )
+            else:
+                metadata = None
+                if st.session_state.get("auto_social_metadata_after_video", True):
+                    with st.spinner(tr("Generating Social Metadata")):
+                        metadata = _generate_social_metadata_for_result(
+                            run_params,
+                            result,
+                            selected_social_platform,
+                        )
+                viral_analysis = None
+                if st.session_state.get("auto_viral_analysis_after_video", False):
+                    with st.spinner(tr("Generating Viral Analysis")):
+                        viral_analysis = _generate_viral_analysis_for_result(
+                            run_params,
+                            result=result,
+                            metadata=metadata,
+                            platform=selected_social_platform,
+                        )
+                _record_history(
+                    task_id,
+                    run_params,
+                    result=result,
+                    metadata=metadata,
+                    viral_analysis=viral_analysis,
+                )
+                batch_results.append(
+                    {
+                        "subject": subject,
+                        "task_id": task_id,
+                        "videos": result.get("videos", []),
+                        "metadata": metadata,
+                        "viral_analysis": viral_analysis,
+                        "cooldown": result.get("cooldown"),
+                        "pending_uploads": result.get("pending_uploads"),
+                    }
+                )
+            batch_progress.progress(index / len(batch_items))
 
-    open_task_folder(task_id)
-    logger.info(tr("Video Generation Completed"))
+        if failed_subjects:
+            st.error(
+                f"{tr('Batch Generation Finished With Failures')}: "
+                f"{', '.join(failed_subjects)}"
+            )
+        else:
+            st.success(tr("Batch Generation Completed"))
+
+        for item in batch_results:
+            with st.expander(item["subject"], expanded=False):
+                for url in item["videos"]:
+                    st.video(url)
+                cooldown_summary = _cooldown_summary_text(item.get("cooldown"))
+                if cooldown_summary:
+                    st.caption(cooldown_summary)
+                if item.get("metadata"):
+                    st.text_input(
+                        tr("Social Title"),
+                        value=item["metadata"].get("title", ""),
+                        key=f"batch_title_{item['task_id']}",
+                    )
+                    st.text_area(
+                        tr("Social Description"),
+                        value=item["metadata"].get("caption", ""),
+                        height=90,
+                        key=f"batch_caption_{item['task_id']}",
+                    )
+                    st.text_input(
+                        tr("Social Hashtags"),
+                        value=" ".join(item["metadata"].get("hashtags", [])),
+                        key=f"batch_hashtags_{item['task_id']}",
+                    )
+                if item.get("viral_analysis"):
+                    _render_viral_analysis(
+                        item["viral_analysis"],
+                        key_prefix=f"batch_viral_{item['task_id']}",
+                    )
+                if st.button(
+                    tr("Open Task Folder"),
+                    key=f"open_batch_task_{item['task_id']}",
+                ):
+                    open_task_folder(item["task_id"])
+    else:
+        st.toast(tr("Generating Video"))
+        task_id = str(uuid4())
+        result = run_generation(task_id, params)
+        if not result or "videos" not in result:
+            st.error(tr("Video Generation Failed"))
+            logger.error(tr("Video Generation Failed"))
+            _record_history(
+                task_id,
+                params,
+                error=tr("Video Generation Failed"),
+            )
+            scroll_to_bottom()
+            st.stop()
+
+        video_files = result.get("videos", [])
+        metadata = None
+        if st.session_state.get("auto_social_metadata_after_video", True):
+            with st.spinner(tr("Generating Social Metadata")):
+                metadata = _generate_social_metadata_for_result(
+                    params,
+                    result,
+                    selected_social_platform,
+                )
+            st.session_state["social_metadata"] = metadata
+        viral_analysis = None
+        if st.session_state.get("auto_viral_analysis_after_video", False):
+            with st.spinner(tr("Generating Viral Analysis")):
+                viral_analysis = _generate_viral_analysis_for_result(
+                    params,
+                    result=result,
+                    metadata=metadata,
+                    platform=selected_social_platform,
+                )
+            st.session_state["viral_analysis"] = viral_analysis
+        _record_history(
+            task_id,
+            params,
+            result=result,
+            metadata=metadata,
+            viral_analysis=viral_analysis,
+        )
+        st.success(tr("Video Generation Completed"))
+        cooldown_summary = _cooldown_summary_text(result.get("cooldown"))
+        if cooldown_summary:
+            st.caption(cooldown_summary)
+        try:
+            if video_files:
+                player_cols = st.columns(len(video_files) * 2 + 1)
+                for i, url in enumerate(video_files):
+                    player_cols[i * 2 + 1].video(url)
+        except Exception:
+            pass
+
+        if metadata:
+            st.text_input(
+                tr("Social Title"),
+                value=metadata.get("title", ""),
+                key=f"single_title_{task_id}",
+            )
+            st.text_area(
+                tr("Social Description"),
+                value=metadata.get("caption", ""),
+                height=90,
+                key=f"single_caption_{task_id}",
+            )
+            st.text_input(
+                tr("Social Hashtags"),
+                value=" ".join(metadata.get("hashtags", [])),
+                key=f"single_hashtags_{task_id}",
+            )
+        if viral_analysis:
+            _render_viral_analysis(
+                viral_analysis,
+                key_prefix=f"single_viral_{task_id}",
+            )
+
+        open_task_folder(task_id)
+        logger.info(tr("Video Generation Completed"))
+
     scroll_to_bottom()
 
 config.save_config()

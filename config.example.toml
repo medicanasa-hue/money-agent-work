@@ -1,5 +1,9 @@
 [app]
-video_source = "pexels" # "pexels" or "pixabay"
+video_source = "pexels" # "pexels", "pixabay", "coverr", "local", or "multi"
+
+# Optional API key for the local HTTP API. Leave empty for private loopback-only use.
+# Set this when listen_host is 0.0.0.0 or any non-loopback address.
+api_key = ""
 
 # 是否隐藏配置面板
 hide_config = false
@@ -304,6 +308,23 @@ subtitle_provider = "edge"
 # If the selected encoder is not supported by the current FFmpeg or driver, the app falls back to libx264.
 # Available values: "libx264", "h264_nvenc", "h264_amf", "h264_qsv", "h264_mf", "h264_videotoolbox"
 # video_codec = "libx264"
+
+# libx264 CRF quality level. Lower means higher quality and larger files.
+# Valid range: 0-51. Default: 20.
+# video_crf = 20
+
+# Output frame rate for generated MP4 files.
+# Valid range: 1-120. Default: 30.
+# video_fps = 30
+
+# Audio bitrate for final MP4 files.
+# Valid range: 32-512 kbps. Default: 192k.
+# audio_bitrate = "192k"
+
+# libx264 encoder preset. Slower presets can reduce file size at the same CRF.
+# Available values: "ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow", "slower", "veryslow"
+# Default: "medium".
+# video_encoder_preset = "medium"
 #########################################################################################
 
 # 当视频生成成功后，API服务提供的视频下载接入点，默认为当前服务的地址和监听端口
@@ -331,6 +352,25 @@ endpoint = ""
 # material_directory = "task"                #表示将视频素材下载到当前任务的文件夹中，这种方式无法共享已经下载的视频素材
 
 material_directory = ""
+
+# Maximum candidate material duration in seconds. Set 0 to disable the upper
+# duration filter. Very long stock clips are usually less relevant for shorts.
+max_material_duration = 180
+
+# Video material search diversity. 1 keeps the default first-page search.
+# Increase to 2-5 to let Pexels/Pixabay/Coverr sample different result pages.
+# Higher values may improve variety, but can use more API quota or return fewer matches.
+material_search_max_page = 1
+# Optional per-source overrides. Uncomment only when you want source-specific behavior.
+# pexels_search_max_page = 1
+# pixabay_search_max_page = 1
+# coverr_search_max_page = 1
+
+# Skip recently used online video URLs when enough fresh candidates exist.
+# Disabled by default to preserve the original material selection behavior.
+video_cooldown_enabled = false
+# Supported UI values: 3, 7, 14, 30.
+video_cooldown_days = 7
 
 # Used for state management of the task.
 # Redis is expected to be private to this app. Do not expose it to untrusted
@@ -429,12 +469,20 @@ upload_post_platforms = ["tiktok", "instagram"]
 # Automatically cross-post videos after generation (if false, you'll need to call the API manually)
 upload_post_auto_upload = false
 
-# YouTube Shorts privacy status (options: "public", "unlisted", "private")
-upload_post_youtube_privacy_status = "public"
+# Keep generated videos in a review queue instead of posting immediately.
+# Disable only if you intentionally want fully automatic cross-posting.
+upload_post_require_review = true
+
+# YouTube Shorts privacy status (options: "private", "unlisted", "public")
+# Keep this unlisted by default so generated videos are not public/searchable until reviewed.
+upload_post_youtube_privacy_status = "unlisted"
+
+# Public YouTube uploads require this extra explicit opt-in.
+upload_post_allow_public_youtube = false
 
 # Chatterbox TTS (self-hosted, OpenAI-compatible) ##########################
 # Chatterbox (https://github.com/resemble-ai/chatterbox, MIT) is an open-source,
-# locally hosted TTS model with zero-shot voice cloning — a self-hostable
+# locally hosted TTS model with zero-shot voice cloning - a self-hostable
 # alternative to ElevenLabs. Run a server that exposes an OpenAI-compatible
 # endpoint at POST {base_url}/audio/speech (e.g. devnen/Chatterbox-TTS-Server
 # or travisvn/chatterbox-tts-api), then set base_url below. In the WebUI pick

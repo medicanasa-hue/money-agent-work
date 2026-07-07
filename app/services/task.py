@@ -42,12 +42,23 @@ def generate_terms(task_id, params, video_script):
         # 开启素材按文案顺序匹配后，关键词本身也必须按脚本叙事顺序生成；
         # 否则后续即使顺序下载和顺序拼接，也只能复用一组全局主题词，
         # 无法改善“后面内容的画面提前出现”的问题。
-        video_terms = llm.generate_terms(
-            video_subject=params.video_subject,
-            video_script=video_script,
-            amount=8 if params.match_materials_to_script else 5,
-            match_script_order=params.match_materials_to_script,
-        )
+        smart_scene_queries = bool(getattr(params, "smart_scene_queries", False))
+        ordered_materials = params.match_materials_to_script or smart_scene_queries
+        amount = 8 if ordered_materials else 5
+        if smart_scene_queries:
+            video_terms = llm.generate_scene_queries(
+                video_subject=params.video_subject,
+                video_script=video_script,
+                amount=amount,
+                language=params.video_language or "",
+            )
+        if not video_terms:
+            video_terms = llm.generate_terms(
+                video_subject=params.video_subject,
+                video_script=video_script,
+                amount=amount,
+                match_script_order=ordered_materials,
+            )
     else:
         if isinstance(video_terms, str):
             video_terms = [term.strip() for term in re.split(r"[,，]", video_terms)]
@@ -188,7 +199,8 @@ def generate_audio(task_id, params, video_script):
 def generate_subtitle(task_id, params, video_script, sub_maker, audio_file):
     '''
     Generate subtitle for the video script.
-    If subtitle generation is disabled or no subtitle maker is provided, it will return an empty string.
+    If subtitle generation is disabled or the selected provider cannot work without
+    a subtitle maker, it will return an empty string.
     Otherwise, it will generate the subtitle using the specified provider.
     Returns:
         - subtitle_path: path to the generated subtitle file
@@ -198,6 +210,7 @@ def generate_subtitle(task_id, params, video_script, sub_maker, audio_file):
         return ""
 
     subtitle_path = path.join(utils.task_dir(task_id), "subtitle.srt")
+    selected_subtitle_path = subtitle_path
     subtitle_provider = config.app.get("subtitle_provider", "edge").strip().lower()
     logger.info(f"\n\n## generating subtitle, provider: {subtitle_provider}")
 
@@ -213,9 +226,32 @@ def generate_subtitle(task_id, params, video_script, sub_maker, audio_file):
 
     subtitle_fallback = False
     if subtitle_provider == "edge":
-        voice.create_subtitle(
-            text=video_script, sub_maker=sub_maker, subtitle_file=subtitle_path
-        )
+        subtitle_style = getattr(params, "subtitle_style", "classic")
+        if subtitle_style == "karaoke":
+            created = voice.create_karaoke_subtitle(
+                text=video_script,
+                sub_maker=sub_maker,
+                subtitle_file=subtitle_path,
+            )
+            if created:
+                ass_subtitle_path = path.join(utils.task_dir(task_id), "subtitle.ass")
+                ass_created = voice.create_karaoke_ass_subtitle(
+                    sub_maker=sub_maker,
+                    subtitle_file=ass_subtitle_path,
+                )
+                if ass_created:
+                    selected_subtitle_path = ass_subtitle_path
+            else:
+                logger.warning(
+                    "karaoke subtitle unavailable, fallback to classic subtitle"
+                )
+                voice.create_subtitle(
+                    text=video_script, sub_maker=sub_maker, subtitle_file=subtitle_path
+                )
+        else:
+            voice.create_subtitle(
+                text=video_script, sub_maker=sub_maker, subtitle_file=subtitle_path
+            )
         if not os.path.exists(subtitle_path):
             subtitle_fallback = True
             logger.warning("subtitle file not found, fallback to whisper")
@@ -230,10 +266,57 @@ def generate_subtitle(task_id, params, video_script, sub_maker, audio_file):
         logger.warning(f"subtitle file is invalid: {subtitle_path}")
         return ""
 
-    return subtitle_path
+    return selected_subtitle_path
 
 
-def get_video_materials(task_id, params, video_terms, audio_duration):
+def _normalize_cooldown_stats(cooldown_stats):
+    if not cooldown_stats:
+        return None
+    moved_recent_count = int(cooldown_stats.get("moved_recent_count", 0) or 0)
+    if moved_recent_count <= 0:
+        return None
+    try:
+        days = max(1, int(cooldown_stats.get("days", 7) or 7))
+    except (TypeError, ValueError):
+        days = 7
+    return {
+        "moved_recent_count": moved_recent_count,
+        "days": days,
+    }
+
+
+def _config_bool(value, default=False):
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "on")
+    return bool(value)
+
+
+def _build_pending_uploads(video_paths, title, platforms):
+    pending_uploads = []
+    for video_path in video_paths:
+        pending_uploads.append(
+            {
+                "video_path": video_path,
+                "title": title,
+                "platforms": list(platforms or []),
+                "status": "pending",
+            }
+        )
+    return pending_uploads
+
+
+def get_video_materials(
+    task_id,
+    params,
+    video_terms,
+    audio_duration,
+    cooldown_stats=None,
+    material_attributions=None,
+):
     if params.video_source == "local":
         logger.info("\n\n## preprocess local materials")
         materials = video.preprocess_video(
@@ -246,8 +329,29 @@ def get_video_materials(task_id, params, video_terms, audio_duration):
             )
             return None
         return [material_info.url for material_info in materials]
+    selected_online_materials = [
+        item for item in (params.video_materials or [])
+        if getattr(item, "provider", "") != "local"
+    ]
+    if selected_online_materials:
+        logger.info("\n\n## downloading user-selected online materials")
+        downloaded_videos = material.download_selected_videos(
+            task_id=task_id,
+            selected_items=selected_online_materials,
+            audio_duration=audio_duration * params.video_count,
+            max_clip_duration=params.video_clip_duration,
+            attribution_records=material_attributions,
+        )
+        if not downloaded_videos:
+            sm.state.update_task(task_id, state=const.TASK_STATE_FAILED)
+            logger.error("failed to download selected video materials.")
+            return None
+        return downloaded_videos
     else:
         logger.info(f"\n\n## downloading videos from {params.video_source}")
+        ordered_materials = params.match_materials_to_script or bool(
+            getattr(params, "smart_scene_queries", False)
+        )
         # 顺序匹配模式只在用户显式开启时生效。这里强制素材下载按关键词顺序
         # 轮询，避免某个早期关键词下载太多素材，把后续脚本主题挤出最终时间线。
         downloaded_videos = material.download_videos(
@@ -257,12 +361,14 @@ def get_video_materials(task_id, params, video_terms, audio_duration):
             video_aspect=params.video_aspect,
             video_concat_mode=(
                 VideoConcatMode.sequential
-                if params.match_materials_to_script
+                if ordered_materials
                 else params.video_concat_mode
             ),
             audio_duration=audio_duration * params.video_count,
             max_clip_duration=params.video_clip_duration,
-            match_script_order=params.match_materials_to_script,
+            match_script_order=ordered_materials,
+            cooldown_stats=cooldown_stats,
+            attribution_records=material_attributions,
         )
         if not downloaded_videos:
             sm.state.update_task(task_id, state=const.TASK_STATE_FAILED)
@@ -280,7 +386,9 @@ def generate_final_videos(
     combined_video_paths = []
     # 多视频生成默认会打散素材以增加差异；但“按文案顺序匹配素材”追求的是
     # 时间线稳定性和可解释性，所以开启后所有输出都使用顺序拼接。
-    if params.match_materials_to_script:
+    if params.match_materials_to_script or bool(
+        getattr(params, "smart_scene_queries", False)
+    ):
         video_concat_mode = VideoConcatMode.sequential
     elif params.video_count == 1:
         video_concat_mode = params.video_concat_mode
@@ -329,7 +437,29 @@ def generate_final_videos(
     return final_video_paths, combined_video_paths
 
 
+_VIDEO_QUALITY_PARAM_FIELDS = (
+    "video_codec",
+    "video_crf",
+    "video_encoder_preset",
+    "video_fps",
+    "audio_bitrate",
+)
+
+
+def _video_quality_config_from_params(params: VideoParams) -> dict[str, object]:
+    return {
+        field: value
+        for field in _VIDEO_QUALITY_PARAM_FIELDS
+        if (value := getattr(params, field, None)) is not None
+    }
+
+
 def start(task_id, params: VideoParams, stop_at: str = "video"):
+    with video.video_quality_config(_video_quality_config_from_params(params)):
+        return _start(task_id, params, stop_at)
+
+
+def _start(task_id, params: VideoParams, stop_at: str = "video"):
     logger.info(f"start task: {task_id}, stop_at: {stop_at}")
     sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=5)
 
@@ -401,21 +531,34 @@ def start(task_id, params: VideoParams, stop_at: str = "video"):
     sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=40)
 
     # 5. Get video materials
+    cooldown_stats = {"moved_recent_count": 0, "days": config.app.get("video_cooldown_days", 7)}
+    material_attributions = []
     downloaded_videos = get_video_materials(
-        task_id, params, video_terms, audio_duration
+        task_id,
+        params,
+        video_terms,
+        audio_duration,
+        cooldown_stats=cooldown_stats,
+        material_attributions=material_attributions,
     )
     if not downloaded_videos:
         sm.state.update_task(task_id, state=const.TASK_STATE_FAILED)
         return
 
     if stop_at == "materials":
+        result = {"materials": downloaded_videos}
+        cooldown = _normalize_cooldown_stats(cooldown_stats)
+        if cooldown:
+            result["cooldown"] = cooldown
+        if material_attributions:
+            result["material_attributions"] = material_attributions
         sm.state.update_task(
             task_id,
             state=const.TASK_STATE_COMPLETE,
             progress=100,
-            materials=downloaded_videos,
+            **result,
         )
-        return {"materials": downloaded_videos}
+        return result
 
     sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=50)
 
@@ -439,37 +582,53 @@ def start(task_id, params: VideoParams, stop_at: str = "video"):
 
     # 7. Cross-post to social platforms (if enabled)
     cross_post_results = []
+    pending_uploads = []
     if upload_post.upload_post_service.is_configured() and upload_post.upload_post_service.auto_upload:
         platforms = upload_post.upload_post_service.platforms
-        logger.info(f"\n\n## cross-posting videos to {', '.join(platforms)}")
-
-        youtube_extra = None
-        if any(p.startswith("youtube") for p in platforms):
-            metadata = llm.generate_social_metadata(
-                video_subject=params.video_subject,
-                video_script=video_script,
-                language=params.video_language or "",
-                platform="youtube_shorts",
+        upload_title = params.video_subject or "Check out this video! #shorts #viral"
+        require_review = _config_bool(
+            config.app.get("upload_post_require_review", True),
+            default=True,
+        )
+        if require_review:
+            pending_uploads = _build_pending_uploads(
+                final_video_paths,
+                upload_title,
+                platforms,
             )
-            youtube_extra = {
-                "youtube_title": metadata.get("title", params.video_subject),
-                "youtube_description": metadata.get("caption", ""),
-                "tags": metadata.get("hashtags", []),
-                "privacyStatus": upload_post.upload_post_service.youtube_privacy_status,
-                "containsSyntheticMedia": True,
-            }
-
-        for video_path in final_video_paths:
-            result = upload_post.cross_post_video(
-                video_path=video_path,
-                title=params.video_subject or "Check out this video! #shorts #viral",
-                youtube_extra=youtube_extra,
+            logger.info(
+                f"\n\n## queued {len(pending_uploads)} videos for upload review"
             )
-            cross_post_results.append(result)
-            if result.get('success'):
-                logger.info(f"✅ Cross-posted: {video_path}")
-            else:
-                logger.warning(f"⚠️ Failed to cross-post: {video_path} - {result.get('error', 'Unknown error')}")
+        else:
+            logger.info(f"\n\n## cross-posting videos to {', '.join(platforms)}")
+
+            youtube_extra = None
+            if any(p.startswith("youtube") for p in platforms):
+                metadata = llm.generate_social_metadata(
+                    video_subject=params.video_subject,
+                    video_script=video_script,
+                    language=params.video_language or "",
+                    platform="youtube_shorts",
+                )
+                youtube_extra = {
+                    "youtube_title": metadata.get("title", params.video_subject),
+                    "youtube_description": metadata.get("caption", ""),
+                    "tags": metadata.get("hashtags", []),
+                    "privacyStatus": upload_post.upload_post_service.youtube_privacy_status,
+                    "containsSyntheticMedia": True,
+                }
+
+            for video_path in final_video_paths:
+                result = upload_post.cross_post_video(
+                    video_path=video_path,
+                    title=upload_title,
+                    youtube_extra=youtube_extra,
+                )
+                cross_post_results.append(result)
+                if result.get('success'):
+                    logger.info(f"Cross-posted: {video_path}")
+                else:
+                    logger.warning(f"Failed to cross-post: {video_path} - {result.get('error', 'Unknown error')}")
 
     kwargs = {
         "videos": final_video_paths,
@@ -480,8 +639,13 @@ def start(task_id, params: VideoParams, stop_at: str = "video"):
         "audio_duration": audio_duration,
         "subtitle_path": subtitle_path,
         "materials": downloaded_videos,
+        "material_attributions": material_attributions if material_attributions else None,
         "cross_post_results": cross_post_results if cross_post_results else None,
+        "pending_uploads": pending_uploads if pending_uploads else None,
     }
+    cooldown = _normalize_cooldown_stats(cooldown_stats)
+    if cooldown:
+        kwargs["cooldown"] = cooldown
     sm.state.update_task(
         task_id, state=const.TASK_STATE_COMPLETE, progress=100, **kwargs
     )

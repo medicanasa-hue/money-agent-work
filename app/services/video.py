@@ -1,6 +1,7 @@
 import glob
 import itertools
 import io
+import math
 import os
 import random
 import gc
@@ -8,14 +9,15 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from contextlib import redirect_stdout
+from collections.abc import Mapping
+from contextlib import contextmanager, redirect_stdout
+from contextvars import ContextVar
 from functools import lru_cache
 from typing import List
 from loguru import logger
 import numpy as np
 from moviepy import (
     AudioFileClip,
-    ColorClip,
     CompositeAudioClip,
     CompositeVideoClip,
     ImageClip,
@@ -65,16 +67,27 @@ class SubClippedVideoClip:
 
 
 audio_codec = "aac"
+_DEFAULT_AUDIO_BITRATE_KBPS = 192
+_MIN_AUDIO_BITRATE_KBPS = 32
+_MAX_AUDIO_BITRATE_KBPS = 512
 # Docker 里的 ffmpeg/AAC 组合在默认配置下更容易出现音频质量波动，
 # 这里显式抬高音频码率，避免成片阶段因为默认值过低而引入明显失真。
-audio_bitrate = "192k"
-fps = 30
+audio_bitrate = f"{_DEFAULT_AUDIO_BITRATE_KBPS}k"
+_DEFAULT_VIDEO_FPS = 30
+_MAX_VIDEO_FPS = 120
+fps = _DEFAULT_VIDEO_FPS
 # FFmpeg 按帧率拼接/转码时，最终时长可能比 MoviePy 读到的理论时长短几十毫秒。
 # 这里给视频素材多留一个很小的安全余量，避免音频末尾因为帧舍入出现黑屏、
 # 卡顿或最后一小段旁白没有画面的情况。
 _VIDEO_DURATION_SAFETY_MARGIN = 0.1
+_DEFAULT_VIDEO_TRANSITION_DURATION = 1.0
+_MAX_IMAGE_ZOOM_SCALE = 1.2
 _BGM_EXTENSIONS = (".mp3",)
 _DEFAULT_VIDEO_CODEC = "libx264"
+_DEFAULT_LIBX264_CRF = "20"
+_DEFAULT_LIBX264_PRESET = "medium"
+_MP4_PIXEL_FORMAT_FFMPEG_PARAMS = ("-pix_fmt", "yuv420p")
+_MP4_FASTSTART_FFMPEG_PARAMS = ("-movflags", "+faststart")
 _SUPPORTED_VIDEO_CODECS = (
     "libx264",
     "h264_nvenc",
@@ -83,7 +96,69 @@ _SUPPORTED_VIDEO_CODECS = (
     "h264_mf",
     "h264_videotoolbox",
 )
+_SUPPORTED_LIBX264_PRESETS = (
+    "ultrafast",
+    "superfast",
+    "veryfast",
+    "faster",
+    "fast",
+    "medium",
+    "slow",
+    "slower",
+    "veryslow",
+)
 _runtime_disabled_video_codecs = set()
+_VIDEO_QUALITY_CONFIG_KEYS = frozenset(
+    (
+        "video_codec",
+        "video_crf",
+        "video_encoder_preset",
+        "video_fps",
+        "audio_bitrate",
+    )
+)
+_video_quality_config: ContextVar[dict[str, object] | None] = ContextVar(
+    "video_quality_config",
+    default=None,
+)
+
+
+def _clean_video_quality_config(
+    overrides: Mapping[str, object] | None,
+) -> dict[str, object]:
+    if not overrides:
+        return {}
+    return {
+        key: value
+        for key, value in dict(overrides).items()
+        if key in _VIDEO_QUALITY_CONFIG_KEYS and value is not None
+    }
+
+
+@contextmanager
+def video_quality_config(overrides: Mapping[str, object] | None):
+    current_config = _video_quality_config.get() or {}
+    merged_config = {
+        **current_config,
+        **_clean_video_quality_config(overrides),
+    }
+    token = _video_quality_config.set(merged_config)
+    try:
+        yield
+    finally:
+        _video_quality_config.reset(token)
+
+
+def _get_video_quality_config_value(key: str, default):
+    current_config = _video_quality_config.get()
+    if current_config and key in current_config:
+        return current_config[key]
+    return config.app.get(key, default)
+
+
+def _source_file_key(file_path: str) -> str:
+    value = str(file_path or "").replace("\\", "/")
+    return os.path.normcase(os.path.normpath(value))
 
 
 def _get_required_video_duration(audio_duration: float) -> float:
@@ -95,6 +170,57 @@ def _get_required_video_duration(audio_duration: float) -> float:
     轻量余量。函数独立出来，便于测试和后续按实际反馈调整余量大小。
     """
     return max(0.0, float(audio_duration) + _VIDEO_DURATION_SAFETY_MARGIN)
+
+
+def _fit_clip_to_target_frame(clip, target_width: int, target_height: int):
+    clip_w, clip_h = clip.size
+    if clip_w == target_width and clip_h == target_height:
+        return clip
+
+    clip_ratio = clip_w / clip_h
+    target_ratio = target_width / target_height
+    logger.debug(
+        f"resizing clip, source: {clip_w}x{clip_h}, ratio: {clip_ratio:.2f}, "
+        f"target: {target_width}x{target_height}, ratio: {target_ratio:.2f}"
+    )
+
+    if abs(clip_ratio - target_ratio) < 0.01:
+        return clip.resized(new_size=(target_width, target_height))
+
+    scale_factor = max(target_width / clip_w, target_height / clip_h)
+    new_width = _ceil_even_dimension(clip_w * scale_factor, target_width)
+    new_height = _ceil_even_dimension(clip_h * scale_factor, target_height)
+    resized_clip = clip.resized(new_size=(new_width, new_height))
+    return resized_clip.cropped(
+        x_center=new_width / 2,
+        y_center=new_height / 2,
+        width=target_width,
+        height=target_height,
+    )
+
+
+def _get_effective_transition_duration(clip_duration: float) -> float:
+    safe_duration = max(0.0, float(clip_duration or 0))
+    return min(_DEFAULT_VIDEO_TRANSITION_DURATION, safe_duration / 2)
+
+
+def _image_zoom_scale(current_time: float, clip_duration: float) -> float:
+    safe_time = max(0.0, float(current_time or 0))
+    safe_duration = max(0.001, float(clip_duration or 0))
+    linear_scale = 1 + (safe_duration * 0.03) * (safe_time / safe_duration)
+    return min(_MAX_IMAGE_ZOOM_SCALE, linear_scale)
+
+
+def _ceil_even_dimension(value: float, minimum: int) -> int:
+    dimension = max(math.ceil(value), int(minimum))
+    if dimension % 2:
+        dimension += 1
+    return max(2, dimension)
+
+
+def _even_video_size(size) -> tuple[int, int]:
+    width, height = int(size[0]), int(size[1])
+    return max(2, width - width % 2), max(2, height - height % 2)
 
 
 def _prioritize_unique_source_clips(
@@ -120,7 +246,7 @@ def _prioritize_unique_source_clips(
 
     grouped_items: dict[str, list[SubClippedVideoClip]] = {}
     for item in subclipped_items:
-        grouped_items.setdefault(item.source_file_path, []).append(item)
+        grouped_items.setdefault(_source_file_key(item.source_file_path), []).append(item)
 
     primary_items = []
     overflow_items = []
@@ -160,8 +286,9 @@ def _get_configured_video_codec() -> str:
     参数导致输出格式不可控，甚至让生成任务在后续阶段才失败。
     """
     configured_codec = str(
-        config.app.get("video_codec", _DEFAULT_VIDEO_CODEC) or _DEFAULT_VIDEO_CODEC
-    ).strip()
+        _get_video_quality_config_value("video_codec", _DEFAULT_VIDEO_CODEC)
+        or _DEFAULT_VIDEO_CODEC
+    ).strip().lower()
     if configured_codec not in _SUPPORTED_VIDEO_CODECS:
         logger.warning(
             f"unsupported video codec configured: {configured_codec}, "
@@ -169,6 +296,44 @@ def _get_configured_video_codec() -> str:
         )
         return _DEFAULT_VIDEO_CODEC
     return configured_codec
+
+
+def _get_configured_video_fps() -> int:
+    raw_value = _get_video_quality_config_value("video_fps", _DEFAULT_VIDEO_FPS)
+    if isinstance(raw_value, bool):
+        return _DEFAULT_VIDEO_FPS
+    if isinstance(raw_value, str):
+        raw_value = raw_value.strip().lower()
+        if raw_value.endswith("fps"):
+            raw_value = raw_value[:-3].strip()
+    try:
+        configured_fps = int(raw_value)
+    except (TypeError, ValueError):
+        return _DEFAULT_VIDEO_FPS
+    if 1 <= configured_fps <= _MAX_VIDEO_FPS:
+        return configured_fps
+    return _DEFAULT_VIDEO_FPS
+
+
+def _get_configured_audio_bitrate() -> str:
+    raw_value = _get_video_quality_config_value("audio_bitrate", audio_bitrate)
+    if isinstance(raw_value, bool):
+        return audio_bitrate
+
+    value = str(raw_value).strip().lower()
+    if value.endswith("kbps"):
+        value = value[:-4].strip()
+    elif value.endswith("k"):
+        value = value[:-1]
+
+    try:
+        kbps = int(value)
+    except (TypeError, ValueError):
+        return audio_bitrate
+
+    if _MIN_AUDIO_BITRATE_KBPS <= kbps <= _MAX_AUDIO_BITRATE_KBPS:
+        return f"{kbps}k"
+    return audio_bitrate
 
 
 @lru_cache(maxsize=16)
@@ -210,7 +375,17 @@ def _get_effective_video_codec(preferred_codec: str | None = None) -> str:
     用户选择硬件编码器时，先做 FFmpeg encoder 列表检测；如果本进程里已经
     实际编码失败过，也直接回退，避免一个任务里每个片段都重复失败。
     """
-    selected_codec = preferred_codec or _get_configured_video_codec()
+    if preferred_codec:
+        selected_codec = str(preferred_codec).strip().lower()
+        if selected_codec not in _SUPPORTED_VIDEO_CODECS:
+            logger.warning(
+                f"unsupported video codec requested: {selected_codec}, "
+                f"fallback to {_DEFAULT_VIDEO_CODEC}"
+            )
+            return _DEFAULT_VIDEO_CODEC
+    else:
+        selected_codec = _get_configured_video_codec()
+
     if selected_codec == _DEFAULT_VIDEO_CODEC:
         return _DEFAULT_VIDEO_CODEC
 
@@ -233,6 +408,7 @@ def _get_effective_video_codec(preferred_codec: str | None = None) -> str:
 
 
 def _disable_runtime_video_codec(codec: str, reason: str):
+    codec = str(codec).strip().lower()
     if codec == _DEFAULT_VIDEO_CODEC:
         return
     _runtime_disabled_video_codecs.add(codec)
@@ -260,6 +436,75 @@ def _get_temp_audio_dir(output_dir: str) -> str:
     return output_dir
 
 
+def _ffmpeg_mp4_faststart_args(output_file: str) -> list[str]:
+    if os.path.splitext(output_file)[1].lower() != ".mp4":
+        return []
+    return list(_MP4_FASTSTART_FFMPEG_PARAMS)
+
+
+def _get_configured_libx264_crf() -> str:
+    raw_value = _get_video_quality_config_value("video_crf", _DEFAULT_LIBX264_CRF)
+    if isinstance(raw_value, bool):
+        return _DEFAULT_LIBX264_CRF
+    try:
+        crf = int(raw_value)
+    except (TypeError, ValueError):
+        return _DEFAULT_LIBX264_CRF
+    if 0 <= crf <= 51:
+        return str(crf)
+    return _DEFAULT_LIBX264_CRF
+
+
+def _get_configured_libx264_preset() -> str:
+    raw_value = _get_video_quality_config_value(
+        "video_encoder_preset",
+        _DEFAULT_LIBX264_PRESET,
+    )
+    if not isinstance(raw_value, str):
+        return _DEFAULT_LIBX264_PRESET
+    preset = raw_value.strip().lower()
+    if preset in _SUPPORTED_LIBX264_PRESETS:
+        return preset
+    return _DEFAULT_LIBX264_PRESET
+
+
+def _ffmpeg_libx264_quality_args(
+    codec: str | None, *, bitrate=None, existing_params=None
+) -> list[str]:
+    codec = str(codec or "").strip().lower()
+    params = list(existing_params or [])
+    if codec != _DEFAULT_VIDEO_CODEC:
+        return []
+
+    quality_args = []
+    if "-preset" not in params:
+        quality_args.extend(["-preset", _get_configured_libx264_preset()])
+    if not bitrate and "-crf" not in params:
+        quality_args.extend(["-crf", _get_configured_libx264_crf()])
+    return quality_args
+
+
+def _with_mp4_write_ffmpeg_params(
+    output_file: str, kwargs: dict, codec: str | None = None
+) -> dict:
+    if os.path.splitext(output_file)[1].lower() != ".mp4":
+        return kwargs
+
+    existing_params = list(kwargs.get("ffmpeg_params") or [])
+    if "-pix_fmt" not in existing_params:
+        existing_params.extend(_MP4_PIXEL_FORMAT_FFMPEG_PARAMS)
+    existing_params.extend(
+        _ffmpeg_libx264_quality_args(
+            codec,
+            bitrate=kwargs.get("bitrate"),
+            existing_params=existing_params,
+        )
+    )
+    if "-movflags" not in existing_params:
+        existing_params.extend(_MP4_FASTSTART_FFMPEG_PARAMS)
+    return {**kwargs, "ffmpeg_params": existing_params}
+
+
 def _fallback_write_videofile(clip, output_file: str, failed_codec: str, reason: str, **kwargs):
     """
     硬件编码失败后用 libx264 重试，只有重试成功才禁用该硬件编码器。
@@ -281,18 +526,22 @@ def _write_videofile_with_codec_fallback(clip, output_file: str, codec: str, **k
     生成任务不能因为高级编码器不可用而整体失败，所以这里把回退集中处理。
     """
     effective_codec = _get_effective_video_codec(codec)
+    write_kwargs = _with_mp4_write_ffmpeg_params(output_file, kwargs, effective_codec)
     try:
-        clip.write_videofile(output_file, codec=effective_codec, **kwargs)
+        clip.write_videofile(output_file, codec=effective_codec, **write_kwargs)
         return effective_codec
     except Exception as exc:
         if effective_codec == _DEFAULT_VIDEO_CODEC:
             raise
+        fallback_kwargs = _with_mp4_write_ffmpeg_params(
+            output_file, kwargs, _DEFAULT_VIDEO_CODEC
+        )
         return _fallback_write_videofile(
             clip,
             output_file,
             failed_codec=effective_codec,
             reason=str(exc),
-            **kwargs,
+            **fallback_kwargs,
         )
 
 
@@ -313,6 +562,101 @@ def _format_ffmpeg_concat_path(file_path: str) -> str:
     return _escape_ffmpeg_concat_path(absolute_path.replace("\\", "/"))
 
 
+def _format_ffmpeg_ass_filter_path(file_path: str) -> str:
+    absolute_path = os.path.abspath(file_path).replace("\\", "/")
+    return (
+        absolute_path.replace("\\", "\\\\")
+        .replace(":", r"\:")
+        .replace("'", r"\'")
+        .replace(",", r"\,")
+        .replace("[", r"\[")
+        .replace("]", r"\]")
+    )
+
+
+def _build_ass_subtitles_filter(subtitle_file: str) -> str:
+    return f"subtitles='{_format_ffmpeg_ass_filter_path(subtitle_file)}'"
+
+
+def _ass_burn_temp_output_file(output_file: str) -> str:
+    output_dir = os.path.dirname(output_file) or "."
+    output_name = os.path.basename(output_file)
+    output_stem, output_ext = os.path.splitext(output_name)
+    return os.path.join(output_dir, f"{output_stem}.assburn.tmp{output_ext or '.mp4'}")
+
+
+def _remove_file_quietly(file_path: str):
+    try:
+        if os.path.exists(file_path):
+            os.remove(file_path)
+    except OSError as exc:
+        logger.warning(f"failed to remove temp file {file_path}: {str(exc)}")
+
+
+def _burn_ass_subtitles_with_ffmpeg(
+    input_file: str,
+    subtitle_file: str,
+    output_file: str,
+    threads: int | None,
+) -> bool:
+    temp_output_file = _ass_burn_temp_output_file(output_file)
+
+    def run_burn(codec: str):
+        _remove_file_quietly(temp_output_file)
+        return subprocess.run(
+            [
+                utils.get_ffmpeg_binary(),
+                "-y",
+                "-i",
+                input_file,
+                "-vf",
+                _build_ass_subtitles_filter(subtitle_file),
+                "-c:v",
+                codec,
+                "-c:a",
+                "copy",
+                "-threads",
+                str(threads or 2),
+                "-pix_fmt",
+                "yuv420p",
+                *_ffmpeg_libx264_quality_args(codec),
+                *_ffmpeg_mp4_faststart_args(temp_output_file),
+                temp_output_file,
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    def finalize_burn_output() -> bool:
+        if not os.path.exists(temp_output_file):
+            logger.error("ASS subtitle burn-in did not create an output file")
+            return False
+        os.replace(temp_output_file, output_file)
+        return True
+
+    codec = _get_effective_video_codec(_get_configured_video_codec())
+    try:
+        result = run_burn(codec)
+        if result.returncode == 0 and finalize_burn_output():
+            return True
+
+        reason = (result.stderr or result.stdout or "").strip()
+        logger.warning(f"failed to burn ASS subtitles with {codec}: {reason}")
+        if codec != _DEFAULT_VIDEO_CODEC:
+            fallback_result = run_burn(_DEFAULT_VIDEO_CODEC)
+            if fallback_result.returncode == 0 and finalize_burn_output():
+                _disable_runtime_video_codec(codec, reason)
+                return True
+            reason = (fallback_result.stderr or fallback_result.stdout or "").strip()
+            logger.error(f"failed to burn ASS subtitles with fallback codec: {reason}")
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.error(f"failed to burn ASS subtitles: {str(exc)}")
+
+    _remove_file_quietly(temp_output_file)
+    return False
+
+
 def concat_video_clips_with_ffmpeg(
     clip_files: List[str], output_file: str, threads: int, output_dir: str
 ):
@@ -321,8 +665,8 @@ def concat_video_clips_with_ffmpeg(
         for clip_file in clip_files:
             fp.write(f"file '{_format_ffmpeg_concat_path(clip_file)}'\n")
 
-    def build_command(codec: str) -> list[str]:
-        return [
+    def build_command(codec: str, stream_copy: bool = False) -> list[str]:
+        command = [
             utils.get_ffmpeg_binary(),
             "-y",
             "-f",
@@ -331,17 +675,30 @@ def concat_video_clips_with_ffmpeg(
             "0",
             "-i",
             concat_list_file,
+        ]
+        if stream_copy:
+            return [
+                *command,
+                "-c",
+                "copy",
+                *_ffmpeg_mp4_faststart_args(output_file),
+                output_file,
+            ]
+        return [
+            *command,
             "-c:v",
             codec,
             "-threads",
             str(threads or 2),
             "-pix_fmt",
             "yuv420p",
+            *_ffmpeg_libx264_quality_args(codec),
+            *_ffmpeg_mp4_faststart_args(output_file),
             output_file,
         ]
 
-    def run_concat(codec: str):
-        command = build_command(codec)
+    def run_concat(codec: str, stream_copy: bool = False):
+        command = build_command(codec, stream_copy=stream_copy)
         # 使用 ffmpeg 只做一次串联与编码，避免 MoviePy 逐段合并时反复重编码，
         # 从而降低画质劣化与颜色偏移风险。
         result = subprocess.run(
@@ -356,6 +713,13 @@ def concat_video_clips_with_ffmpeg(
         return codec
 
     try:
+        try:
+            return run_concat("copy", stream_copy=True)
+        except Exception as exc:
+            logger.info(
+                f"stream-copy concat failed, re-encoding clips: {str(exc)}"
+            )
+
         effective_codec = _get_effective_video_codec()
         try:
             return run_concat(effective_codec)
@@ -559,7 +923,8 @@ def combine_videos(
 
     # 兼容 API 直接调用时未传转场模式的情况，避免后续访问 .value 时崩溃。
     transition_value = getattr(video_transition_mode, "value", video_transition_mode)
-    output_dir = os.path.dirname(combined_video_path)
+    concat_mode_value = getattr(video_concat_mode, "value", video_concat_mode)
+    output_dir = os.path.dirname(combined_video_path) or "."
 
     aspect = VideoAspect(video_aspect)
     video_width, video_height = aspect.to_resolution()
@@ -594,7 +959,7 @@ def combine_videos(
                 )
 
             start_time = end_time
-            if video_concat_mode.value == VideoConcatMode.sequential.value:
+            if concat_mode_value == VideoConcatMode.sequential.value:
                 break
 
     subclipped_items = _prioritize_unique_source_clips(
@@ -616,6 +981,7 @@ def combine_videos(
             f"remaining: {required_video_duration - video_duration:.2f}s"
         )
         
+        clip = None
         try:
             clip = _open_video_clip_quietly(subclipped_item.file_path).subclipped(
                 subclipped_item.start_time, subclipped_item.end_time
@@ -623,43 +989,33 @@ def combine_videos(
             clip_duration = clip.duration
             # Not all videos are same size, so we need to resize them
             clip_w, clip_h = clip.size
-            if clip_w != video_width or clip_h != video_height:
-                clip_ratio = clip.w / clip.h
-                video_ratio = video_width / video_height
-                logger.debug(f"resizing clip, source: {clip_w}x{clip_h}, ratio: {clip_ratio:.2f}, target: {video_width}x{video_height}, ratio: {video_ratio:.2f}")
-                
-                if clip_ratio == video_ratio:
-                    clip = clip.resized(new_size=(video_width, video_height))
-                else:
-                    if clip_ratio > video_ratio:
-                        scale_factor = video_width / clip_w
-                    else:
-                        scale_factor = video_height / clip_h
-
-                    new_width = int(clip_w * scale_factor)
-                    new_height = int(clip_h * scale_factor)
-
-                    background = ColorClip(size=(video_width, video_height), color=(0, 0, 0)).with_duration(clip_duration)
-                    clip_resized = clip.resized(new_size=(new_width, new_height)).with_position("center")
-                    clip = CompositeVideoClip([background, clip_resized])
+            clip = _fit_clip_to_target_frame(clip, video_width, video_height)
                     
             shuffle_side = random.choice(["left", "right", "top", "bottom"])
-            if transition_value in (None, VideoTransitionMode.none.value):
+            transition_duration = _get_effective_transition_duration(clip.duration)
+            if (
+                transition_value in (None, VideoTransitionMode.none.value)
+                or transition_duration <= 0
+            ):
                 clip = clip
             elif transition_value == VideoTransitionMode.fade_in.value:
-                clip = video_effects.fadein_transition(clip, 1)
+                clip = video_effects.fadein_transition(clip, transition_duration)
             elif transition_value == VideoTransitionMode.fade_out.value:
-                clip = video_effects.fadeout_transition(clip, 1)
+                clip = video_effects.fadeout_transition(clip, transition_duration)
             elif transition_value == VideoTransitionMode.slide_in.value:
-                clip = video_effects.slidein_transition(clip, 1, shuffle_side)
+                clip = video_effects.slidein_transition(clip, transition_duration, shuffle_side)
             elif transition_value == VideoTransitionMode.slide_out.value:
-                clip = video_effects.slideout_transition(clip, 1, shuffle_side)
+                clip = video_effects.slideout_transition(clip, transition_duration, shuffle_side)
             elif transition_value == VideoTransitionMode.shuffle.value:
                 transition_funcs = [
-                    lambda c: video_effects.fadein_transition(c, 1),
-                    lambda c: video_effects.fadeout_transition(c, 1),
-                    lambda c: video_effects.slidein_transition(c, 1, shuffle_side),
-                    lambda c: video_effects.slideout_transition(c, 1, shuffle_side),
+                    lambda c: video_effects.fadein_transition(c, transition_duration),
+                    lambda c: video_effects.fadeout_transition(c, transition_duration),
+                    lambda c: video_effects.slidein_transition(
+                        c, transition_duration, shuffle_side
+                    ),
+                    lambda c: video_effects.slideout_transition(
+                        c, transition_duration, shuffle_side
+                    ),
                 ]
                 shuffle_transition = random.choice(transition_funcs)
                 clip = shuffle_transition(clip)
@@ -668,18 +1024,17 @@ def combine_videos(
                 clip = clip.subclipped(0, max_clip_duration)
                 
             # wirte clip to temp file
-            clip_file = f"{output_dir}/temp-clip-{i+1}.mp4"
+            clip_file = os.path.join(output_dir, f"temp-clip-{i+1}.mp4")
             _write_videofile_with_codec_fallback(
                 clip,
                 clip_file,
                 codec=_get_configured_video_codec(),
                 logger=None,
-                fps=fps,
+                fps=_get_configured_video_fps(),
             )
 
             # Store clip duration before closing
             clip_duration_saved = clip.duration
-            close_clip(clip)
 
             processed_clips.append(
                 SubClippedVideoClip(
@@ -694,6 +1049,9 @@ def combine_videos(
             
         except Exception as e:
             logger.error(f"failed to process clip: {str(e)}")
+        finally:
+            if clip is not None:
+                close_clip(clip)
     
     # loop processed clips until the video duration covers the audio duration and the small safety margin.
     if video_duration < required_video_duration:
@@ -912,7 +1270,19 @@ def generate_video(
     # https://github.com/harry0703/MoneyPrinterTurbo/issues/217
     # PermissionError: [WinError 32] The process cannot access the file because it is being used by another process: 'final-1.mp4.tempTEMP_MPY_wvf_snd.mp3'
     # write into the same directory as the output file
-    output_dir = os.path.dirname(output_file)
+    output_dir = os.path.dirname(output_file) or "."
+    ass_subtitle_path = ""
+    srt_fallback_subtitle_path = ""
+    moviepy_subtitle_path = subtitle_path
+    moviepy_output_file = output_file
+    if subtitle_path and subtitle_path.lower().endswith(".ass"):
+        ass_subtitle_path = subtitle_path
+        moviepy_subtitle_path = ""
+        candidate_srt_path = os.path.splitext(subtitle_path)[0] + ".srt"
+        if os.path.exists(candidate_srt_path):
+            srt_fallback_subtitle_path = candidate_srt_path
+        output_root, output_ext = os.path.splitext(output_file)
+        moviepy_output_file = f"{output_root}.nosub{output_ext or '.mp4'}"
 
     font_path = ""
     if params.subtitle_enabled:
@@ -1079,60 +1449,94 @@ def generate_video(
             _clip = _clip.with_position(("center", "center"))
         return _clip
 
-    video_clip = _open_video_clip_quietly(video_path)
-    audio_clip = AudioFileClip(audio_path).with_effects(
-        [afx.MultiplyVolume(params.voice_volume)]
-    )
-
-    def make_textclip(text):
-        return TextClip(
-            text=text,
-            font=font_path,
-            font_size=params.font_size,
+    video_clip = None
+    try:
+        video_clip = _open_video_clip_quietly(video_path)
+        audio_clip = AudioFileClip(audio_path).with_effects(
+            [afx.MultiplyVolume(params.voice_volume)]
         )
 
-    if subtitle_path and os.path.exists(subtitle_path):
-        sub = SubtitlesClip(
-            subtitles=subtitle_path, encoding="utf-8", make_textclip=make_textclip
-        )
-        text_clips = []
-        for item in sub.subtitles:
-            clip = create_text_clip(subtitle_item=item)
-            text_clips.append(clip)
-        video_clip = CompositeVideoClip([video_clip, *text_clips])
-
-    bgm_file = get_bgm_file(bgm_type=params.bgm_type, bgm_file=params.bgm_file)
-    if bgm_file:
-        try:
-            bgm_clip = AudioFileClip(bgm_file).with_effects(
-                [
-                    afx.MultiplyVolume(params.bgm_volume),
-                    afx.AudioFadeOut(3),
-                    afx.AudioLoop(duration=video_clip.duration),
-                ]
+        def make_textclip(text):
+            return TextClip(
+                text=text,
+                font=font_path,
+                font_size=params.font_size,
             )
-            audio_clip = CompositeAudioClip([audio_clip, bgm_clip])
-        except Exception as e:
-            logger.error(f"failed to add bgm: {str(e)}")
 
-    video_clip = video_clip.with_audio(audio_clip)
-    # 显式沿用输入音频的采样率；如果取不到，再回退到 MoviePy 默认的 44100Hz。
-    # 这样可以减少不同运行环境，尤其是 Docker 环境中再次重采样带来的音质波动。
-    output_audio_fps = int(getattr(audio_clip, "fps", 0) or 44100)
-    _write_videofile_with_codec_fallback(
-        video_clip,
-        output_file=output_file,
-        codec=_get_configured_video_codec(),
-        audio_codec=audio_codec,
-        audio_fps=output_audio_fps,
-        audio_bitrate=audio_bitrate,
-        temp_audiofile_path=_get_temp_audio_dir(output_dir),
-        threads=params.n_threads or 2,
-        logger=None,
-        fps=fps,
-    )
-    video_clip.close()
-    del video_clip
+        if moviepy_subtitle_path and os.path.exists(moviepy_subtitle_path):
+            sub = SubtitlesClip(
+                subtitles=moviepy_subtitle_path,
+                encoding="utf-8",
+                make_textclip=make_textclip,
+            )
+            text_clips = []
+            for item in sub.subtitles:
+                clip = create_text_clip(subtitle_item=item)
+                text_clips.append(clip)
+            video_clip = CompositeVideoClip([video_clip, *text_clips])
+
+        bgm_file = get_bgm_file(bgm_type=params.bgm_type, bgm_file=params.bgm_file)
+        if bgm_file:
+            try:
+                bgm_clip = AudioFileClip(bgm_file).with_effects(
+                    [
+                        afx.MultiplyVolume(params.bgm_volume),
+                        afx.AudioFadeOut(3),
+                        afx.AudioLoop(duration=video_clip.duration),
+                    ]
+                )
+                audio_clip = CompositeAudioClip([audio_clip, bgm_clip])
+            except Exception as e:
+                logger.error(f"failed to add bgm: {str(e)}")
+
+        video_clip = video_clip.with_audio(audio_clip)
+        # 显式沿用输入音频的采样率；如果取不到，再回退到 MoviePy 默认的 44100Hz。
+        # 这样可以减少不同运行环境，尤其是 Docker 环境中再次重采样带来的音质波动。
+        output_audio_fps = int(getattr(audio_clip, "fps", 0) or 44100)
+        _write_videofile_with_codec_fallback(
+            video_clip,
+            output_file=moviepy_output_file,
+            codec=_get_configured_video_codec(),
+            audio_codec=audio_codec,
+            audio_fps=output_audio_fps,
+            audio_bitrate=_get_configured_audio_bitrate(),
+            temp_audiofile_path=_get_temp_audio_dir(output_dir),
+            threads=params.n_threads or 2,
+            logger=None,
+            fps=_get_configured_video_fps(),
+        )
+    finally:
+        if video_clip is not None:
+            video_clip.close()
+            video_clip = None
+
+    if ass_subtitle_path:
+        burned = _burn_ass_subtitles_with_ffmpeg(
+            input_file=moviepy_output_file,
+            subtitle_file=ass_subtitle_path,
+            output_file=output_file,
+            threads=params.n_threads,
+        )
+        if burned:
+            if moviepy_output_file != output_file and os.path.exists(moviepy_output_file):
+                os.remove(moviepy_output_file)
+            return
+
+        if srt_fallback_subtitle_path:
+            logger.warning("ASS subtitle burn-in failed, fallback to SRT subtitles")
+            if moviepy_output_file != output_file and os.path.exists(moviepy_output_file):
+                os.remove(moviepy_output_file)
+            return generate_video(
+                video_path=video_path,
+                audio_path=audio_path,
+                subtitle_path=srt_fallback_subtitle_path,
+                output_file=output_file,
+                params=params,
+            )
+
+        logger.warning("ASS subtitle burn-in failed, keeping video without subtitles")
+        if moviepy_output_file != output_file and os.path.exists(moviepy_output_file):
+            os.replace(moviepy_output_file, output_file)
 
 
 def preprocess_video(materials: List[MaterialInfo], clip_duration=4):
@@ -1142,6 +1546,7 @@ def preprocess_video(materials: List[MaterialInfo], clip_duration=4):
 
     # 仅返回通过预处理校验的素材，避免低分辨率图片继续进入后续的视频合成流程。
     valid_materials = []
+    seen_material_paths = set()
     local_videos_dir = utils.storage_dir("local_videos", create=True)
 
     for material in materials:
@@ -1161,6 +1566,11 @@ def preprocess_video(materials: List[MaterialInfo], clip_duration=4):
                 f"local_videos_dir: {local_videos_dir}, error: {str(exc)}"
             )
             continue
+
+        material_source_key = _source_file_key(material_source_path)
+        if material_source_key in seen_material_paths:
+            continue
+        seen_material_paths.add(material_source_key)
 
         ext = utils.parse_extension(material_source_path)
         try:
@@ -1195,32 +1605,48 @@ def preprocess_video(materials: List[MaterialInfo], clip_duration=4):
                 logger.info(f"processing image: {material_source_path}")
                 # 探测尺寸时已经打开过一次素材，这里先释放探测句柄，再重新创建用于导出的图片 clip。
                 close_clip(clip)
-                # Create an image clip and set its duration to 3 seconds
-                clip = (
-                    ImageClip(material_source_path)
-                    .with_duration(clip_duration)
-                    .with_position("center")
-                )
-                # Apply a zoom effect using the resize method.
-                # A lambda function is used to make the zoom effect dynamic over time.
-                # The zoom effect starts from the original size and gradually scales up to 120%.
-                # t represents the current time, and clip.duration is the total duration of the clip (3 seconds).
-                # Note: 1 represents 100% size, so 1.2 represents 120% size.
-                zoom_clip = clip.resized(
-                    lambda t: 1 + (clip_duration * 0.03) * (t / clip.duration)
-                )
+                clip = None
+                final_clip = None
+                try:
+                    # Create an image clip and set its duration to 3 seconds
+                    clip = (
+                        ImageClip(material_source_path)
+                        .with_duration(clip_duration)
+                        .with_position("center")
+                    )
+                    # Apply a zoom effect using the resize method.
+                    # A lambda function is used to make the zoom effect dynamic over time.
+                    # The zoom effect starts from the original size and gradually scales up to 120%.
+                    # t represents the current time, and clip.duration is the total duration of the clip (3 seconds).
+                    # Note: 1 represents 100% size, so 1.2 represents 120% size.
+                    zoom_clip = clip.resized(
+                        lambda t: _image_zoom_scale(t, clip.duration)
+                    )
 
-                # Optionally, create a composite video clip containing the zoomed clip.
-                # This is useful when you want to add other elements to the video.
-                final_clip = CompositeVideoClip([zoom_clip])
+                    # Optionally, create a composite video clip containing the zoomed clip.
+                    # This is useful when you want to add other elements to the video.
+                    final_clip = CompositeVideoClip(
+                        [zoom_clip],
+                        size=_even_video_size(clip.size),
+                        bg_color=(0, 0, 0),
+                    )
 
-                # Output the video to a file.
-                video_file = f"{material_source_path}.mp4"
-                final_clip.write_videofile(video_file, fps=30, logger=None)
-                close_clip(clip)
-                close_clip(final_clip)
-                material.url = video_file
-                logger.success(f"image processed: {video_file}")
+                    # Output the video to a file.
+                    video_file = f"{material_source_path}.mp4"
+                    _write_videofile_with_codec_fallback(
+                        final_clip,
+                        output_file=video_file,
+                        codec=_get_configured_video_codec(),
+                        fps=_get_configured_video_fps(),
+                        logger=None,
+                    )
+                    material.url = video_file
+                    logger.success(f"image processed: {video_file}")
+                finally:
+                    close_clip(clip)
+                    close_clip(final_clip)
+                    clip = None
+                    final_clip = None
             else:
                 # 普通视频素材只需要读取尺寸做校验，校验完成后立即释放句柄即可。
                 close_clip(clip)

@@ -662,6 +662,47 @@ class TestVoiceService(unittest.TestCase):
             self.assertIn("Gemini subtitle generation should work now", subtitle_content)
             self.assertIn("Testing multiple lines", subtitle_content)
 
+    def test_generate_subtitle_uses_whisper_when_sub_maker_missing(self):
+        script = "Custom audio should still get subtitles."
+
+        def fake_whisper_create(audio_file, subtitle_file):
+            Path(subtitle_file).write_text(
+                "1\n00:00:00,000 --> 00:00:01,000\nCustom audio subtitles\n",
+                encoding="utf-8",
+            )
+
+        with tempfile.TemporaryDirectory() as tmp_dir, patch.object(
+            task_service.config,
+            "app",
+            dict(task_service.config.app, subtitle_provider="whisper"),
+        ), patch.object(
+            task_service.subtitle, "create", side_effect=fake_whisper_create
+        ) as whisper_create, patch.object(
+            task_service.subtitle, "correct"
+        ) as correct, patch(
+            "app.utils.utils.task_dir",
+            lambda tid="": str(Path(tmp_dir) / tid) if tid else str(Path(tmp_dir)),
+        ):
+            task_id = "custom-audio-whisper-subtitle-task"
+            Path(tmp_dir, task_id).mkdir(parents=True, exist_ok=True)
+            subtitle_path = task_service.generate_subtitle(
+                task_id=task_id,
+                params=SimpleNamespace(subtitle_enabled=True),
+                video_script=script,
+                sub_maker=None,
+                audio_file="custom-audio.mp3",
+            )
+
+        self.assertTrue(subtitle_path.endswith("subtitle.srt"))
+        whisper_create.assert_called_once_with(
+            audio_file="custom-audio.mp3",
+            subtitle_file=subtitle_path,
+        )
+        correct.assert_called_once_with(
+            subtitle_file=subtitle_path,
+            video_script=script,
+        )
+
     def test_script_split_keeps_thousand_separator_comma(self):
         """
         Edge TTS 会把 "1,000 years" 作为连续文本返回。脚本断句时不能把
@@ -776,6 +817,130 @@ class TestVoiceService(unittest.TestCase):
         self.assertEqual(len(sub_items), len(script_lines))
         self.assertIn("أهلاً وسهلاً بك في المدرسة", sub_items[0])
         self.assertIn("شكراً لك", sub_items[-1])
+
+    def test_create_karaoke_subtitle_uses_edge_cue_timing(self):
+        sub_maker = SimpleNamespace(
+            cues=[
+                SimpleNamespace(
+                    content="Hello",
+                    start=timedelta(seconds=0),
+                    end=timedelta(seconds=0.4),
+                ),
+                SimpleNamespace(
+                    content="world",
+                    start=timedelta(seconds=0.4),
+                    end=timedelta(seconds=0.9),
+                ),
+            ]
+        )
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            subtitle_file = Path(tmp_dir) / "karaoke.srt"
+            created = vs.create_karaoke_subtitle(
+                sub_maker=sub_maker,
+                text="Hello world.",
+                subtitle_file=str(subtitle_file),
+            )
+            subtitle_content = subtitle_file.read_text(encoding="utf-8")
+
+        self.assertTrue(created)
+        self.assertIn("00:00:00,000 --> 00:00:00,400", subtitle_content)
+        self.assertIn("00:00:00,400 --> 00:00:00,900", subtitle_content)
+        self.assertIn("\nHello\n", subtitle_content)
+        self.assertIn("\nworld\n", subtitle_content)
+
+    def test_create_karaoke_ass_subtitle_uses_edge_cue_timing(self):
+        sub_maker = SimpleNamespace(
+            cues=[
+                SimpleNamespace(
+                    content="Hello",
+                    start=timedelta(seconds=0),
+                    end=timedelta(seconds=0.4),
+                ),
+                SimpleNamespace(
+                    content="world",
+                    start=timedelta(seconds=0.4),
+                    end=timedelta(seconds=0.9),
+                ),
+                SimpleNamespace(
+                    content="{now}",
+                    start=timedelta(seconds=0.9),
+                    end=timedelta(seconds=1.2),
+                ),
+            ]
+        )
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            subtitle_file = Path(tmp_dir) / "karaoke.ass"
+            created = vs.create_karaoke_ass_subtitle(
+                sub_maker=sub_maker,
+                subtitle_file=str(subtitle_file),
+            )
+            subtitle_content = subtitle_file.read_text(encoding="utf-8")
+
+        self.assertTrue(created)
+        self.assertIn("[Script Info]", subtitle_content)
+        self.assertIn("[Events]", subtitle_content)
+        self.assertIn("Dialogue: 0,0:00:00.00,0:00:01.20,Karaoke", subtitle_content)
+        self.assertIn(r"{\kf40}Hello {\kf50}world {\kf30}(now)", subtitle_content)
+        self.assertNotIn("{now}", subtitle_content)
+
+    def test_create_karaoke_ass_subtitle_returns_false_without_edge_cues(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            subtitle_file = Path(tmp_dir) / "karaoke.ass"
+            created = vs.create_karaoke_ass_subtitle(
+                sub_maker=SimpleNamespace(),
+                subtitle_file=str(subtitle_file),
+            )
+
+            self.assertFalse(created)
+            self.assertFalse(subtitle_file.exists())
+
+    def test_generate_subtitle_uses_karaoke_when_requested(self):
+        sub_maker = SimpleNamespace(
+            cues=[
+                SimpleNamespace(
+                    content="Hello",
+                    start=timedelta(seconds=0),
+                    end=timedelta(seconds=0.4),
+                ),
+                SimpleNamespace(
+                    content="world",
+                    start=timedelta(seconds=0.4),
+                    end=timedelta(seconds=0.9),
+                ),
+            ]
+        )
+
+        with tempfile.TemporaryDirectory() as tmp_dir, patch.object(
+            task_service.config,
+            "app",
+            dict(task_service.config.app, subtitle_provider="edge"),
+        ), patch.object(
+            task_service.subtitle, "create"
+        ) as whisper_create, patch(
+            "app.utils.utils.task_dir",
+            lambda tid="": str(Path(tmp_dir) / tid) if tid else str(Path(tmp_dir)),
+        ):
+            task_id = "karaoke-subtitle-edge-task"
+            Path(tmp_dir, task_id).mkdir(parents=True, exist_ok=True)
+            subtitle_path = task_service.generate_subtitle(
+                task_id=task_id,
+                params=SimpleNamespace(subtitle_enabled=True, subtitle_style="karaoke"),
+                video_script="Hello world.",
+                sub_maker=sub_maker,
+                audio_file="",
+            )
+            subtitle_content = Path(subtitle_path).read_text(encoding="utf-8")
+            srt_content = Path(subtitle_path).with_suffix(".srt").read_text(
+                encoding="utf-8"
+            )
+
+        self.assertTrue(subtitle_path.endswith("subtitle.ass"))
+        self.assertFalse(whisper_create.called)
+        self.assertIn(r"{\kf40}Hello {\kf50}world", subtitle_content)
+        self.assertIn("\nHello\n", srt_content)
+        self.assertIn("\nworld\n", srt_content)
 
     def test_create_subtitle_ignores_markdown_separator_lines(self):
         """

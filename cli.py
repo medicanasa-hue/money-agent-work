@@ -7,6 +7,7 @@ from loguru import logger
 
 from app.models.schema import MaterialInfo, VideoParams
 from app.services import task as tm
+from app.services import video as video_service
 from app.utils import utils
 
 
@@ -24,6 +25,49 @@ def _paragraph_count(value: str) -> int:
             f"paragraph-number must be between 1 and 10, got {parsed}"
         )
     return parsed
+
+
+def _int_range(value: str, *, name: str, min_value: int, max_value: int) -> int:
+    parsed = int(value)
+    if parsed < min_value or parsed > max_value:
+        raise argparse.ArgumentTypeError(
+            f"{name} must be between {min_value} and {max_value}, got {parsed}"
+        )
+    return parsed
+
+
+def _video_crf(value: str) -> int:
+    return _int_range(value, name="video-crf", min_value=0, max_value=51)
+
+
+def _video_fps(value: str) -> int:
+    value = str(value).strip().lower()
+    if value.endswith("fps"):
+        value = value[:-3].strip()
+    return _int_range(value, name="video-fps", min_value=1, max_value=120)
+
+
+def _audio_bitrate(value: str) -> str:
+    normalized = str(value).strip().lower()
+    if normalized.endswith("kbps"):
+        normalized = normalized[:-4].strip()
+    elif normalized.endswith("k"):
+        normalized = normalized[:-1]
+    kbps = _int_range(
+        normalized,
+        name="audio-bitrate",
+        min_value=32,
+        max_value=512,
+    )
+    return f"{kbps}k"
+
+
+def _video_codec(value: str) -> str:
+    return str(value).strip().lower()
+
+
+def _libx264_preset(value: str) -> str:
+    return str(value).strip().lower()
 
 
 def _non_negative_float(value: str) -> float:
@@ -58,6 +102,25 @@ _TRANSITION_MODE_VALUES = {
     "slide-in": "SlideIn",
     "slide-out": "SlideOut",
 }
+_VIDEO_CODEC_CHOICES = [
+    "libx264",
+    "h264_nvenc",
+    "h264_amf",
+    "h264_qsv",
+    "h264_mf",
+    "h264_videotoolbox",
+]
+_LIBX264_PRESET_CHOICES = [
+    "ultrafast",
+    "superfast",
+    "veryfast",
+    "faster",
+    "fast",
+    "medium",
+    "slow",
+    "slower",
+    "veryslow",
+]
 
 
 def _transition_mode(value: str) -> str | None:
@@ -148,10 +211,48 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="maximum duration of each source clip in seconds",
     )
     parser.add_argument(
+        "--video-codec",
+        type=_video_codec,
+        choices=_VIDEO_CODEC_CHOICES,
+        default=None,
+        help="video encoder codec",
+    )
+    parser.add_argument(
+        "--video-crf",
+        type=_video_crf,
+        default=None,
+        help="libx264 CRF quality level, 0-51; lower means higher quality",
+    )
+    parser.add_argument(
+        "--video-encoder-preset",
+        type=_libx264_preset,
+        choices=_LIBX264_PRESET_CHOICES,
+        default=None,
+        help="libx264 encoder preset",
+    )
+    parser.add_argument(
+        "--video-fps",
+        type=_video_fps,
+        default=None,
+        help="output frame rate, 1-120",
+    )
+    parser.add_argument(
+        "--audio-bitrate",
+        type=_audio_bitrate,
+        default=None,
+        help="final audio bitrate in kbps, 32-512; accepts 192, 192k, or 192kbps",
+    )
+    parser.add_argument(
         "--match-materials-to-script",
         default=None,
         action=argparse.BooleanOptionalAction,
         help="match generated/search materials to script order",
+    )
+    parser.add_argument(
+        "--smart-scene-queries",
+        default=None,
+        action=argparse.BooleanOptionalAction,
+        help="generate concrete scene-based B-roll search queries",
     )
     parser.add_argument("--voice-name", default="", help="tts voice name")
     parser.add_argument(
@@ -187,6 +288,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="enable subtitles (default: enabled, use --no-subtitle-enabled to disable)",
     )
     parser.add_argument("--font-name", default=None, help="subtitle font file name")
+    parser.add_argument(
+        "--subtitle-style",
+        choices=["classic", "karaoke"],
+        default=None,
+        help="subtitle rendering style",
+    )
     parser.add_argument(
         "--subtitle-position",
         choices=["top", "center", "bottom", "custom"],
@@ -288,13 +395,20 @@ def build_video_params(args: argparse.Namespace) -> VideoParams:
         "video_concat_mode",
         "video_transition_mode",
         "video_clip_duration",
+        "video_codec",
+        "video_crf",
+        "video_encoder_preset",
+        "video_fps",
+        "audio_bitrate",
         "match_materials_to_script",
+        "smart_scene_queries",
         "voice_volume",
         "voice_rate",
         "bgm_type",
         "bgm_file",
         "bgm_volume",
         "font_name",
+        "subtitle_style",
         "subtitle_position",
         "custom_position",
         "text_fore_color",
@@ -319,12 +433,29 @@ def build_video_params(args: argparse.Namespace) -> VideoParams:
     return VideoParams(**params_kwargs)
 
 
+def build_video_quality_config(args: argparse.Namespace) -> dict[str, object]:
+    quality_config_fields = {
+        "video_codec": args.video_codec,
+        "video_crf": args.video_crf,
+        "video_encoder_preset": args.video_encoder_preset,
+        "video_fps": args.video_fps,
+        "audio_bitrate": args.audio_bitrate,
+    }
+    return {
+        key: value
+        for key, value in quality_config_fields.items()
+        if value is not None
+    }
+
+
 def run_cli(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     params = build_video_params(args)
+    quality_config = build_video_quality_config(args)
     task_id = args.task_id or utils.get_uuid()
     logger.info(f"start cli task: {task_id}, stop_at: {args.stop_at}")
-    result = tm.start(task_id=task_id, params=params, stop_at=args.stop_at)
+    with video_service.video_quality_config(quality_config):
+        result = tm.start(task_id=task_id, params=params, stop_at=args.stop_at)
     if not result:
         logger.error("video generation failed")
         return 1

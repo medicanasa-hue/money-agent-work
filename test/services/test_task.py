@@ -4,13 +4,16 @@ import shutil
 import sys
 import tempfile
 from pathlib import Path
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 # add project root to python path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
+from app.config import config
 from app.services import task as tm
-from app.models.schema import MaterialInfo, VideoParams
+from app.services import video as vd
+from app.models.schema import MaterialInfo, VideoConcatMode, VideoParams
 from app.utils import utils
 
 resources_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "resources")
@@ -26,6 +29,226 @@ class TestTaskService(unittest.TestCase):
     
     def tearDown(self):
         pass
+
+    def _run_start_with_upload_config(self, require_review):
+        params = VideoParams(
+            video_subject="upload review",
+            video_script="",
+            video_source="pexels",
+        )
+        mock_state = SimpleNamespace(update_task=MagicMock())
+        mock_upload_service = SimpleNamespace(
+            is_configured=MagicMock(return_value=True),
+            auto_upload=True,
+            platforms=["youtube"],
+            youtube_privacy_status="unlisted",
+        )
+
+        with (
+            patch.object(
+                tm.config,
+                "app",
+                dict(tm.config.app, upload_post_require_review=require_review),
+            ),
+            patch.object(tm.sm, "state", mock_state),
+            patch.object(tm.upload_post, "upload_post_service", mock_upload_service),
+            patch.object(tm, "generate_script", return_value="script"),
+            patch.object(tm, "generate_terms", return_value=["term"]),
+            patch.object(tm, "save_script_data"),
+            patch.object(
+                tm,
+                "generate_audio",
+                return_value=("audio.mp3", 10, None),
+            ),
+            patch.object(tm, "generate_subtitle", return_value="subtitle.srt"),
+            patch.object(tm, "get_video_materials", return_value=["material.mp4"]),
+            patch.object(
+                tm,
+                "generate_final_videos",
+                return_value=(["final-a.mp4", "final-b.mp4"], ["combined.mp4"]),
+            ),
+            patch.object(
+                tm.llm,
+                "generate_social_metadata",
+                return_value={
+                    "title": "Upload title",
+                    "caption": "Upload caption",
+                    "hashtags": ["shorts"],
+                },
+            ) as generate_metadata,
+            patch.object(
+                tm.upload_post,
+                "cross_post_video",
+                return_value={"success": True},
+            ) as cross_post,
+        ):
+            result = tm.start("upload-review-task", params)
+
+        return result, cross_post, generate_metadata
+
+    def test_start_queues_pending_uploads_when_review_required(self):
+        result, cross_post, generate_metadata = self._run_start_with_upload_config(
+            require_review=True
+        )
+
+        cross_post.assert_not_called()
+        generate_metadata.assert_not_called()
+        self.assertIsNone(result["cross_post_results"])
+        self.assertEqual(
+            result["pending_uploads"],
+            [
+                {
+                    "video_path": "final-a.mp4",
+                    "title": "upload review",
+                    "platforms": ["youtube"],
+                    "status": "pending",
+                },
+                {
+                    "video_path": "final-b.mp4",
+                    "title": "upload review",
+                    "platforms": ["youtube"],
+                    "status": "pending",
+                },
+            ],
+        )
+
+    def test_start_cross_posts_when_review_is_disabled(self):
+        result, cross_post, generate_metadata = self._run_start_with_upload_config(
+            require_review=False
+        )
+
+        self.assertEqual(cross_post.call_count, 2)
+        generate_metadata.assert_called_once()
+        self.assertEqual(result["cross_post_results"], [{"success": True}, {"success": True}])
+        self.assertIsNone(result["pending_uploads"])
+
+    def test_generate_terms_falls_back_when_smart_scene_queries_are_empty(self):
+        params = VideoParams(
+            video_subject="budget planning",
+            video_script="",
+            video_source="pexels",
+            smart_scene_queries=True,
+        )
+
+        with (
+            patch.object(tm.llm, "generate_scene_queries", return_value=[]) as scene_queries,
+            patch.object(tm.llm, "generate_terms", return_value=["fallback term"]) as fallback_terms,
+        ):
+            result = tm.generate_terms(
+                task_id="smart-scene-fallback",
+                params=params,
+                video_script="First bills, then savings.",
+            )
+
+        self.assertEqual(result, ["fallback term"])
+        scene_queries.assert_called_once_with(
+            video_subject="budget planning",
+            video_script="First bills, then savings.",
+            amount=8,
+            language="",
+        )
+        fallback_terms.assert_called_once_with(
+            video_subject="budget planning",
+            video_script="First bills, then savings.",
+            amount=8,
+            match_script_order=True,
+        )
+
+    def test_generate_subtitle_returns_ass_when_karaoke_ass_created(self):
+        def fake_create_karaoke_subtitle(text, sub_maker, subtitle_file):
+            Path(subtitle_file).write_text(
+                "1\n00:00:00,000 --> 00:00:01,000\nHello world\n",
+                encoding="utf-8",
+            )
+            return True
+
+        def fake_create_karaoke_ass_subtitle(sub_maker, subtitle_file):
+            Path(subtitle_file).write_text(
+                "[Script Info]\n[Events]\nDialogue: 0,0:00:00.00,0:00:01.00,Karaoke,,0,0,0,,{\\kf100}Hello world\n",
+                encoding="utf-8",
+            )
+            return True
+
+        with tempfile.TemporaryDirectory() as tmp_dir, patch.object(
+            tm.config,
+            "app",
+            dict(tm.config.app, subtitle_provider="edge"),
+        ), patch(
+            "app.utils.utils.task_dir",
+            lambda tid="": str(Path(tmp_dir) / tid) if tid else str(Path(tmp_dir)),
+        ), patch.object(
+            tm.voice,
+            "create_karaoke_subtitle",
+            side_effect=fake_create_karaoke_subtitle,
+        ) as create_srt, patch.object(
+            tm.voice,
+            "create_karaoke_ass_subtitle",
+            side_effect=fake_create_karaoke_ass_subtitle,
+        ) as create_ass, patch.object(
+            tm.subtitle, "create"
+        ) as whisper_create:
+            task_id = "karaoke-ass-task"
+            Path(tmp_dir, task_id).mkdir(parents=True, exist_ok=True)
+
+            subtitle_path = tm.generate_subtitle(
+                task_id=task_id,
+                params=SimpleNamespace(subtitle_enabled=True, subtitle_style="karaoke"),
+                video_script="Hello world.",
+                sub_maker=SimpleNamespace(cues=[object()]),
+                audio_file="",
+            )
+            subtitle_exists = Path(subtitle_path).exists()
+            srt_exists = Path(subtitle_path).with_suffix(".srt").exists()
+
+        self.assertTrue(subtitle_path.endswith("subtitle.ass"))
+        self.assertTrue(subtitle_exists)
+        self.assertTrue(srt_exists)
+        create_srt.assert_called_once()
+        create_ass.assert_called_once()
+        whisper_create.assert_not_called()
+
+    def test_generate_subtitle_returns_srt_when_karaoke_ass_fails(self):
+        def fake_create_karaoke_subtitle(text, sub_maker, subtitle_file):
+            Path(subtitle_file).write_text(
+                "1\n00:00:00,000 --> 00:00:01,000\nHello world\n",
+                encoding="utf-8",
+            )
+            return True
+
+        with tempfile.TemporaryDirectory() as tmp_dir, patch.object(
+            tm.config,
+            "app",
+            dict(tm.config.app, subtitle_provider="edge"),
+        ), patch(
+            "app.utils.utils.task_dir",
+            lambda tid="": str(Path(tmp_dir) / tid) if tid else str(Path(tmp_dir)),
+        ), patch.object(
+            tm.voice,
+            "create_karaoke_subtitle",
+            side_effect=fake_create_karaoke_subtitle,
+        ), patch.object(
+            tm.voice,
+            "create_karaoke_ass_subtitle",
+            return_value=False,
+        ) as create_ass, patch.object(
+            tm.subtitle, "create"
+        ) as whisper_create:
+            task_id = "karaoke-ass-fallback-task"
+            Path(tmp_dir, task_id).mkdir(parents=True, exist_ok=True)
+
+            subtitle_path = tm.generate_subtitle(
+                task_id=task_id,
+                params=SimpleNamespace(subtitle_enabled=True, subtitle_style="karaoke"),
+                video_script="Hello world.",
+                sub_maker=SimpleNamespace(cues=[object()]),
+                audio_file="",
+            )
+            subtitle_exists = Path(subtitle_path).exists()
+
+        self.assertTrue(subtitle_path.endswith("subtitle.srt"))
+        self.assertTrue(subtitle_exists)
+        create_ass.assert_called_once()
+        whisper_create.assert_not_called()
 
     def test_generate_script_forwards_advanced_prompt_options(self):
         """
@@ -53,6 +276,71 @@ class TestTaskService(unittest.TestCase):
             custom_system_prompt="Only write short narration.",
         )
 
+    def test_start_applies_video_quality_params_without_persisting_config(self):
+        params = VideoParams(
+            video_subject="quality",
+            video_script="",
+            video_source="pexels",
+            video_codec="h264_nvenc",
+            video_crf=18,
+            video_encoder_preset="slow",
+            video_fps=60,
+            audio_bitrate="256k",
+        )
+        mock_state = SimpleNamespace(update_task=MagicMock())
+        mock_upload_service = SimpleNamespace(
+            is_configured=MagicMock(return_value=False),
+            auto_upload=False,
+        )
+
+        def generate_final_videos_with_quality(*_args, **_kwargs):
+            self.assertEqual(vd._get_configured_video_codec(), "h264_nvenc")
+            self.assertEqual(vd._get_configured_libx264_crf(), "18")
+            self.assertEqual(vd._get_configured_libx264_preset(), "slow")
+            self.assertEqual(vd._get_configured_video_fps(), 60)
+            self.assertEqual(vd._get_configured_audio_bitrate(), "256k")
+            return ["final.mp4"], ["combined.mp4"]
+
+        with (
+            patch.dict(
+                config.app,
+                {
+                    "video_codec": "libx264",
+                    "video_crf": 24,
+                    "video_encoder_preset": "fast",
+                    "video_fps": 24,
+                    "audio_bitrate": "128k",
+                },
+                clear=False,
+            ),
+            patch.object(tm.sm, "state", mock_state),
+            patch.object(tm.upload_post, "upload_post_service", mock_upload_service),
+            patch.object(tm, "generate_script", return_value="script"),
+            patch.object(tm, "generate_terms", return_value=["term"]),
+            patch.object(tm, "save_script_data"),
+            patch.object(tm, "generate_audio", return_value=("audio.mp3", 10, None)),
+            patch.object(tm, "generate_subtitle", return_value="subtitle.srt"),
+            patch.object(tm, "get_video_materials", return_value=["material.mp4"]),
+            patch.object(
+                tm,
+                "generate_final_videos",
+                side_effect=generate_final_videos_with_quality,
+            ),
+        ):
+            result = tm.start("quality-task", params)
+
+            self.assertEqual(result["videos"], ["final.mp4"])
+            self.assertEqual(config.app["video_codec"], "libx264")
+            self.assertEqual(config.app["video_crf"], 24)
+            self.assertEqual(config.app["video_encoder_preset"], "fast")
+            self.assertEqual(config.app["video_fps"], 24)
+            self.assertEqual(config.app["audio_bitrate"], "128k")
+
+        self.assertEqual(
+            vd._get_configured_video_codec(),
+            config.app.get("video_codec", "libx264"),
+        )
+
     def test_generate_terms_uses_script_order_mode_when_enabled(self):
         """
         默认模式不受影响；只有用户显式开启素材按文案顺序匹配时，任务层才
@@ -75,6 +363,61 @@ class TestTaskService(unittest.TestCase):
             match_script_order=True,
         )
     
+    def test_generate_terms_uses_smart_scene_queries_when_enabled(self):
+        params = VideoParams(
+            video_subject="inflation",
+            video_script="",
+            smart_scene_queries=True,
+        )
+
+        with (
+            patch.object(
+                tm.llm,
+                "generate_scene_queries",
+                return_value=["family bills kitchen", "market prices rising"],
+            ) as generate_scene_queries,
+            patch.object(tm.llm, "generate_terms") as generate_terms,
+        ):
+            result = tm.generate_terms("task-id", params, "Aile butcesi zorlanir.")
+
+        self.assertEqual(result, ["family bills kitchen", "market prices rising"])
+        generate_scene_queries.assert_called_once_with(
+            video_subject="inflation",
+            video_script="Aile butcesi zorlanir.",
+            amount=8,
+            language="",
+        )
+        generate_terms.assert_not_called()
+
+    def test_get_video_materials_treats_smart_scene_queries_as_ordered(self):
+        params = VideoParams(
+            video_subject="inflation",
+            video_script="",
+            video_source="pexels",
+            smart_scene_queries=True,
+            video_clip_duration=5,
+        )
+
+        with patch.object(
+            tm.material,
+            "download_videos",
+            return_value=["clip-1.mp4"],
+        ) as download_videos:
+            cooldown_stats = {"moved_recent_count": 0}
+            result = tm.get_video_materials(
+                "task-id",
+                params,
+                ["family bills kitchen"],
+                audio_duration=10,
+                cooldown_stats=cooldown_stats,
+            )
+
+        self.assertEqual(result, ["clip-1.mp4"])
+        kwargs = download_videos.call_args.kwargs
+        self.assertTrue(kwargs["match_script_order"])
+        self.assertEqual(kwargs["video_concat_mode"], VideoConcatMode.sequential)
+        self.assertIs(kwargs["cooldown_stats"], cooldown_stats)
+
     def test_generate_audio_uses_custom_file_inside_task_directory(self):
         task_id = "test-custom-audio-safe"
         task_dir = utils.task_dir(task_id)
@@ -250,6 +593,83 @@ class TestTaskService(unittest.TestCase):
         self.assertEqual(subtitle_path, "")
         create_subtitle.assert_not_called()
         whisper_create.assert_not_called()
+
+    def test_get_video_materials_uses_selected_online_materials(self):
+        selected_materials = [
+            MaterialInfo(
+                provider="pexels",
+                url="https://v.example/manual.mp4",
+                duration=5,
+                title="Manual clip",
+                license="CC BY 4.0",
+                license_url="https://creativecommons.org/licenses/by/4.0/",
+                attribution="Manual clip - Creator - CC BY 4.0",
+            )
+        ]
+        params = VideoParams(
+            video_subject="manual materials",
+            video_script="script",
+            video_source="pexels",
+            video_materials=selected_materials,
+            video_clip_duration=5,
+            video_count=1,
+        )
+
+        material_attributions = []
+
+        def fake_selected_download(*, attribution_records=None, **kwargs):
+            attribution_records.append(
+                {
+                    "video_path": "/tmp/manual.mp4",
+                    "provider": "pexels",
+                    "title": "Manual clip",
+                    "license": "CC BY 4.0",
+                    "license_url": "https://creativecommons.org/licenses/by/4.0/",
+                    "attribution": "Manual clip - Creator - CC BY 4.0",
+                    "source_url": "https://v.example/manual.mp4",
+                }
+            )
+            return ["/tmp/manual.mp4"]
+
+        with (
+            patch.object(
+                tm.material,
+                "download_selected_videos",
+                side_effect=fake_selected_download,
+            ) as selected_download,
+            patch.object(tm.material, "download_videos") as auto_download,
+        ):
+            result = tm.get_video_materials(
+                "manual-material-task",
+                params,
+                ["city"],
+                audio_duration=5,
+                material_attributions=material_attributions,
+            )
+
+        self.assertEqual(result, ["/tmp/manual.mp4"])
+        self.assertEqual(
+            material_attributions,
+            [
+                {
+                    "video_path": "/tmp/manual.mp4",
+                    "provider": "pexels",
+                    "title": "Manual clip",
+                    "license": "CC BY 4.0",
+                    "license_url": "https://creativecommons.org/licenses/by/4.0/",
+                    "attribution": "Manual clip - Creator - CC BY 4.0",
+                    "source_url": "https://v.example/manual.mp4",
+                }
+            ],
+        )
+        selected_download.assert_called_once_with(
+            task_id="manual-material-task",
+            selected_items=selected_materials,
+            audio_duration=5,
+            max_clip_duration=5,
+            attribution_records=material_attributions,
+        )
+        auto_download.assert_not_called()
 
     @unittest.skipUnless(
         RUN_INTEGRATION_TESTS,

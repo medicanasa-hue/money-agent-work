@@ -6,6 +6,8 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 import cli
+from app.config import config
+from app.services import video as vd
 
 
 class TestCli(unittest.TestCase):
@@ -70,6 +72,126 @@ class TestCli(unittest.TestCase):
         params = cli.build_video_params(args)
         self.assertEqual(params.video_source, "coverr")
 
+    def test_run_cli_applies_video_quality_config(self):
+        def start_with_quality_context(**_kwargs):
+            self.assertEqual(vd._get_configured_video_codec(), "h264_nvenc")
+            self.assertEqual(vd._get_configured_libx264_crf(), "18")
+            self.assertEqual(vd._get_configured_libx264_preset(), "slow")
+            self.assertEqual(vd._get_configured_video_fps(), 60)
+            self.assertEqual(vd._get_configured_audio_bitrate(), "256k")
+            return {"script": "ok"}
+
+        with patch.dict(
+            config.app,
+            {
+                "video_codec": "libx264",
+                "video_crf": 24,
+                "video_encoder_preset": "fast",
+                "video_fps": 24,
+                "audio_bitrate": "128k",
+            },
+            clear=False,
+        ), patch.object(
+            cli.tm, "start", side_effect=start_with_quality_context
+        ) as start, patch.object(
+            cli.utils, "get_uuid", return_value="quality-task"
+        ), patch("builtins.print"):
+            code = cli.run_cli(
+                [
+                    "--video-subject",
+                    "quality",
+                    "--stop-at",
+                    "script",
+                    "--video-codec",
+                    "h264_nvenc",
+                    "--video-crf",
+                    "18",
+                    "--video-encoder-preset",
+                    "slow",
+                    "--video-fps",
+                    "60",
+                    "--audio-bitrate",
+                    "256k",
+                ]
+            )
+
+            self.assertEqual(code, 0)
+            self.assertTrue(start.called)
+            self.assertEqual(config.app["video_codec"], "libx264")
+            self.assertEqual(config.app["video_crf"], 24)
+            self.assertEqual(config.app["video_encoder_preset"], "fast")
+            self.assertEqual(config.app["video_fps"], 24)
+            self.assertEqual(config.app["audio_bitrate"], "128k")
+
+    def test_video_quality_cli_args_validate_ranges(self):
+        with self.assertRaises(SystemExit):
+            cli.parse_args(["--video-subject", "test", "--video-crf", "52"])
+
+    def test_video_quality_cli_fps_normalizes_fps_suffix(self):
+        args = cli.parse_args(
+            [
+                "--video-subject",
+                "test",
+                "--video-fps",
+                "60fps",
+            ]
+        )
+
+        self.assertEqual(args.video_fps, 60)
+
+    def test_video_quality_cli_audio_bitrate_normalizes_kbps_suffix(self):
+        args = cli.parse_args(
+            [
+                "--video-subject",
+                "test",
+                "--audio-bitrate",
+                "256kbps",
+            ]
+        )
+
+        self.assertEqual(args.audio_bitrate, "256k")
+
+    def test_video_quality_cli_choice_args_normalize_safe_values(self):
+        args = cli.parse_args(
+            [
+                "--video-subject",
+                "test",
+                "--video-codec",
+                " H264_NVENC ",
+                "--video-encoder-preset",
+                " Slow ",
+            ]
+        )
+
+        self.assertEqual(args.video_codec, "h264_nvenc")
+        self.assertEqual(args.video_encoder_preset, "slow")
+
+    def test_build_video_params_keeps_video_quality_args(self):
+        args = cli.parse_args(
+            [
+                "--video-subject",
+                "test",
+                "--video-codec",
+                "h264_nvenc",
+                "--video-crf",
+                "18",
+                "--video-encoder-preset",
+                "slow",
+                "--video-fps",
+                "60",
+                "--audio-bitrate",
+                "256k",
+            ]
+        )
+
+        params = cli.build_video_params(args)
+
+        self.assertEqual(params.video_codec, "h264_nvenc")
+        self.assertEqual(params.video_crf, 18)
+        self.assertEqual(params.video_encoder_preset, "slow")
+        self.assertEqual(params.video_fps, 60)
+        self.assertEqual(params.audio_bitrate, "256k")
+
     def test_build_video_params_with_script_video_and_audio_options(self):
         args = cli.parse_args(
             [
@@ -126,6 +248,8 @@ class TestCli(unittest.TestCase):
                 "test",
                 "--font-name",
                 "MicrosoftYaHeiBold.ttc",
+                "--subtitle-style",
+                "karaoke",
                 "--subtitle-position",
                 "custom",
                 "--custom-position",
@@ -147,6 +271,7 @@ class TestCli(unittest.TestCase):
         params = cli.build_video_params(args)
 
         self.assertEqual(params.font_name, "MicrosoftYaHeiBold.ttc")
+        self.assertEqual(params.subtitle_style, "karaoke")
         self.assertEqual(params.subtitle_position, "custom")
         self.assertEqual(params.custom_position, 42.5)
         self.assertEqual(params.text_fore_color, "#AABBCC")

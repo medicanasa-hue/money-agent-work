@@ -19,8 +19,13 @@ def get_api_key(request: Request):
 
 
 def verify_token(request: Request):
+    expected_token = str(config.app.get("api_key", "") or "").strip()
+    if not expected_token:
+        return
+
     token = get_api_key(request)
-    if token != config.app.get("api_key", ""):
+    token = str(token or "").strip()
+    if token != expected_token:
         request_id = get_task_id(request)
         request_url = request.url
         user_agent = request.headers.get("user-agent")
