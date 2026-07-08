@@ -275,6 +275,98 @@ class TestWebuiI18n(unittest.TestCase):
         )
         self.assertEqual(helpers["_quality_gate_warning_text"]({"warn": False}), "")
 
+    def test_script_score_delta_helper_formats_before_after_scores(self):
+        helpers = _load_webui_helpers(
+            "_format_script_score_delta",
+            "_should_apply_improved_analysis",
+        )
+
+        self.assertEqual(
+            helpers["_format_script_score_delta"](
+                {"before": 45, "after": 78, "delta": 33}
+            ),
+            "+33 (45 -> 78)",
+        )
+        self.assertEqual(
+            helpers["_format_script_score_delta"](
+                {"before": 70, "after": 65, "delta": -5}
+            ),
+            "-5 (70 -> 65)",
+        )
+        self.assertEqual(
+            helpers["_format_script_score_delta"](
+                {"before": None, "after": 78, "delta": None}
+            ),
+            "",
+        )
+        self.assertTrue(
+            helpers["_should_apply_improved_analysis"](
+                "Improved script.",
+                {
+                    "improved_script": "Improved script.",
+                    "improved_analysis": {"overall_score": 78},
+                },
+            )
+        )
+        self.assertFalse(
+            helpers["_should_apply_improved_analysis"](
+                "User edited script.",
+                {
+                    "improved_script": "Improved script.",
+                    "improved_analysis": {"overall_score": 78},
+                },
+            )
+        )
+        self.assertFalse(
+            helpers["_should_apply_improved_analysis"](
+                "Improved script.",
+                {"improved_script": "Improved script."},
+            )
+        )
+
+    def test_script_rewrite_preview_text_area_uses_session_state_only(self):
+        tree = ast.parse(WEBUI_MAIN.read_text(encoding="utf-8"))
+        preview_text_areas = []
+
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            if not (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr == "text_area"
+            ):
+                continue
+            keywords = {keyword.arg: keyword.value for keyword in node.keywords}
+            key_value = keywords.get("key")
+            if (
+                isinstance(key_value, ast.Constant)
+                and key_value.value == "script_rewrite_preview"
+            ):
+                preview_text_areas.append(keywords)
+
+        self.assertEqual(len(preview_text_areas), 1)
+        self.assertNotIn("value", preview_text_areas[0])
+
+    def test_viral_analysis_inputs_use_batch_fallback(self):
+        helpers = _load_webui_helpers(
+            "_session_text_value",
+            "_preflight_input_values",
+            "_viral_analysis_input_values",
+        )
+        helpers["st"] = SimpleNamespace(session_state={})
+
+        values = helpers["_viral_analysis_input_values"](
+            SimpleNamespace(video_subject="", video_script="", video_language="en"),
+            [
+                {"subject": "Batch subject 1", "script": "Batch script 1"},
+                {"subject": "Batch subject 2", "script": "Batch script 2"},
+            ],
+        )
+
+        self.assertIn("Batch subject 1", values["video_subject"])
+        self.assertIn("Batch script 2", values["video_script"])
+        self.assertEqual(values["language"], "en")
+
     def test_preflight_inputs_fall_back_to_current_session_values(self):
         helpers = _load_webui_helpers(
             "_session_text_value",

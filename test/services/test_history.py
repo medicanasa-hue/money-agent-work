@@ -144,6 +144,67 @@ class TestProductionHistory(unittest.TestCase):
 
         self.assertEqual(entries[0]["viral_analysis"], viral_analysis)
 
+    def test_history_preserves_thumbnail_candidates(self):
+        thumbnail_candidates = [
+            {
+                "path": "/tmp/task/thumbnails/thumbnail-1.jpg",
+                "timestamp_sec": 1.0,
+                "concept": "Close-up with bold keyword",
+            }
+        ]
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with patch("app.services.history.utils.storage_dir", return_value=temp_dir):
+                history.add_history(
+                    {
+                        "task_id": "task-thumb",
+                        "subject": "thumbnail",
+                        "thumbnail_candidates": thumbnail_candidates,
+                        "thumbnail_candidate_error": "",
+                    }
+                )
+
+                entries = history.list_history()
+
+        self.assertEqual(entries[0]["thumbnail_candidates"], thumbnail_candidates)
+        self.assertEqual(entries[0]["thumbnail_candidate_error"], "")
+
+    def test_update_publish_metrics_normalizes_manual_metrics(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with patch("app.services.history.utils.storage_dir", return_value=temp_dir):
+                history.add_history(
+                    {
+                        "task_id": "task-metrics",
+                        "subject": "metrics",
+                    }
+                )
+
+                updated = history.update_publish_metrics(
+                    "task-metrics",
+                    {
+                        "views": "1200",
+                        "likes": "90",
+                        "comments": "10",
+                        "shares": "5",
+                        "saves": "7",
+                        "captured_at": "2026-07-07T10:00:00+00:00",
+                    },
+                )
+                entries = history.list_history()
+
+        self.assertTrue(updated)
+        self.assertEqual(
+            entries[0]["publish_metrics"],
+            {
+                "views": 1200,
+                "likes": 90,
+                "comments": 10,
+                "shares": 5,
+                "saves": 7,
+                "captured_at": "2026-07-07T10:00:00+00:00",
+            },
+        )
+
     def test_update_pending_upload_result_marks_uploaded(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             with patch("app.services.history.utils.storage_dir", return_value=temp_dir):
@@ -218,6 +279,42 @@ class TestProductionHistory(unittest.TestCase):
             pending_upload["result"],
             {"success": False, "error": "quota exceeded"},
         )
+
+    def test_update_pending_upload_result_skips_malformed_pending_uploads(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with patch("app.services.history.utils.storage_dir", return_value=temp_dir):
+                history.save_history(
+                    [
+                        {
+                            "task_id": "task-upload",
+                            "subject": "malformed duplicate",
+                            "pending_uploads": "not-a-list",
+                        },
+                        {
+                            "task_id": "task-upload",
+                            "subject": "valid duplicate",
+                            "pending_uploads": [
+                                {
+                                    "video_path": "/tmp/final.mp4",
+                                    "title": "Ready to upload",
+                                    "platforms": ["youtube"],
+                                    "status": "pending",
+                                }
+                            ],
+                        },
+                    ]
+                )
+
+                updated = history.update_pending_upload_result(
+                    "task-upload",
+                    "/tmp/final.mp4",
+                    {"success": True, "post_url": "https://youtube.com/shorts/abc"},
+                )
+                entries = history.list_history()
+
+        self.assertTrue(updated)
+        self.assertEqual(entries[0]["pending_uploads"], "not-a-list")
+        self.assertEqual(entries[1]["pending_uploads"][0]["status"], "uploaded")
 
     def test_find_recent_similar_subjects_matches_recent_overlap(self):
         with tempfile.TemporaryDirectory() as temp_dir:

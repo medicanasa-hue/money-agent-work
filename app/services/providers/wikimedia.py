@@ -25,6 +25,12 @@ from .utils import get_tls_verify, raise_for_http_error, safe_error_details
 
 _API_URL = "https://commons.wikimedia.org/w/api.php"
 _COMMON_PARAMS = {"format": "json", "origin": "*"}
+# Wikimedia, User-Agent göndermeyen ya da generic (ör. "python-requests/x.y")
+# UA gönderen istekleri 403 ile reddediyor. Politika, tarayıcı UA'sı taklit
+# etmek yerine betiği tanımlayan açıklayıcı bir UA istiyor:
+# https://foundation.wikimedia.org/wiki/Policy:Wikimedia_Foundation_User-Agent_Policy
+_UA = "MoneyPrinterTurbo/1.0 (https://github.com/harry0703/MoneyPrinterTurbo)"
+_HEADERS = {"User-Agent": _UA}
 
 
 def _clean_extmetadata_value(value) -> str:
@@ -71,6 +77,7 @@ class WikimediaProvider(VideoProvider):
             r = requests.get(
                 _API_URL,
                 params=search_params,
+                headers=_HEADERS,
                 proxies=config.proxy,
                 verify=get_tls_verify(),
                 timeout=(30, 60),
@@ -98,6 +105,7 @@ class WikimediaProvider(VideoProvider):
             ir = requests.get(
                 _API_URL,
                 params=info_params,
+                headers=_HEADERS,
                 proxies=config.proxy,
                 verify=get_tls_verify(),
                 timeout=(30, 60),

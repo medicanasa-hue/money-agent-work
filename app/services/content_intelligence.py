@@ -13,9 +13,29 @@ MAX_CONTENT_SCRIPT_LENGTH = 8000
 MAX_CONTENT_CONTEXT_LENGTH = 500
 MAX_CONTENT_TONE_LENGTH = 128
 MAX_TREND_CONTEXT_LENGTH = 500
+MAX_FALLBACK_ERROR_WARNING_LENGTH = 300
+MAX_RAW_LLM_RESPONSE_LOG_LENGTH = 1200
 TREND_SOURCE_NONE = "none"
 TREND_SOURCE_STATIC = "static"
 TREND_SOURCE_RSS = "rss"
+ANGLE_HOOK_TEMPLATES = {
+    "beginner guide": "New to {subject}? Here's where most people start wrong.",
+    "common mistake": "This is the mistake almost everyone makes with {subject}.",
+    "quick checklist": "Here's a fast checklist most people skip for {subject}.",
+    "before and after": "See what changes when you fix this about {subject}.",
+    "myth versus reality": "You've probably been told the wrong thing about {subject}.",
+    "three practical tips": "Three things that actually work for {subject}.",
+    "simple daily routine": "A simple routine most people never try for {subject}.",
+}
+NON_RETRYABLE_CONTENT_PLAN_ERROR_MARKERS = (
+    "api_key is not set",
+    "quota",
+    "rate limit",
+    "rate-limit",
+    "authentication",
+    "unauthorized",
+    "forbidden",
+)
 
 
 def _clean_text(value: Any, max_length: int, default: str = "") -> str:
@@ -292,6 +312,32 @@ def _normalize_warning_items(value: Any) -> list[str]:
     ]
 
 
+def _fallback_error_warning(last_error: str = "") -> str:
+    clean_error = _clean_text(
+        last_error,
+        MAX_FALLBACK_ERROR_WARNING_LENGTH,
+    )
+    return f"LLM planning failed: {clean_error}" if clean_error else ""
+
+
+def _is_non_retryable_content_plan_error(error_message: str) -> bool:
+    text = (error_message or "").lower()
+    if any(marker in text for marker in NON_RETRYABLE_CONTENT_PLAN_ERROR_MARKERS):
+        return True
+    return bool(
+        re.search(r"\berror:\s*(401|403|429)\b", text)
+        or re.search(r"\b(401|403|429)\s+post\b", text)
+    )
+
+
+def _log_raw_llm_response_excerpt(response: str) -> None:
+    if not response or str(response).lstrip().startswith("Error: "):
+        return
+    excerpt = _clean_text(response, MAX_RAW_LLM_RESPONSE_LOG_LENGTH)
+    if excerpt:
+        logger.warning(f"content plan raw LLM response excerpt: {excerpt}")
+
+
 def _trend_disclaimer(extra_warnings: Sequence[str] | None = None) -> str:
     warnings_text = " ".join(extra_warnings or [])
     if "RSS trend context" in warnings_text:
@@ -462,11 +508,15 @@ def _fallback_ideas(
     for index in range(idea_count):
         angle = angles[index % len(angles)]
         subject = f"{base_subject}: {angle}"
+        hook_template = ANGLE_HOOK_TEMPLATES.get(
+            angle,
+            "Most people miss this about {subject}.",
+        )
         ideas.append(
             {
                 "subject": subject,
                 "angle": angle,
-                "hook": f"Most people miss this about {base_subject}.",
+                "hook": hook_template.format(subject=base_subject),
                 "script_prompt": (
                     f"Write a concise short-form video script about {subject}. "
                     "Keep it practical and easy to follow."
@@ -488,6 +538,7 @@ def fallback_content_plan(
     idea_count: int = 7,
     start_date: date | None = None,
     extra_warnings: Sequence[str] | None = None,
+    last_error: str = "",
 ) -> dict:
     days = _normalize_days(days)
     daily_count = _normalize_daily_count(daily_count)
@@ -506,6 +557,9 @@ def fallback_content_plan(
         _trend_disclaimer(extra_warnings),
         "Fallback plan used because the LLM response was unavailable or invalid.",
     ]
+    error_warning = _fallback_error_warning(last_error)
+    if error_warning:
+        warnings.append(error_warning)
     for warning in extra_warnings or []:
         clean_warning = _clean_text(warning, 300)
         if clean_warning and clean_warning not in warnings:
@@ -541,8 +595,6 @@ def build_content_plan_prompt(
     daily_count = _normalize_daily_count(daily_count)
     idea_count = _normalize_idea_count(idea_count)
     trend_context = _clean_text(trend_context, MAX_TREND_CONTEXT_LENGTH)
-    calendar_count = days * daily_count
-
     language_instruction = (
         "Use the same language as the video subject and script."
         if language == "auto"
@@ -560,7 +612,10 @@ Create practical short-form video ideas and a production calendar for {platform}
 2. Do not claim live trends, current popularity, or guaranteed virality.
 3. Do not imply that you used web, YouTube, TikTok, Google Trends, RSS, or real-time data.
 4. Treat this as an editorial planning assistant using only the context below.
-5. {language_instruction}
+5. The response must parse with Python json.loads without repairs:
+   escape quotes and newlines inside string values, and do not use trailing commas.
+6. Keep every string value concise, preferably under 120 characters.
+7. {language_instruction}
 
 ## JSON shape
 Return exactly these top-level keys: "ideas", "calendar", "warnings".
@@ -574,13 +629,8 @@ Return exactly these top-level keys: "ideas", "calendar", "warnings".
 - "platform": target platform
 - "rationale": why this is useful without making trend claims
 
-"calendar" must contain {calendar_count} objects for {days} days and {daily_count} item(s) per day. Each object must include:
-- "day": day number from 1 to {days}
-- "date": empty string
-- "subject"
-- "format"
-- "goal"
-- "script_prompt"
+"calendar" must be an empty array. The application will expand the ideas into
+{days} days and {daily_count} item(s) per day after parsing.
 
 "warnings" must include at least one sentence saying no live trend data was used.
 
@@ -632,6 +682,7 @@ def generate_content_plan(
     )
 
     response = ""
+    last_error = ""
     for index in range(getattr(llm, "_max_retries", 3)):
         try:
             response = llm._generate_response(prompt)
@@ -648,7 +699,14 @@ def generate_content_plan(
                 extra_warnings=trend_context.warnings,
             )
         except Exception as exc:
-            logger.warning(f"failed to generate content plan: {str(exc)}")
+            last_error = str(exc)
+            logger.warning(f"failed to generate content plan: {last_error}")
+            _log_raw_llm_response_excerpt(response)
+            if _is_non_retryable_content_plan_error(last_error):
+                logger.warning(
+                    "content plan generation stopped because the error is not retryable"
+                )
+                break
             if index < getattr(llm, "_max_retries", 3) - 1:
                 logger.warning(
                     f"failed to generate content plan, trying again... {index + 1}"
@@ -663,4 +721,5 @@ def generate_content_plan(
         daily_count=daily_count,
         idea_count=idea_count,
         extra_warnings=trend_context.warnings,
+        last_error=last_error,
     )

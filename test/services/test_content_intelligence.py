@@ -116,6 +116,19 @@ class TestContentIntelligence(unittest.TestCase):
         self.assertIn("Static planning note", prompt)
         self.assertIn("Do not claim live trends", prompt)
 
+    def test_build_prompt_keeps_calendar_output_compact(self):
+        prompt = content_intelligence.build_content_plan_prompt(
+            video_subject="Voyager",
+            language="tr",
+            platform="youtube_shorts",
+            days=7,
+            daily_count=1,
+            idea_count=3,
+        )
+
+        self.assertIn('"calendar" must be an empty array', prompt)
+        self.assertIn("Keep every string value concise", prompt)
+
     def test_generate_content_plan_uses_llm_json(self):
         payload = """
         {
@@ -375,6 +388,83 @@ class TestContentIntelligence(unittest.TestCase):
         self.assertIn("RSS headlines were used", result["warnings"][0])
         self.assertTrue(
             any("RSS trend context was used" in warning for warning in result["warnings"])
+        )
+
+    def test_fallback_content_plan_uses_distinct_hooks_for_distinct_angles(self):
+        result = content_intelligence.fallback_content_plan(
+            video_subject="Voyager'dan gelen son sinyal ne diyor?",
+            platform="youtube_shorts",
+            days=7,
+            daily_count=1,
+            idea_count=3,
+        )
+
+        hooks = [idea["hook"] for idea in result["ideas"]]
+
+        self.assertEqual(len(hooks), 3)
+        self.assertGreater(len(set(hooks)), 1)
+
+    def test_fallback_content_plan_includes_last_error_warning(self):
+        result = content_intelligence.fallback_content_plan(
+            video_subject="Voyager",
+            platform="youtube_shorts",
+            days=7,
+            daily_count=1,
+            idea_count=1,
+            last_error="content intelligence response is not a JSON object",
+        )
+
+        self.assertTrue(
+            any(
+                "content intelligence response is not a JSON object" in warning
+                for warning in result["warnings"]
+            )
+        )
+
+    def test_generate_content_plan_fallback_includes_last_error_warning(self):
+        with patch.object(
+            content_intelligence.llm,
+            "_generate_response",
+            return_value="Error: api_key is not set",
+        ):
+            result = content_intelligence.generate_content_plan(
+                video_subject="Voyager",
+                platform="youtube_shorts",
+                days=7,
+                daily_count=1,
+                idea_count=1,
+            )
+
+        self.assertEqual(result["source"], "fallback")
+        self.assertTrue(
+            any("api_key is not set" in warning for warning in result["warnings"])
+        )
+
+    def test_generate_content_plan_stops_retrying_non_retryable_errors(self):
+        with patch.object(
+            content_intelligence.llm,
+            "_generate_response",
+            return_value="Error: 429 quota exceeded",
+        ) as generate:
+            result = content_intelligence.generate_content_plan(
+                video_subject="Voyager",
+                platform="youtube_shorts",
+                days=7,
+                daily_count=1,
+                idea_count=1,
+            )
+
+        self.assertEqual(result["source"], "fallback")
+        self.assertEqual(generate.call_count, 1)
+        self.assertTrue(
+            any("429 quota exceeded" in warning for warning in result["warnings"])
+        )
+
+    def test_content_plan_parse_column_number_is_still_retryable(self):
+        self.assertFalse(
+            content_intelligence._is_non_retryable_content_plan_error(
+                "Expecting ',' delimiter: line 1 column 429 (char 428)"
+            )
         )
 
     def test_request_model_rejects_oversized_content_fields(self):

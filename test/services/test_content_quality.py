@@ -1,4 +1,7 @@
+import json
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from app.services import content_quality
@@ -168,37 +171,115 @@ class TestContentQuality(unittest.TestCase):
     def test_suggest_improved_script_preserves_original_and_returns_suggestion(self):
         original = "Coffee is expensive. Follow for more."
         improved = "Coffee prices did not jump by accident. Here is the simple chain. Save this before your next grocery run."
+        original_analysis = {
+            "overall_score": 42,
+            "hook_score": 45,
+            "pacing_score": 55,
+            "warnings": ["Weak hook."],
+        }
+        improved_analysis = {
+            "overall_score": 82,
+            "hook_score": 78,
+            "pacing_score": 74,
+            "warnings": [],
+        }
 
         with patch.object(
             content_quality.llm,
             "_generate_response",
             return_value=improved,
-        ) as generate:
+        ) as generate, patch.object(
+            content_quality.viral_analyzer,
+            "analyze_viral_potential",
+            return_value=improved_analysis,
+        ) as analyze:
             suggestion = content_quality.suggest_improved_script(
                 video_subject="Coffee prices",
                 video_script=original,
-                viral_analysis={"warnings": ["Weak hook."]},
+                viral_analysis=original_analysis,
+                platform="tiktok",
+                language="en",
+                title="Coffee shock",
+                video_duration_sec=35,
+                social_caption="Save this before shopping.",
+                hashtags=["#coffee"],
+                material_attributions=[{"title": "Coffee beans", "license": "CC-BY"}],
+            )
+
+        generate.assert_called_once()
+        analyze.assert_called_once()
+        self.assertEqual(analyze.call_args.kwargs["video_script"], improved)
+        self.assertEqual(analyze.call_args.kwargs["target_platforms"], ["tiktok"])
+        self.assertEqual(analyze.call_args.kwargs["title"], "Coffee shock")
+        self.assertEqual(analyze.call_args.kwargs["video_duration_sec"], 35)
+        self.assertEqual(
+            analyze.call_args.kwargs["social_caption"],
+            "Save this before shopping.",
+        )
+        self.assertEqual(analyze.call_args.kwargs["hashtags"], ["#coffee"])
+        self.assertEqual(
+            analyze.call_args.kwargs["material_attributions"],
+            [{"title": "Coffee beans", "license": "CC-BY"}],
+        )
+        self.assertEqual(suggestion["original_script"], original)
+        self.assertEqual(suggestion["improved_script"], improved)
+        self.assertEqual(suggestion["original_analysis"], original_analysis)
+        self.assertEqual(suggestion["improved_analysis"], improved_analysis)
+        self.assertEqual(
+            suggestion["score_comparison"]["hook_score"],
+            {"before": 45, "after": 78, "delta": 33},
+        )
+        self.assertEqual(suggestion["source"], "llm")
+        self.assertEqual(suggestion["error"], "")
+
+    def test_suggest_improved_script_handles_missing_original_analysis(self):
+        improved = "Coffee changed overnight. Here is what it means. Follow for more."
+        improved_analysis = {
+            "overall_score": 80,
+            "hook_score": 78,
+            "pacing_score": 70,
+        }
+
+        with patch.object(
+            content_quality.llm,
+            "_generate_response",
+            return_value=improved,
+        ), patch.object(
+            content_quality.viral_analyzer,
+            "analyze_viral_potential",
+            return_value=improved_analysis,
+        ):
+            suggestion = content_quality.suggest_improved_script(
+                video_subject="Coffee prices",
+                video_script="Coffee is expensive. Follow for more.",
+                viral_analysis=None,
                 platform="tiktok",
                 language="en",
             )
 
-        generate.assert_called_once()
-        self.assertEqual(suggestion["original_script"], original)
-        self.assertEqual(suggestion["improved_script"], improved)
-        self.assertEqual(suggestion["source"], "llm")
-        self.assertEqual(suggestion["error"], "")
+        self.assertIsNone(suggestion["score_comparison"]["hook_score"]["before"])
+        self.assertEqual(suggestion["score_comparison"]["hook_score"]["after"], 78)
+        self.assertIsNone(suggestion["score_comparison"]["hook_score"]["delta"])
 
     def test_suggest_improved_script_rejects_empty_or_same_output(self):
-        self.assertEqual(
-            content_quality.suggest_improved_script(video_script="")["source"],
-            "unavailable",
-        )
+        with patch.object(
+            content_quality.viral_analyzer,
+            "analyze_viral_potential",
+        ) as analyze:
+            self.assertEqual(
+                content_quality.suggest_improved_script(video_script="")["source"],
+                "unavailable",
+            )
+            analyze.assert_not_called()
 
         with patch.object(
             content_quality.llm,
             "_generate_response",
             return_value="Same script.",
-        ):
+        ), patch.object(
+            content_quality.viral_analyzer,
+            "analyze_viral_potential",
+        ) as analyze:
             suggestion = content_quality.suggest_improved_script(
                 video_script="Same script.",
                 viral_analysis={"warnings": ["Weak hook."]},
@@ -206,6 +287,73 @@ class TestContentQuality(unittest.TestCase):
 
         self.assertEqual(suggestion["improved_script"], "")
         self.assertIn("No useful rewrite", suggestion["error"])
+        analyze.assert_not_called()
+
+    def test_suggest_improved_script_logs_rejected_outputs_without_script_text(self):
+        sensitive_script = "Sensitive script text that should not be logged."
+        viral_analysis = {
+            "overall_score": 40,
+            "hook_score": 35,
+            "pacing_score": 55,
+            "warnings": ["Weak hook.", "Missing CTA."],
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with patch.object(
+                content_quality.utils,
+                "storage_dir",
+                return_value=temp_dir,
+            ), patch.object(
+                content_quality.llm,
+                "_generate_response",
+                side_effect=[
+                    "",
+                    sensitive_script,
+                    ValueError("provider unavailable"),
+                ],
+            ), patch.object(
+                content_quality.viral_analyzer,
+                "analyze_viral_potential",
+            ) as analyze:
+                content_quality.suggest_improved_script(
+                    video_subject="Coffee prices",
+                    video_script=sensitive_script,
+                    viral_analysis=viral_analysis,
+                    platform="tiktok",
+                    language="en",
+                )
+                content_quality.suggest_improved_script(
+                    video_subject="Coffee prices",
+                    video_script=sensitive_script,
+                    viral_analysis=viral_analysis,
+                    platform="tiktok",
+                    language="en",
+                )
+                content_quality.suggest_improved_script(
+                    video_subject="Coffee prices",
+                    video_script=sensitive_script,
+                    viral_analysis=viral_analysis,
+                    platform="tiktok",
+                    language="en",
+                )
+
+            log_path = Path(temp_dir) / content_quality.SCRIPT_REWRITE_REJECTION_LOG
+            events = [
+                json.loads(line)
+                for line in log_path.read_text(encoding="utf-8").splitlines()
+            ]
+
+        analyze.assert_not_called()
+        self.assertEqual(
+            [event["reason"] for event in events],
+            ["empty_output", "same_output", "llm_error"],
+        )
+        self.assertEqual(events[0]["video_subject"], "Coffee prices")
+        self.assertEqual(events[0]["platform"], "tiktok")
+        self.assertEqual(events[0]["language"], "en")
+        self.assertEqual(events[0]["scores"]["hook_score"], 35)
+        self.assertEqual(events[0]["warnings"], ["Weak hook.", "Missing CTA."])
+        self.assertNotIn(sensitive_script, json.dumps(events, ensure_ascii=False))
 
 
 if __name__ == "__main__":

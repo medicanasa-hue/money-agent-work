@@ -72,6 +72,9 @@ def _normalize_entry(entry: dict[str, Any]) -> dict[str, Any]:
     normalized.setdefault("material_attributions", None)
     normalized.setdefault("metadata", None)
     normalized.setdefault("viral_analysis", None)
+    normalized.setdefault("thumbnail_candidates", None)
+    normalized.setdefault("thumbnail_candidate_error", "")
+    normalized.setdefault("publish_metrics", None)
     normalized.setdefault("cooldown", None)
     normalized.setdefault("pending_uploads", None)
     normalized.setdefault("error", "")
@@ -169,6 +172,41 @@ def find_recent_similar_subjects(
     return matches[: max(0, int(limit))]
 
 
+def _normalize_metric_int(value: Any) -> int:
+    if isinstance(value, bool):
+        return 0
+    try:
+        parsed_value = int(value)
+    except (TypeError, ValueError):
+        return 0
+    return max(0, parsed_value)
+
+
+def normalize_publish_metrics(metrics: dict[str, Any] | None) -> dict[str, Any]:
+    metrics = metrics if isinstance(metrics, dict) else {}
+    return {
+        "views": _normalize_metric_int(metrics.get("views")),
+        "likes": _normalize_metric_int(metrics.get("likes")),
+        "comments": _normalize_metric_int(metrics.get("comments")),
+        "shares": _normalize_metric_int(metrics.get("shares")),
+        "saves": _normalize_metric_int(metrics.get("saves")),
+        "captured_at": str(metrics.get("captured_at") or _utc_now_iso()).strip(),
+    }
+
+
+def update_publish_metrics(task_id: str, metrics: dict[str, Any]) -> bool:
+    entries = list_history()
+    normalized_metrics = normalize_publish_metrics(metrics)
+
+    for entry in entries:
+        if entry.get("task_id") != task_id:
+            continue
+        entry["publish_metrics"] = normalized_metrics
+        save_history(entries)
+        return True
+    return False
+
+
 def update_pending_upload_result(
     task_id: str,
     video_path: str,
@@ -185,7 +223,7 @@ def update_pending_upload_result(
 
         pending_uploads = entry.get("pending_uploads") or []
         if not isinstance(pending_uploads, list):
-            return False
+            continue
 
         for pending_upload in pending_uploads:
             if not isinstance(pending_upload, dict):

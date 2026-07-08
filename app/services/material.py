@@ -285,13 +285,51 @@ def save_video(video_url: str, save_dir: str = "") -> str:
                       "AppleWebKit/537.36 (KHTML, like Gecko) "
                       "Chrome/115.0.0.0 Safari/537.36"
     }
-    with open(video_path, "wb") as f:
-        f.write(
-            requests.get(
-                video_url, headers=headers, proxies=config.proxy,
-                verify=_get_tls_verify(), timeout=(60, 240),
-            ).content
+    try:
+        resp = requests.get(
+            video_url, headers=headers, proxies=config.proxy,
+            verify=_get_tls_verify(), timeout=(60, 240),
         )
+    except Exception as e:
+        logger.warning(f"video download request failed: {video_url} => {str(e)}")
+        return ""
+
+    # getattr ile erişiyoruz: gerçek requests.Response nesnelerinde bu alanlar
+    # her zaman mevcut, ama testlerdeki basit mock nesneleri sadece .content
+    # tanımlayabiliyor; onlarla geriye dönük uyumluluğu koruyoruz.
+    status_code = getattr(resp, "status_code", 200)
+    if status_code != 200:
+        logger.warning(
+            f"video download failed: {video_url} => HTTP {status_code}"
+        )
+        return ""
+
+    resp_headers = getattr(resp, "headers", {}) or {}
+    content_type = resp_headers.get("Content-Type", "")
+    if content_type and not (
+        content_type.startswith("video/") or content_type == "application/octet-stream"
+    ):
+        logger.warning(
+            f"video download returned non-video content: {video_url} => "
+            f"Content-Type={content_type}"
+        )
+        return ""
+
+    content = resp.content
+    declared_length = resp_headers.get("Content-Length")
+    if declared_length is not None:
+        try:
+            if int(declared_length) > len(content):
+                logger.warning(
+                    f"video download truncated: {video_url} => expected "
+                    f"{declared_length} bytes, got {len(content)}"
+                )
+                return ""
+        except ValueError:
+            pass
+
+    with open(video_path, "wb") as f:
+        f.write(content)
 
     if os.path.exists(video_path) and os.path.getsize(video_path) > 0:
         clip = None

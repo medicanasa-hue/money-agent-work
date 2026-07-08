@@ -31,6 +31,8 @@ from app.services import (
     llm,
     material,
     presets,
+    quality_calibration,
+    thumbnail,
     upload_post,
     viral_analyzer,
     voice,
@@ -1039,6 +1041,137 @@ def _render_viral_analysis(analysis, key_prefix):
             st.progress(score_value)
 
 
+def _generate_thumbnail_candidates_for_result(task_id, result=None, viral_analysis=None):
+    if not viral_analysis:
+        return {"candidates": [], "error": ""}
+    return thumbnail.generate_thumbnail_candidates(
+        task_id=task_id,
+        video_paths=(result or {}).get("videos", []),
+        thumbnail_concepts=viral_analysis.get("thumbnail_concepts"),
+    )
+
+
+def _attach_thumbnail_candidates(task_id, result=None, viral_analysis=None):
+    result = result or {}
+    thumbnail_result = _generate_thumbnail_candidates_for_result(
+        task_id,
+        result=result,
+        viral_analysis=viral_analysis,
+    )
+    candidates = thumbnail_result.get("candidates") or []
+    error = thumbnail_result.get("error") or ""
+    if candidates:
+        result["thumbnail_candidates"] = candidates
+    if error:
+        result["thumbnail_candidate_error"] = error
+    return thumbnail_result
+
+
+def _render_thumbnail_candidates(candidates=None, error="", key_prefix="thumbnail"):
+    candidates = candidates or []
+    if not candidates and not error:
+        return
+    st.write(tr("Thumbnail Candidates"))
+    if error and not candidates:
+        st.warning(tr("Thumbnail Candidate Error").format(error=error))
+        return
+    image_cols = st.columns(min(3, max(1, len(candidates))))
+    for index, candidate in enumerate(candidates[:3]):
+        image_path = candidate.get("path", "")
+        timestamp = candidate.get("timestamp_sec")
+        concept = candidate.get("concept", "")
+        caption_parts = []
+        if timestamp is not None:
+            caption_parts.append(f"{timestamp:g}s")
+        if concept:
+            caption_parts.append(concept)
+        caption = " - ".join(caption_parts)
+        with image_cols[index % len(image_cols)]:
+            if image_path and os.path.isfile(image_path):
+                st.image(image_path, caption=caption, use_container_width=True)
+            elif image_path:
+                st.code(image_path)
+            elif caption:
+                st.caption(caption)
+
+
+def _format_script_score_delta(change):
+    if not isinstance(change, dict):
+        return ""
+    try:
+        before = int(change.get("before"))
+        after = int(change.get("after"))
+    except (TypeError, ValueError):
+        return ""
+    try:
+        delta = int(change.get("delta"))
+    except (TypeError, ValueError):
+        delta = after - before
+    sign = "+" if delta >= 0 else ""
+    return f"{sign}{delta} ({before} -> {after})"
+
+
+def _should_apply_improved_analysis(applied_script, rewrite_suggestion):
+    if not isinstance(rewrite_suggestion, dict):
+        return False
+    if not rewrite_suggestion.get("improved_analysis"):
+        return False
+    return str(applied_script or "") == str(
+        rewrite_suggestion.get("improved_script", "") or ""
+    )
+
+
+def _render_script_rewrite_comparison(rewrite_suggestion):
+    if not isinstance(rewrite_suggestion, dict):
+        return
+
+    comparison = rewrite_suggestion.get("score_comparison") or {}
+    improved_analysis = rewrite_suggestion.get("improved_analysis") or {}
+    if not comparison and not improved_analysis:
+        return
+
+    st.write(tr("Script Improvement Comparison"))
+    st.caption(tr("Score Change"))
+
+    score_cols = st.columns(3)
+    for index, (score_key, label_key) in enumerate(
+        (
+            ("overall_score", "Viral Score"),
+            ("hook_score", "Hook Score"),
+            ("pacing_score", "Pacing Score"),
+        )
+    ):
+        change = comparison.get(score_key) or {}
+        after_score = change.get("after") if isinstance(change, dict) else None
+        if after_score is None and isinstance(improved_analysis, dict):
+            after_score = improved_analysis.get(score_key)
+        try:
+            score_value = f"{int(after_score)}/100"
+        except (TypeError, ValueError):
+            score_value = tr("Score Not Available")
+        score_cols[index].metric(
+            tr(label_key),
+            score_value,
+            delta=_format_script_score_delta(change) or None,
+        )
+
+    summary = (
+        improved_analysis.get("summary")
+        if isinstance(improved_analysis, dict)
+        else ""
+    )
+    if summary:
+        st.caption(f"{tr('Improved Script Analysis')}: {summary}")
+
+    warnings = (
+        improved_analysis.get("warnings", [])
+        if isinstance(improved_analysis, dict)
+        else []
+    )
+    if warnings:
+        st.warning(f"{tr('Improved Script Analysis')}: " + " | ".join(warnings[:3]))
+
+
 def _content_preflight_warning_text(
     report,
     video_subject,
@@ -1097,6 +1230,10 @@ def _preflight_input_values(params, batch_items=None):
         "video_script": video_script,
         "language": language,
     }
+
+
+def _viral_analysis_input_values(params, batch_items=None):
+    return _preflight_input_values(params, batch_items)
 
 
 def _quality_gate_warning_text(gate):
@@ -1173,6 +1310,10 @@ def _record_history(
             "terms": (result or {}).get("terms") or run_params.video_terms,
             "metadata": metadata,
             "viral_analysis": viral_analysis,
+            "thumbnail_candidates": (result or {}).get("thumbnail_candidates"),
+            "thumbnail_candidate_error": (result or {}).get(
+                "thumbnail_candidate_error", ""
+            ),
             "cooldown": (result or {}).get("cooldown"),
             "pending_uploads": (result or {}).get("pending_uploads"),
             "error": error,
@@ -3214,6 +3355,29 @@ with st.expander(tr("Recent Jobs"), expanded=False):
             history.clear_history()
             st.rerun()
 
+        calibration_report = quality_calibration.build_quality_gate_calibration_report(
+            recent_jobs,
+            current_threshold=st.session_state.get(
+                "viral_quality_gate_threshold",
+                content_quality.DEFAULT_QUALITY_GATE_THRESHOLD,
+            ),
+        )
+        if calibration_report.get("sample_count"):
+            st.write(tr("Quality Gate Calibration"))
+            st.caption(
+                tr("Quality Gate Calibration Summary").format(
+                    samples=calibration_report.get("sample_count", 0),
+                    threshold=calibration_report.get(
+                        "recommended_threshold",
+                        content_quality.DEFAULT_QUALITY_GATE_THRESHOLD,
+                    ),
+                )
+            )
+            st.caption(
+                f"{tr('Quality Gate Recommendation')}: "
+                f"{calibration_report.get('recommendation', '')}"
+            )
+
         for job in recent_jobs:
             history_key_prefix = f"history_{job.get('task_id', '')}"
             subject = job.get("subject") or job.get("task_id") or tr("Untitled")
@@ -3226,6 +3390,11 @@ with st.expander(tr("Recent Jobs"), expanded=False):
                     st.write(tr("Videos"))
                     for url in videos:
                         st.code(url)
+                _render_thumbnail_candidates(
+                    job.get("thumbnail_candidates"),
+                    job.get("thumbnail_candidate_error", ""),
+                    key_prefix=f"{history_key_prefix}_thumb",
+                )
                 terms = job.get("terms") or []
                 if isinstance(terms, str):
                     terms = [term.strip() for term in terms.split(",") if term.strip()]
@@ -3270,6 +3439,63 @@ with st.expander(tr("Recent Jobs"), expanded=False):
                         viral_analysis,
                         key_prefix=f"history_viral_{job.get('task_id', '')}",
                     )
+                publish_metrics = job.get("publish_metrics") or {}
+                st.write(tr("Publish Metrics"))
+                metric_cols = st.columns(5)
+                metric_values = {
+                    "views": metric_cols[0].number_input(
+                        tr("Views"),
+                        min_value=0,
+                        value=int(publish_metrics.get("views", 0) or 0),
+                        step=1,
+                        key=f"{history_key_prefix}_views",
+                    ),
+                    "likes": metric_cols[1].number_input(
+                        tr("Likes"),
+                        min_value=0,
+                        value=int(publish_metrics.get("likes", 0) or 0),
+                        step=1,
+                        key=f"{history_key_prefix}_likes",
+                    ),
+                    "comments": metric_cols[2].number_input(
+                        tr("Comments"),
+                        min_value=0,
+                        value=int(publish_metrics.get("comments", 0) or 0),
+                        step=1,
+                        key=f"{history_key_prefix}_comments",
+                    ),
+                    "shares": metric_cols[3].number_input(
+                        tr("Shares"),
+                        min_value=0,
+                        value=int(publish_metrics.get("shares", 0) or 0),
+                        step=1,
+                        key=f"{history_key_prefix}_shares",
+                    ),
+                    "saves": metric_cols[4].number_input(
+                        tr("Saves"),
+                        min_value=0,
+                        value=int(publish_metrics.get("saves", 0) or 0),
+                        step=1,
+                        key=f"{history_key_prefix}_saves",
+                    ),
+                }
+                captured_at = st.text_input(
+                    tr("Captured At"),
+                    value=publish_metrics.get("captured_at", ""),
+                    key=f"{history_key_prefix}_captured_at",
+                )
+                if st.button(
+                    tr("Save Publish Metrics"),
+                    key=f"{history_key_prefix}_save_publish_metrics",
+                    disabled=not bool(job.get("task_id")),
+                ):
+                    metric_values["captured_at"] = captured_at
+                    if history.update_publish_metrics(
+                        job.get("task_id", ""),
+                        metric_values,
+                    ):
+                        st.success(tr("Publish Metrics Saved"))
+                        st.rerun()
                 if job.get("error"):
                     st.error(job["error"])
 
@@ -3669,19 +3895,22 @@ with st.expander(tr("Viral Analysis"), expanded=False):
         "viral_quality_gate_threshold"
     ]
 
+    viral_batch_items = _get_batch_items()
+    viral_inputs = _viral_analysis_input_values(params, viral_batch_items)
+
     if st.button(tr("Generate Viral Analysis"), key="generate_viral_analysis"):
-        if not params.video_subject and not params.video_script:
+        if not viral_inputs["video_subject"] and not viral_inputs["video_script"]:
             st.error(tr("Please Enter the Video Subject or Script"))
         else:
             current_metadata = st.session_state.get("social_metadata") or {}
             with st.spinner(tr("Generating Viral Analysis")):
                 st.session_state["viral_analysis"] = viral_analyzer.analyze_viral_potential(
-                    video_subject=params.video_subject,
-                    video_script=params.video_script,
+                    video_subject=viral_inputs["video_subject"],
+                    video_script=viral_inputs["video_script"],
                     title=current_metadata.get("title", ""),
                     video_duration_sec=None,
                     target_platforms=[selected_social_platform],
-                    language=params.video_language or "auto",
+                    language=viral_inputs["language"],
                     social_caption=current_metadata.get("caption", ""),
                     hashtags=current_metadata.get("hashtags"),
                 )
@@ -3699,12 +3928,16 @@ with st.expander(tr("Viral Analysis"), expanded=False):
             help=tr("Improve Script Help"),
         ):
             with st.spinner(tr("Improving Script")):
+                current_metadata = st.session_state.get("social_metadata") or {}
                 rewrite_suggestion = content_quality.suggest_improved_script(
                     video_subject=params.video_subject,
                     video_script=params.video_script,
                     viral_analysis=current_viral_analysis,
                     platform=selected_social_platform,
                     language=params.video_language or "auto",
+                    title=current_metadata.get("title", ""),
+                    social_caption=current_metadata.get("caption", ""),
+                    hashtags=current_metadata.get("hashtags"),
                 )
                 st.session_state["script_rewrite_suggestion"] = rewrite_suggestion
                 st.session_state["script_rewrite_preview"] = rewrite_suggestion.get(
@@ -3717,17 +3950,25 @@ with st.expander(tr("Viral Analysis"), expanded=False):
         if rewrite_error:
             st.warning(tr("Improve Script Unavailable").format(error=rewrite_error))
         else:
+            _render_script_rewrite_comparison(rewrite_suggestion)
+            st.session_state.setdefault(
+                "script_rewrite_preview",
+                rewrite_suggestion.get("improved_script", ""),
+            )
             st.text_area(
                 tr("Improved Script Suggestion"),
-                value=rewrite_suggestion.get("improved_script", ""),
                 height=240,
                 key="script_rewrite_preview",
             )
             if st.button(tr("Apply Improved Script"), key="apply_improved_script"):
-                st.session_state["video_script"] = st.session_state.get(
+                applied_script = st.session_state.get(
                     "script_rewrite_preview",
                     rewrite_suggestion.get("improved_script", ""),
                 )
+                st.session_state["video_script"] = applied_script
+                improved_analysis = rewrite_suggestion.get("improved_analysis")
+                if _should_apply_improved_analysis(applied_script, rewrite_suggestion):
+                    st.session_state["viral_analysis"] = improved_analysis
                 st.session_state["script_rewrite_suggestion"] = None
                 st.success(tr("Improved Script Applied"))
                 st.rerun()
@@ -3928,6 +4169,8 @@ if start_button or batch_button:
                             metadata=metadata,
                             platform=selected_social_platform,
                         )
+                    with st.spinner(tr("Generating Thumbnail Candidates")):
+                        _attach_thumbnail_candidates(task_id, result, viral_analysis)
                 _record_history(
                     task_id,
                     run_params,
@@ -3942,6 +4185,10 @@ if start_button or batch_button:
                         "videos": result.get("videos", []),
                         "metadata": metadata,
                         "viral_analysis": viral_analysis,
+                        "thumbnail_candidates": result.get("thumbnail_candidates"),
+                        "thumbnail_candidate_error": result.get(
+                            "thumbnail_candidate_error", ""
+                        ),
                         "cooldown": result.get("cooldown"),
                         "pending_uploads": result.get("pending_uploads"),
                     }
@@ -3985,6 +4232,11 @@ if start_button or batch_button:
                         item["viral_analysis"],
                         key_prefix=f"batch_viral_{item['task_id']}",
                     )
+                _render_thumbnail_candidates(
+                    item.get("thumbnail_candidates"),
+                    item.get("thumbnail_candidate_error", ""),
+                    key_prefix=f"batch_thumb_{item['task_id']}",
+                )
                 if st.button(
                     tr("Open Task Folder"),
                     key=f"open_batch_task_{item['task_id']}",
@@ -4024,6 +4276,8 @@ if start_button or batch_button:
                     metadata=metadata,
                     platform=selected_social_platform,
                 )
+            with st.spinner(tr("Generating Thumbnail Candidates")):
+                _attach_thumbnail_candidates(task_id, result, viral_analysis)
             st.session_state["viral_analysis"] = viral_analysis
         _record_history(
             task_id,
@@ -4066,6 +4320,11 @@ if start_button or batch_button:
                 viral_analysis,
                 key_prefix=f"single_viral_{task_id}",
             )
+        _render_thumbnail_candidates(
+            result.get("thumbnail_candidates"),
+            result.get("thumbnail_candidate_error", ""),
+            key_prefix=f"single_thumb_{task_id}",
+        )
 
         open_task_folder(task_id)
         logger.info(tr("Video Generation Completed"))

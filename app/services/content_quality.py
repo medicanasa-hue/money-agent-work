@@ -1,19 +1,28 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import json
+import os
 import re
 from typing import Any
 
+from loguru import logger
+
 from app.services import content_intelligence, history, llm, viral_analyzer
+from app.utils import utils
 
 DEFAULT_PREFLIGHT_IDEA_COUNT = 3
 DEFAULT_PREFLIGHT_DAYS = 7
 DEFAULT_PREFLIGHT_DAILY_COUNT = 1
 DEFAULT_PREFLIGHT_LOOKBACK_DAYS = history.DEFAULT_SUBJECT_LOOKBACK_DAYS
 DEFAULT_QUALITY_GATE_THRESHOLD = 60
+SCRIPT_REWRITE_REJECTION_LOG = "script_rewrite_rejections.jsonl"
 MAX_REWRITE_SUBJECT_LENGTH = 500
 MAX_REWRITE_SCRIPT_LENGTH = 8000
 MAX_REWRITE_CONTEXT_LENGTH = 1200
+MAX_REWRITE_LOG_ERROR_LENGTH = 500
+MAX_REWRITE_LOG_WARNING_LENGTH = 180
+SCRIPT_SCORE_KEYS = ("overall_score", "hook_score", "pacing_score")
 
 
 def _clean_text(value: Any) -> str:
@@ -182,6 +191,121 @@ def _analysis_lines(analysis: dict[str, Any] | None) -> list[str]:
     return lines
 
 
+def _score_value(value: Any) -> int | None:
+    try:
+        score = int(round(float(value)))
+    except (TypeError, ValueError):
+        return None
+    return max(0, min(100, score))
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def get_script_rewrite_rejection_log_path(create: bool = False) -> str:
+    return os.path.join(
+        utils.storage_dir("logs", create=create),
+        SCRIPT_REWRITE_REJECTION_LOG,
+    )
+
+
+def _analysis_score_summary(analysis: dict[str, Any] | None) -> dict[str, int | None]:
+    source = analysis if isinstance(analysis, dict) else {}
+    return {key: _score_value(source.get(key)) for key in SCRIPT_SCORE_KEYS}
+
+
+def _analysis_warning_summary(analysis: dict[str, Any] | None) -> list[str]:
+    if not isinstance(analysis, dict):
+        return []
+    warnings = analysis.get("warnings") or []
+    if isinstance(warnings, str):
+        warnings = [warnings]
+    if not isinstance(warnings, (list, tuple)):
+        return []
+    return [
+        _clamp_text(warning, MAX_REWRITE_LOG_WARNING_LENGTH)
+        for warning in warnings[:3]
+        if _clean_text(warning)
+    ]
+
+
+def log_script_rewrite_rejection(
+    *,
+    reason: str,
+    video_subject: str = "",
+    viral_analysis: dict[str, Any] | None = None,
+    platform: str = "tiktok",
+    language: str = "auto",
+    error: str = "",
+) -> dict[str, Any]:
+    event = {
+        "created_at": _utc_now_iso(),
+        "reason": _clamp_text(reason, 80),
+        "video_subject": _clamp_text(video_subject, MAX_REWRITE_SUBJECT_LENGTH),
+        "platform": _clamp_text(platform, 64) or "tiktok",
+        "language": _clamp_text(language, 64) or "auto",
+        "scores": _analysis_score_summary(viral_analysis),
+        "warnings": _analysis_warning_summary(viral_analysis),
+        "error": _clamp_text(error, MAX_REWRITE_LOG_ERROR_LENGTH),
+    }
+
+    try:
+        log_path = get_script_rewrite_rejection_log_path(create=True)
+        with open(log_path, "a", encoding="utf-8") as fp:
+            fp.write(json.dumps(event, ensure_ascii=False) + "\n")
+    except Exception as exc:
+        logger.warning(f"failed to log script rewrite rejection: {exc}")
+    return event
+
+
+def build_script_score_comparison(
+    original_analysis: dict[str, Any] | None,
+    improved_analysis: dict[str, Any] | None,
+) -> dict[str, dict[str, int | None]]:
+    comparison: dict[str, dict[str, int | None]] = {}
+    original = original_analysis if isinstance(original_analysis, dict) else {}
+    improved = improved_analysis if isinstance(improved_analysis, dict) else {}
+
+    for key in SCRIPT_SCORE_KEYS:
+        before = _score_value(original.get(key))
+        after = _score_value(improved.get(key))
+        delta = after - before if before is not None and after is not None else None
+        comparison[key] = {
+            "before": before,
+            "after": after,
+            "delta": delta,
+        }
+    return comparison
+
+
+def _script_improvement_result(
+    *,
+    original_script: str,
+    improved_script: str = "",
+    original_analysis: dict[str, Any] | None = None,
+    improved_analysis: dict[str, Any] | None = None,
+    source: str = "unavailable",
+    error: str = "",
+) -> dict[str, Any]:
+    return {
+        "original_script": original_script,
+        "improved_script": improved_script,
+        "original_analysis": (
+            original_analysis if isinstance(original_analysis, dict) else None
+        ),
+        "improved_analysis": (
+            improved_analysis if isinstance(improved_analysis, dict) else None
+        ),
+        "score_comparison": build_script_score_comparison(
+            original_analysis,
+            improved_analysis,
+        ),
+        "source": source,
+        "error": error,
+    }
+
+
 def build_script_improvement_prompt(
     *,
     video_subject: str = "",
@@ -249,15 +373,21 @@ def suggest_improved_script(
     viral_analysis: dict[str, Any] | None = None,
     platform: str = "tiktok",
     language: str = "auto",
+    title: str = "",
+    video_duration_sec: int | float | None = None,
+    social_caption: str = "",
+    hashtags: list[str] | tuple[str, ...] | str | None = None,
+    material_attributions: (
+        list[dict[str, Any]] | tuple[dict[str, Any], ...] | None
+    ) = None,
 ) -> dict[str, Any]:
     original_script = _clamp_text(video_script, MAX_REWRITE_SCRIPT_LENGTH)
     if not original_script:
-        return {
-            "original_script": "",
-            "improved_script": "",
-            "source": "unavailable",
-            "error": "Original script is empty.",
-        }
+        return _script_improvement_result(
+            original_script="",
+            original_analysis=viral_analysis,
+            error="Original script is empty.",
+        )
 
     prompt = build_script_improvement_prompt(
         video_subject=video_subject,
@@ -273,24 +403,67 @@ def suggest_improved_script(
             raise ValueError(response)
         improved_script = _extract_rewritten_script(response)
     except Exception as exc:
-        return {
-            "original_script": original_script,
-            "improved_script": "",
-            "source": "unavailable",
-            "error": str(exc),
-        }
+        log_script_rewrite_rejection(
+            reason="llm_error",
+            video_subject=video_subject,
+            viral_analysis=viral_analysis,
+            platform=platform,
+            language=language,
+            error=str(exc),
+        )
+        return _script_improvement_result(
+            original_script=original_script,
+            original_analysis=viral_analysis,
+            error=str(exc),
+        )
 
-    if not improved_script or improved_script.strip() == original_script.strip():
-        return {
-            "original_script": original_script,
-            "improved_script": "",
-            "source": "unavailable",
-            "error": "No useful rewrite was generated.",
-        }
+    if not improved_script:
+        log_script_rewrite_rejection(
+            reason="empty_output",
+            video_subject=video_subject,
+            viral_analysis=viral_analysis,
+            platform=platform,
+            language=language,
+        )
+        return _script_improvement_result(
+            original_script=original_script,
+            original_analysis=viral_analysis,
+            error="No useful rewrite was generated.",
+        )
 
-    return {
-        "original_script": original_script,
-        "improved_script": improved_script,
-        "source": "llm",
-        "error": "",
-    }
+    if improved_script.strip() == original_script.strip():
+        log_script_rewrite_rejection(
+            reason="same_output",
+            video_subject=video_subject,
+            viral_analysis=viral_analysis,
+            platform=platform,
+            language=language,
+        )
+        return _script_improvement_result(
+            original_script=original_script,
+            original_analysis=viral_analysis,
+            error="No useful rewrite was generated.",
+        )
+
+    selected_platform = _clamp_text(platform, 64) or "tiktok"
+    selected_language = _clamp_text(language, 64) or "auto"
+    improved_analysis = viral_analyzer.analyze_viral_potential(
+        video_subject=video_subject,
+        video_script=improved_script,
+        title=title,
+        video_duration_sec=video_duration_sec,
+        target_platforms=[selected_platform],
+        language=selected_language,
+        social_caption=social_caption,
+        hashtags=hashtags,
+        material_attributions=material_attributions,
+    )
+
+    return _script_improvement_result(
+        original_script=original_script,
+        improved_script=improved_script,
+        original_analysis=viral_analysis,
+        improved_analysis=improved_analysis,
+        source="llm",
+        error="",
+    )
