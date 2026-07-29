@@ -6,6 +6,12 @@ from loguru import logger
 
 from app.config import config
 
+
+_ELEVENLABS_SUBSCRIPTION_URL = "https://api.elevenlabs.io/v1/user/subscription"
+_ELEVENLABS_VOICES_URL = "https://api.elevenlabs.io/v2/voices"
+_ELEVENLABS_FREE_TIERS = frozenset(("free", "trial"))
+
+
 def get_siliconflow_voices() -> list[str]:
     """
     获取硅基流动的声音列表
@@ -89,29 +95,94 @@ def get_mimo_voices() -> list[str]:
     return [f"mimo:{voice}-{gender}" for voice, gender in voices_with_gender]
 
 
-def get_elevenlabs_voices(api_key: str) -> list[str]:
-    if not api_key:
-        return []
+def _elevenlabs_subscription_tier(api_key: str) -> str:
     try:
-        url = "https://api.elevenlabs.io/v1/voices"
-        params = {}
-        headers = {"xi-api-key": api_key}
-        response = requests.get(url, params=params, headers=headers, timeout=10)
+        response = requests.get(
+            _ELEVENLABS_SUBSCRIPTION_URL,
+            headers={"xi-api-key": api_key},
+            timeout=10,
+        )
+    except requests.RequestException as exc:
+        logger.warning(f"ElevenLabs subscription fetch failed: {exc}")
+        return ""
+    if response.status_code != 200:
+        logger.warning(
+            "ElevenLabs subscription fetch failed with status "
+            f"{response.status_code}"
+        )
+        return ""
+    try:
+        payload = response.json()
+    except ValueError:
+        return ""
+    if not isinstance(payload, dict):
+        return ""
+    return str(payload.get("tier") or "").strip().lower()
+
+
+def _is_elevenlabs_voice_available(voice: dict, tier: str) -> bool:
+    if str(voice.get("status") or "").strip().lower() == "disabled":
+        return False
+    if tier not in _ELEVENLABS_FREE_TIERS:
+        return True
+
+    # ElevenLabs exposes saved Voice Library entries in the catalog even
+    # though its API does not permit free-tier TTS generation with them.
+    if isinstance(voice.get("sharing"), dict):
+        return False
+
+    available_tiers = voice.get("available_for_tiers")
+    if isinstance(available_tiers, list) and available_tiers:
+        normalized_tiers = {
+            str(available_tier or "").strip().lower()
+            for available_tier in available_tiers
+        }
+        return bool(_ELEVENLABS_FREE_TIERS & normalized_tiers)
+    return True
+
+
+def get_elevenlabs_voice_catalog(api_key: str) -> dict:
+    catalog = {"voices": [], "tier": "", "filtered_count": 0}
+    if not api_key:
+        return catalog
+
+    tier = _elevenlabs_subscription_tier(api_key)
+    catalog["tier"] = tier
+    try:
+        response = requests.get(
+            _ELEVENLABS_VOICES_URL,
+            params={"page_size": 100},
+            headers={"xi-api-key": api_key},
+            timeout=10,
+        )
         if response.status_code != 200:
             logger.warning(
-                f"ElevenLabs voices fetch failed with status {response.status_code}: {response.text}"
+                "ElevenLabs voices fetch failed with status "
+                f"{response.status_code}"
             )
-            return []
+            return catalog
         data = response.json()
-        voices = data.get("voices", [])
-        return [
-            f"elevenlabs:{v['voice_id']}:{v['name']}"
-            for v in voices
-            if v.get("voice_id") and v.get("name") and v.get("status") != "disabled"
-        ]
+        voices = data.get("voices", []) if isinstance(data, dict) else []
+        for voice in voices:
+            if (
+                not isinstance(voice, dict)
+                or not voice.get("voice_id")
+                or not voice.get("name")
+            ):
+                continue
+            if not _is_elevenlabs_voice_available(voice, tier):
+                catalog["filtered_count"] += 1
+                continue
+            catalog["voices"].append(
+                f"elevenlabs:{voice['voice_id']}:{voice['name']}"
+            )
     except Exception as e:
         logger.warning(f"ElevenLabs voices fetch failed: {str(e)}")
-        return []
+    return catalog
+
+
+def get_elevenlabs_voices(api_key: str) -> list[str]:
+    return get_elevenlabs_voice_catalog(api_key)["voices"]
 
 
 def get_chatterbox_voices() -> list[str]:

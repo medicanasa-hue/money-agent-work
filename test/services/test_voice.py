@@ -1772,21 +1772,107 @@ class TestElevenLabsVoice(unittest.TestCase):
 
     @patch("app.services.voice.requests.get")
     def test_get_elevenlabs_voices_success(self, mock_get):
-        mock_get.return_value.status_code = 200
-        mock_get.return_value.json.return_value = {
-            "voices": [
-                {"voice_id": "abc123", "name": "Adam"},
-                {"voice_id": "def456", "name": "Rachel"},
-            ]
-        }
+        subscription_response = SimpleNamespace(
+            status_code=200,
+            text="",
+            json=lambda: {"tier": "starter"},
+        )
+        voices_response = SimpleNamespace(
+            status_code=200,
+            text="",
+            json=lambda: {
+                "voices": [
+                    {"voice_id": "abc123", "name": "Adam"},
+                    {"voice_id": "def456", "name": "Rachel"},
+                ]
+            },
+        )
+        mock_get.side_effect = [subscription_response, voices_response]
+
         result = vs.get_elevenlabs_voices("fake-api-key")
-        self.assertEqual(result, [
-            "elevenlabs:abc123:Adam",
-            "elevenlabs:def456:Rachel",
-        ])
-        mock_get.assert_called_once()
-        call_kwargs = mock_get.call_args
-        self.assertIn("xi-api-key", call_kwargs.kwargs.get("headers", {}))
+        self.assertEqual(
+            result,
+            [
+                "elevenlabs:abc123:Adam",
+                "elevenlabs:def456:Rachel",
+            ],
+        )
+        self.assertEqual(mock_get.call_count, 2)
+        self.assertTrue(
+            all(
+                "xi-api-key" in call.kwargs.get("headers", {})
+                for call in mock_get.call_args_list
+            )
+        )
+
+    @patch("app.services.voice.requests.get")
+    def test_get_elevenlabs_voice_catalog_filters_library_voices_on_free_tier(
+        self,
+        mock_get,
+    ):
+        subscription_response = SimpleNamespace(
+            status_code=200,
+            text="",
+            json=lambda: {"tier": "free"},
+        )
+        voices_response = SimpleNamespace(
+            status_code=200,
+            text="",
+            json=lambda: {
+                "voices": [
+                    {
+                        "voice_id": "premade",
+                        "name": "Default",
+                        "category": "premade",
+                    },
+                    {
+                        "voice_id": "library",
+                        "name": "Library",
+                        "category": "professional",
+                        "sharing": {"free_users_allowed": True},
+                    },
+                ]
+            },
+        )
+        mock_get.side_effect = [subscription_response, voices_response]
+
+        catalog = vs.get_elevenlabs_voice_catalog("free-api-key")
+
+        self.assertEqual(catalog["tier"], "free")
+        self.assertEqual(catalog["filtered_count"], 1)
+        self.assertEqual(catalog["voices"], ["elevenlabs:premade:Default"])
+
+    @patch("app.services.voice.requests.get")
+    def test_get_elevenlabs_voice_catalog_keeps_library_voices_on_paid_tier(
+        self,
+        mock_get,
+    ):
+        subscription_response = SimpleNamespace(
+            status_code=200,
+            text="",
+            json=lambda: {"tier": "creator"},
+        )
+        voices_response = SimpleNamespace(
+            status_code=200,
+            text="",
+            json=lambda: {
+                "voices": [
+                    {
+                        "voice_id": "library",
+                        "name": "Library",
+                        "category": "professional",
+                        "sharing": {"free_users_allowed": False},
+                    }
+                ]
+            },
+        )
+        mock_get.side_effect = [subscription_response, voices_response]
+
+        catalog = vs.get_elevenlabs_voice_catalog("paid-api-key")
+
+        self.assertEqual(catalog["tier"], "creator")
+        self.assertEqual(catalog["filtered_count"], 0)
+        self.assertEqual(catalog["voices"], ["elevenlabs:library:Library"])
 
     @patch("app.services.voice.requests.get")
     def test_get_elevenlabs_voices_http_error(self, mock_get):

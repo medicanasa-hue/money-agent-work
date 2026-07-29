@@ -449,6 +449,38 @@ class TestVideoService(unittest.TestCase):
 
         self.assertEqual(vd._get_configured_video_codec(), "libx264")
 
+    def test_ffmpeg_quality_args_uses_amf_specific_qp_override(self):
+        config.app.update(
+            {
+                "video_crf": 20,
+                "video_amf_qp_i": 20,
+            }
+        )
+
+        self.assertEqual(
+            vd._ffmpeg_quality_args("h264_amf"),
+            ["-rc", "cqp", "-qp_i", "20", "-qp_p", "22"],
+        )
+        self.assertEqual(
+            vd._ffmpeg_quality_args("libx264"),
+            ["-preset", "medium", "-crf", "20"],
+        )
+
+    def test_ffmpeg_quality_args_rejects_invalid_amf_qp_override(self):
+        for invalid_value in (True, "invalid", -1, 50):
+            with self.subTest(invalid_value=invalid_value):
+                config.app.update(
+                    {
+                        "video_crf": 20,
+                        "video_amf_qp_i": invalid_value,
+                    }
+                )
+
+                self.assertEqual(
+                    vd._ffmpeg_quality_args("h264_amf"),
+                    ["-rc", "cqp", "-qp_i", "12", "-qp_p", "14"],
+                )
+
     def test_ffmpeg_encoder_exists_falls_back_when_probe_fails(self):
         """
         Windows 上用户配置的 ffmpeg 可能因为路径损坏、权限或杀软拦截而无法

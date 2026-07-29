@@ -77,7 +77,11 @@ def test_tts_provider_inputs_render_the_standardized_labels():
         patch.object(voice, "get_siliconflow_voices", return_value=[]),
         patch.object(voice, "get_gemini_voices", return_value=[]),
         patch.object(voice, "get_mimo_voices", return_value=[]),
-        patch.object(voice, "get_elevenlabs_voices", return_value=[]),
+        patch.object(
+            voice,
+            "get_elevenlabs_voice_catalog",
+            return_value={"voices": [], "tier": "", "filtered_count": 0},
+        ),
         patch.object(voice, "get_chatterbox_voices", return_value=[]),
     ):
         app = AppTest.from_file(str(WEBUI_MAIN), default_timeout=30)
@@ -93,4 +97,41 @@ def test_tts_provider_inputs_render_the_standardized_labels():
             assert api_key_input.proto.type == api_key_input.proto.PASSWORD
             assert not getattr(api_key_input.proto, "help", "")
 
+    assert [str(item.value) for item in app.exception] == []
+
+
+def test_free_elevenlabs_catalog_explains_filtered_library_voices():
+    test_ui = dict(
+        config.ui,
+        voice_mode="tts",
+        tts_server="elevenlabs",
+        voice_name="",
+    )
+    test_elevenlabs = {
+        "api_key": "test-api-key",
+        "model_id": "eleven_multilingual_v2",
+    }
+
+    with (
+        patch.object(config, "ui", test_ui),
+        patch.object(config, "elevenlabs", test_elevenlabs),
+        patch.object(config, "save_config"),
+        patch.object(
+            voice,
+            "get_elevenlabs_voice_catalog",
+            return_value={
+                "voices": ["elevenlabs:premade:Default"],
+                "tier": "free",
+                "filtered_count": 3,
+            },
+        ),
+    ):
+        app = AppTest.from_file(str(WEBUI_MAIN), default_timeout=30)
+        app.session_state["ui_language"] = "tr"
+        app.run()
+
+    assert any(
+        "3 Voice Library sesi" in item.value
+        for item in app.info
+    )
     assert [str(item.value) for item in app.exception] == []

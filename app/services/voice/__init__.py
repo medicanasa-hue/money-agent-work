@@ -11,6 +11,7 @@ from app.utils import utils
 from .discovery import (
     get_all_azure_voices,
     get_chatterbox_voices,
+    get_elevenlabs_voice_catalog,
     get_elevenlabs_voices,
     get_gemini_voices,
     get_mimo_voices,
@@ -93,6 +94,7 @@ __all__ = [
     "get_all_azure_voices",
     "get_audio_duration",
     "get_chatterbox_voices",
+    "get_elevenlabs_voice_catalog",
     "get_edge_tts_timeout_seconds",
     "get_elevenlabs_voices",
     "get_gemini_voices",

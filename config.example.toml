@@ -382,6 +382,9 @@ custom_audio_subtitle_provider = "whisper"
 
 # libx264 CRF quality level. Lower means higher quality and larger files.
 # video_crf = 20
+# Optional AMF-only I-frame QP (0-49). This leaves video_crf unchanged for
+# automatic libx264 fallback; calibrate it on the target AMD GPU before use.
+# video_amf_qp_i = 20
 # Optional conservative cleanup for visible color banding in compressed B-roll.
 # video_deband_enabled = false
 # Output frame rate and final audio bitrate.
@@ -515,7 +518,8 @@ api_key = ""
 
 [elevenlabs]
 # API key: https://elevenlabs.io/app/settings/api-keys
-# Favorite voices in the ElevenLabs voice library are shown in the WebUI.
+# Available voices are shown in the WebUI. Voice Library entries are hidden
+# automatically on free accounts because ElevenLabs blocks their API use.
 api_key = ""
 # Available models include eleven_multilingual_v2, eleven_flash_v2_5, and eleven_v3.
 model_id = "eleven_multilingual_v2"

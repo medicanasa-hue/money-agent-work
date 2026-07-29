@@ -48,6 +48,7 @@ from app.services import (
     metrics_sync,
     publish_insights,
     presets,
+    provider_health,
     quality_calibration,
     render_quality,
     review_feedback,
@@ -126,6 +127,12 @@ details[data-testid="stExpander"] {
 }
 
 @media (max-width: 640px) {
+    h1 {
+        font-size: clamp(1.4rem, 7vw, 1.75rem) !important;
+        line-height: 1.2 !important;
+        white-space: nowrap !important;
+    }
+
     div[data-testid="stMetric"] {
         padding: 0.15rem 0;
     }
@@ -2919,17 +2926,34 @@ def _render_tts_settings_panel(params):
         )
         if saved_elevenlabs_api_key:
             config.elevenlabs["api_key"] = saved_elevenlabs_api_key
-        cache_key = f"elevenlabs_voices_{saved_elevenlabs_api_key}"
+        api_key_fingerprint = (
+            hashlib.sha256(saved_elevenlabs_api_key.encode("utf-8")).hexdigest()[:16]
+            if saved_elevenlabs_api_key
+            else "empty"
+        )
+        cache_key = f"elevenlabs_voice_catalog_{api_key_fingerprint}"
         if cache_key not in st.session_state:
-            st.session_state[cache_key] = voice.get_elevenlabs_voices(
+            st.session_state[cache_key] = voice.get_elevenlabs_voice_catalog(
                 saved_elevenlabs_api_key
             )
         if st.button("ğŸ”„ Sesleri Yenile", key="refresh_elevenlabs"):
             for key in list(st.session_state.keys()):
-                if key.startswith("elevenlabs_voices_"):
+                if key.startswith(
+                    ("elevenlabs_voice_catalog_", "elevenlabs_voices_")
+                ):
                     del st.session_state[key]
             st.rerun()
-        filtered_voices = st.session_state[cache_key]
+        elevenlabs_catalog = st.session_state[cache_key]
+        filtered_voices = list(elevenlabs_catalog.get("voices") or [])
+        filtered_voice_count = int(
+            elevenlabs_catalog.get("filtered_count") or 0
+        )
+        if filtered_voice_count:
+            st.info(
+                tr("ElevenLabs Free Tier Voice Filter").format(
+                    count=filtered_voice_count
+                )
+            )
     elif selected_tts_server == "chatterbox":
         _sync_chatterbox_config_from_session_state()
         filtered_voices = voice.get_chatterbox_voices()
@@ -5984,7 +6008,14 @@ def _accounts_api_readiness_state():
     media_key_count = (
         pexels_count + pixabay_count + coverr_count + dvids_count + vecteezy_count
     )
-    video_source_count = _enabled_video_source_count()
+    source_health = provider_health.build_video_source_health()
+    video_source_count = source_health["enabled_count"]
+    ready_source_count = source_health["ready_count"]
+    missing_source_rows = [
+        row
+        for row in source_health["sources"]
+        if row["enabled"] and row["status"] == "needs_configuration"
+    ]
     elevenlabs_ready = _has_config_secret(getattr(config, "elevenlabs", {}))
     chatterbox_ready = bool(
         str((getattr(config, "chatterbox", {}) or {}).get("base_url", "") or "").strip()
@@ -6000,6 +6031,12 @@ def _accounts_api_readiness_state():
     elif not media_key_count and video_source_count <= 0:
         level = "warning"
         message = tr("Accounts Media Needs Source")
+        action = tr("Review Media Sources")
+    elif missing_source_rows:
+        level = "warning"
+        message = tr("Accounts Source Needs Configuration").format(
+            sources=", ".join(tr(row["label"]) for row in missing_source_rows)
+        )
         action = tr("Review Media Sources")
     elif upload_enabled and not upload_ready:
         level = "warning"
@@ -6025,7 +6062,7 @@ def _accounts_api_readiness_state():
             },
             {
                 "label": tr("Video Sources"),
-                "value": f"{video_source_count} {tr('Enabled')}",
+                "value": f"{ready_source_count}/{video_source_count} {tr('Ready')}",
             },
             {
                 "label": tr("TTS Providers"),
@@ -6042,15 +6079,47 @@ def _accounts_api_readiness_state():
                 ),
             },
         ],
+        "source_health": source_health,
     }
 
 
 def _render_accounts_api_readiness():
+    readiness = _accounts_api_readiness_state()
     _render_readiness_review(
         "Accounts API Readiness",
         "Accounts API Readiness Help",
-        _accounts_api_readiness_state(),
+        readiness,
     )
+    source_rows = [
+        row
+        for row in readiness["source_health"]["sources"]
+        if row["enabled"]
+    ]
+    with st.expander(tr("Video Source Configuration"), expanded=False):
+        st.caption(tr("Video Source Configuration Help"))
+        status_labels = {
+            "ready": tr("Ready"),
+            "needs_configuration": tr("Needs Input"),
+        }
+        st.dataframe(
+            [
+                {
+                    tr("Source"): tr(row["label"]),
+                    tr("Status"): status_labels.get(
+                        row["status"],
+                        tr("Needs Input"),
+                    ),
+                    tr("API Requirement"): (
+                        tr("API Key Required")
+                        if row["requires_api_key"]
+                        else tr("No API Key Required")
+                    ),
+                }
+                for row in source_rows
+            ],
+            hide_index=True,
+            width="stretch",
+        )
 
 
 def _brand_kit_profiles():

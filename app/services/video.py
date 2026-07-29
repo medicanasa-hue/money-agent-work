@@ -173,6 +173,7 @@ _VIDEO_QUALITY_CONFIG_KEYS = frozenset(
     (
         "video_codec",
         "video_crf",
+        "video_amf_qp_i",
         "video_encoder_preset",
         "video_fps",
         "audio_bitrate",
@@ -1504,6 +1505,19 @@ def _get_configured_libx264_preset() -> str:
     return _DEFAULT_LIBX264_PRESET
 
 
+def _get_configured_amf_qp_i() -> int:
+    raw_value = _get_video_quality_config_value("video_amf_qp_i", None)
+    if not isinstance(raw_value, bool):
+        try:
+            qp_i = int(raw_value)
+        except (TypeError, ValueError):
+            pass
+        else:
+            if 0 <= qp_i <= 49:
+                return qp_i
+    return max(0, int(_get_configured_libx264_crf()) - _AMF_CQP_QP_OFFSET)
+
+
 def _ffmpeg_quality_args(
     codec: str | None, *, bitrate=None, existing_params=None
 ) -> list[str]:
@@ -1532,7 +1546,7 @@ def _ffmpeg_quality_args(
         # AMF QP shares CRF's 0-51 range but not its visual equivalence. A lower
         # QP keeps the default CRF 20 near the previous AMF quality baseline while
         # preserving the existing lower-is-higher-quality ordering.
-        qp_i = max(0, int(_get_configured_libx264_crf()) - _AMF_CQP_QP_OFFSET)
+        qp_i = _get_configured_amf_qp_i()
         return [
             "-rc",
             "cqp",
