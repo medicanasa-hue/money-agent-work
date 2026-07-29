@@ -20,12 +20,14 @@ class TaskManager:
         raise NotImplementedError()
 
     def add_task(self, func: Callable, *args: Any, **kwargs: Any):
+        task_info = None
         with self.lock:
             if self.current_tasks < self.max_concurrent_tasks:
+                self.current_tasks += 1
                 logger.info(
                     f"add task: {func.__name__}, current_tasks: {self.current_tasks}"
                 )
-                self.execute_task(func, *args, **kwargs)
+                task_info = {"func": func, "args": args, "kwargs": kwargs}
             else:
                 queue_size = self.queue_size()
                 # 并发数已满时才进入排队。队列必须有上限，否则匿名接口可以持续
@@ -43,6 +45,9 @@ class TaskManager:
                 )
                 self.enqueue({"func": func, "args": args, "kwargs": kwargs})
 
+        if task_info is not None:
+            self._execute_reserved_task(task_info)
+
     def execute_task(self, func: Callable, *args: Any, **kwargs: Any):
         thread = threading.Thread(
             target=self.run_task, args=(func, *args), kwargs=kwargs
@@ -51,28 +56,52 @@ class TaskManager:
 
     def run_task(self, func: Callable, *args: Any, **kwargs: Any):
         try:
-            with self.lock:
-                self.current_tasks += 1
             func(*args, **kwargs)  # call the function here, passing *args and **kwargs.
         finally:
             self.task_done()
 
     def check_queue(self):
+        task_info = None
         with self.lock:
             if (
                 self.current_tasks < self.max_concurrent_tasks
                 and not self.is_queue_empty()
             ):
                 task_info = self.dequeue()
-                func = task_info["func"]
-                args = task_info.get("args", ())
-                kwargs = task_info.get("kwargs", {})
-                self.execute_task(func, *args, **kwargs)
+                if task_info is not None:
+                    self.current_tasks += 1
+
+        if task_info is not None:
+            self._execute_reserved_task(task_info, requeue_on_failure=True)
 
     def task_done(self):
         with self.lock:
+            if self.current_tasks <= 0:
+                logger.warning("task_done called without a reserved task")
+                return
             self.current_tasks -= 1
         self.check_queue()
+
+    def _execute_reserved_task(
+        self,
+        task_info: Dict,
+        requeue_on_failure: bool = False,
+    ):
+        try:
+            self.execute_task(
+                task_info["func"],
+                *task_info.get("args", ()),
+                **task_info.get("kwargs", {}),
+            )
+        except Exception:
+            if requeue_on_failure:
+                with self.lock:
+                    if self.current_tasks > 0:
+                        self.current_tasks -= 1
+                self.enqueue(task_info)
+            else:
+                self.task_done()
+            raise
 
     def enqueue(self, task: Dict):
         raise NotImplementedError()

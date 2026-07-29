@@ -15,6 +15,7 @@ from .utils import (
     get_tls_verify,
     raise_for_http_error,
     safe_error_details,
+    select_best_video_variant,
 )
 
 
@@ -32,7 +33,6 @@ class PixabayProvider(VideoProvider):
         video_aspect: VideoAspect = VideoAspect.portrait,
     ) -> List[MaterialInfo]:
         aspect = VideoAspect(video_aspect)
-        video_width, video_height = aspect.to_resolution()
 
         try:
             api_key = get_api_key("pixabay_api_keys")
@@ -69,19 +69,18 @@ class PixabayProvider(VideoProvider):
                 duration = v["duration"]
                 if duration < minimum_duration:
                     continue
-                best_video = None
-                best_pixels = -1
-                for video in v["videos"].values():
-                    w = int(video["width"])
-                    h = int(video.get("height", 0))
-                    if w >= video_width and h >= video_height and w * h > best_pixels:
-                        best_video = (video, w, h)
-                        best_pixels = w * h
+                videos = v.get("videos")
+                best_video = select_best_video_variant(
+                    videos.values() if isinstance(videos, dict) else [],
+                    video_aspect=aspect,
+                    url_key="url",
+                )
                 if best_video:
                     video, w, h = best_video
                     item = MaterialInfo()
                     item.provider = "pixabay"
                     item.url = video["url"]
+                    item.preview_url = str(video.get("thumbnail") or "").strip()
                     item.duration = duration
                     item.width = w
                     item.height = h

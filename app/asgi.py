@@ -1,7 +1,9 @@
 """Application implementation - ASGI."""
 
+import hmac
 import ipaddress
 import os
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
@@ -9,11 +11,28 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from loguru import logger
+from starlette.datastructures import Headers
 
 from app.config import config
 from app.models.exception import HttpException
 from app.router import root_api_router
 from app.utils import utils
+
+
+@asynccontextmanager
+async def application_lifespan(_: FastAPI):
+    """集中处理 API 进程启动恢复和关闭日志。"""
+    logger.info("startup event")
+
+    # 跨平台发布由当前进程线程池执行，不会在服务重启后恢复。启动时把 Redis
+    # 中确认已失去执行进程的活动状态收敛为失败，避免任务永久无法删除。
+    from app.services import task as task_service
+
+    task_service.recover_interrupted_cross_posts()
+    try:
+        yield
+    finally:
+        logger.info("shutdown event")
 
 
 def exception_handler(request: Request, e: HttpException):
@@ -32,25 +51,64 @@ def validation_exception_handler(request: Request, e: RequestValidationError):
     )
 
 
+def _is_loopback_host(listen_host: str | None) -> bool:
+    host = (listen_host or "").strip().lower()
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
 def warn_if_api_unprotected(api_key: str | None, listen_host: str | None) -> str | None:
     api_key = (api_key or "").strip()
     if api_key:
         return None
 
-    host = (listen_host or "").strip().lower()
-    if host == "localhost":
+    if _is_loopback_host(listen_host):
         return None
-
-    try:
-        if ipaddress.ip_address(host).is_loopback:
-            return None
-    except ValueError:
-        pass
 
     return (
         "API authentication is disabled while listen_host is not loopback. "
         "Set app.api_key or bind the API to 127.0.0.1/localhost for safer local use."
     )
+
+
+def cors_configuration(
+    listen_host: str | None, configured_origins: str | None
+) -> tuple[list[str], bool]:
+    """Use explicit browser origins for network hosts and safe local defaults."""
+    origins = [
+        origin.strip()
+        for origin in str(configured_origins or "").split(",")
+        if origin.strip()
+    ]
+    if origins:
+        return origins, "*" not in origins
+    if _is_loopback_host(listen_host):
+        return ["*"], False
+    return [], False
+
+
+def should_protect_task_outputs(api_key: str | None, listen_host: str | None) -> bool:
+    """Keep browser-friendly task output access for local-only installations."""
+    return bool(str(api_key or "").strip()) and not _is_loopback_host(listen_host)
+
+
+class TaskOutputStaticFiles(StaticFiles):
+    """Require the API key for generated media only on network-bound installs."""
+
+    async def get_response(self, path: str, scope):
+        expected_token = str(config.app.get("api_key", "") or "").strip()
+        if should_protect_task_outputs(expected_token, config.listen_host):
+            token = Headers(scope=scope).get("x-api-key", "").strip()
+            if not hmac.compare_digest(token, expected_token):
+                return JSONResponse(
+                    status_code=401,
+                    content={"detail": "task output authentication required"},
+                )
+        return await super().get_response(path, scope)
 
 
 def get_application() -> FastAPI:
@@ -65,6 +123,7 @@ def get_application() -> FastAPI:
         description=config.project_description,
         version=config.project_version,
         debug=False,
+        lifespan=application_lifespan,
     )
     instance.include_router(root_api_router)
     instance.add_exception_handler(HttpException, exception_handler)
@@ -82,29 +141,22 @@ app = get_application()
 
 # Configures the CORS middleware for the FastAPI app
 cors_allowed_origins_str = os.getenv("CORS_ALLOWED_ORIGINS", "")
-origins = cors_allowed_origins_str.split(",") if cors_allowed_origins_str else ["*"]
+origins, cors_allow_credentials = cors_configuration(
+    config.listen_host,
+    cors_allowed_origins_str,
+)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
-    allow_credentials=True,
+    allow_credentials=cors_allow_credentials,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 task_dir = utils.task_dir()
 app.mount(
-    "/tasks", StaticFiles(directory=task_dir, html=True, follow_symlink=True), name=""
+    "/tasks", TaskOutputStaticFiles(directory=task_dir, html=True, follow_symlink=True), name=""
 )
 
 public_dir = utils.public_dir()
 app.mount("/", StaticFiles(directory=public_dir, html=True), name="")
-
-
-@app.on_event("shutdown")
-def shutdown_event():
-    logger.info("shutdown event")
-
-
-@app.on_event("startup")
-def startup_event():
-    logger.info("startup event")

@@ -1,4 +1,5 @@
 import dataclasses
+import subprocess
 import sys
 import unittest
 import warnings
@@ -6,13 +7,37 @@ from pathlib import Path
 
 from pydantic import ValidationError
 
-sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+ROOT_DIR = Path(__file__).parent.parent.parent
+sys.path.insert(0, str(ROOT_DIR))
 
+from app.models import schema as schema_models
 from app.config import config
-from app.models.schema import MaterialInfo, VideoAspect, VideoParams
+from app.models.schema import (
+    MaterialInfo,
+    VideoAspect,
+    VideoParams,
+    VideoTransitionMode,
+)
 
 
 class TestMaterialInfo(unittest.TestCase):
+    def test_schema_import_has_no_pydantic_v2_config_deprecations(self):
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "import warnings; from pydantic import PydanticDeprecatedSince20; "
+                "warnings.simplefilter('error', PydanticDeprecatedSince20); "
+                "import app.models.schema",
+            ],
+            cwd=ROOT_DIR,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_metadata_defaults_preserve_legacy_construction(self):
         first = MaterialInfo("coverr", "https://example.com/video.mp4", 12, 1920, 1080)
         second = MaterialInfo()
@@ -70,6 +95,8 @@ class TestMaterialInfo(unittest.TestCase):
             "license": "CC BY 4.0",
             "license_url": "https://creativecommons.org/licenses/by/4.0/",
             "attribution": "City skyline at sunrise - Creator - CC BY 4.0",
+            "preview_url": "",
+            "preview_quality_score": None,
         }
 
         self.assertEqual(dataclasses.asdict(material), expected)
@@ -78,18 +105,57 @@ class TestMaterialInfo(unittest.TestCase):
         self.assertEqual(params.model_dump()["video_materials"], [expected])
 
 
+class TestResponseSchemas(unittest.TestCase):
+    def test_response_examples_remain_in_json_schema(self):
+        response_model_names = (
+            "TaskResponse",
+            "TaskQueryResponse",
+            "TaskDeletionResponse",
+            "VideoScriptResponse",
+            "VideoTermsResponse",
+            "VideoSocialMetadataResponse",
+            "ContentIntelligenceResponse",
+            "BgmRetrieveResponse",
+            "BgmUploadResponse",
+            "VideoMaterialRetrieveResponse",
+            "VideoMaterialUploadResponse",
+        )
+
+        for name in response_model_names:
+            with self.subTest(response_model=name):
+                model_schema = getattr(
+                    schema_models, name
+                ).model_json_schema()
+                self.assertTrue(
+                    "example" in model_schema or "examples" in model_schema
+                )
+
+
 class TestVideoAspect(unittest.TestCase):
     def test_to_resolution_known_aspects(self):
         self.assertEqual(VideoAspect.landscape.to_resolution(), (1920, 1080))
         self.assertEqual(VideoAspect.portrait.to_resolution(), (1080, 1920))
+        self.assertEqual(VideoAspect.portrait_4_5.value, "4:5")
+        self.assertEqual(VideoAspect.portrait_4_5.to_resolution(), (1080, 1350))
         self.assertEqual(VideoAspect.square.to_resolution(), (1080, 1080))
 
     def test_to_resolution_rejects_unsupported_value(self):
         with self.assertRaises(ValueError):
-            VideoAspect.to_resolution("4:5")
+            VideoAspect.to_resolution("3:2")
 
 
 class TestVideoParams(unittest.TestCase):
+    def test_video_aspects_accepts_multiple_selected_formats(self):
+        params = VideoParams(
+            video_subject="test",
+            video_aspects=["9:16", "4:5"],
+        )
+
+        self.assertEqual(
+            params.video_aspects,
+            [VideoAspect.portrait, VideoAspect.portrait_4_5],
+        )
+
     def test_subtitle_style_uses_config_default(self):
         params = VideoParams(video_subject="test")
 
@@ -102,6 +168,18 @@ class TestVideoParams(unittest.TestCase):
         params = VideoParams(video_subject="test", subtitle_style="karaoke")
 
         self.assertEqual(params.subtitle_style, "karaoke")
+
+    def test_video_transition_defaults_to_crossfade_but_can_be_disabled(self):
+        self.assertEqual(
+            VideoParams(video_subject="test").video_transition_mode,
+            VideoTransitionMode.crossfade,
+        )
+        self.assertIsNone(
+            VideoParams(
+                video_subject="test",
+                video_transition_mode=None,
+            ).video_transition_mode
+        )
 
     def test_default_video_params_dump_without_serializer_warnings(self):
         params = VideoParams(video_subject="test")

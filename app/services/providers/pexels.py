@@ -1,6 +1,7 @@
 """Pexels video provider."""
+import re
 from typing import List
-from urllib.parse import urlencode
+from urllib.parse import unquote, urlencode, urlparse
 
 import requests
 from loguru import logger
@@ -16,7 +17,30 @@ from .utils import (
     get_tls_verify,
     raise_for_http_error,
     safe_error_details,
+    select_best_video_variant,
 )
+
+
+def _pexels_page_title(page_url: object) -> str:
+    """Extract Pexels' human-readable video title from its detail page URL."""
+    if not isinstance(page_url, str) or not page_url.strip():
+        return ""
+    try:
+        path_segments = [
+            unquote(segment).strip()
+            for segment in urlparse(page_url).path.split("/")
+            if segment.strip()
+        ]
+    except (TypeError, ValueError):
+        return ""
+    if len(path_segments) < 2 or path_segments[-2].casefold() not in {"video", "videos"}:
+        return ""
+
+    slug = path_segments[-1]
+    if slug.isdigit():
+        return ""
+    title = re.sub(r"[-_]+", " ", re.sub(r"-\d{5,}$", "", slug)).strip()
+    return "" if not title or title.isdigit() else title
 
 
 class PexelsProvider(VideoProvider):
@@ -33,8 +57,11 @@ class PexelsProvider(VideoProvider):
         video_aspect: VideoAspect = VideoAspect.portrait,
     ) -> List[MaterialInfo]:
         aspect = VideoAspect(video_aspect)
-        video_orientation = aspect.name
-        video_width, video_height = aspect.to_resolution()
+        video_orientation = (
+            VideoAspect.portrait.name
+            if aspect is VideoAspect.portrait_4_5
+            else aspect.name
+        )
 
         try:
             api_key = get_api_key("pexels_api_keys")
@@ -72,24 +99,18 @@ class PexelsProvider(VideoProvider):
                 duration = v["duration"]
                 if duration < minimum_duration:
                     continue
-                best_file = None
-                best_pixels = -1
-                for vf in v["video_files"]:
-                    w = int(vf["width"])
-                    h = int(vf["height"])
-                    if (
-                        w >= video_width
-                        and h >= video_height
-                        and w * video_height == h * video_width
-                        and w * h > best_pixels
-                    ):
-                        best_file = (vf, w, h)
-                        best_pixels = w * h
+                best_file = select_best_video_variant(
+                    v.get("video_files"),
+                    video_aspect=aspect,
+                    url_key="link",
+                )
                 if best_file:
                     vf, w, h = best_file
                     item = MaterialInfo()
                     item.provider = "pexels"
                     item.url = vf["link"]
+                    item.preview_url = str(v.get("image") or "").strip()
+                    item.title = _pexels_page_title(v.get("url"))
                     item.duration = duration
                     item.width = w
                     item.height = h

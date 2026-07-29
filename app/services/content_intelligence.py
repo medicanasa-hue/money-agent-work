@@ -3,6 +3,7 @@ import re
 from dataclasses import dataclass
 from datetime import date, timedelta
 from typing import Any, Protocol, Sequence
+from urllib.parse import urlparse
 
 from loguru import logger
 
@@ -50,6 +51,16 @@ def _clean_text(value: Any, max_length: int, default: str = "") -> str:
     return text
 
 
+def _clean_source_url(value: Any) -> str:
+    url = _clean_text(value, 2048)
+    if not url:
+        return ""
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return ""
+    return url
+
+
 def _normalize_days(days: int) -> int:
     return 7 if int(days or 7) <= 7 else 14
 
@@ -74,6 +85,15 @@ class TrendContextItem:
     title: str
     insight: str
     search_terms: list[str]
+    source_url: str = ""
+    publisher: str = ""
+
+
+@dataclass(frozen=True)
+class TrendContextSource:
+    title: str
+    url: str
+    publisher: str = ""
 
 
 @dataclass(frozen=True)
@@ -81,6 +101,7 @@ class TrendContextResult:
     text: str = ""
     warnings: tuple[str, ...] = ()
     source: str = TREND_SOURCE_NONE
+    sources: tuple[TrendContextSource, ...] = ()
 
 
 class TrendContextAdapter(Protocol):
@@ -171,10 +192,12 @@ class RssTrendContextAdapter:
     def fetch(
         self, query: str, platform: str = "tiktok", limit: int = 3
     ) -> list[TrendContextItem]:
-        summary = rss_trend.fetch_rss_trend(query, limit=limit)
-        titles = [_clean_text(title, 120) for title in summary.split(";")]
+        source_items = rss_trend.fetch_rss_trend_items(query, limit=limit)
         items = []
-        for title in titles:
+        for source_item in source_items:
+            if not isinstance(source_item, dict):
+                continue
+            title = _clean_text(source_item.get("title"), 120)
             if not title:
                 continue
             items.append(
@@ -185,6 +208,8 @@ class RssTrendContextAdapter:
                         "treat it as popularity, ranking, or virality data."
                     ),
                     search_terms=[query, title],
+                    source_url=_clean_source_url(source_item.get("url")),
+                    publisher=_clean_text(source_item.get("publisher"), 120),
                 )
             )
         return items[:limit]
@@ -226,12 +251,22 @@ def get_trend_context(
         )
 
     lines = []
+    sources = []
     for item in items:
         title = _clean_text(getattr(item, "title", ""), 120)
         insight = _clean_text(getattr(item, "insight", ""), 260)
         terms = ", ".join(_normalize_search_terms(getattr(item, "search_terms", []), "short video"))
         if title and insight:
             lines.append(f"- {title}: {insight} Search terms: {terms}.")
+            source_url = _clean_source_url(getattr(item, "source_url", ""))
+            if source_url:
+                sources.append(
+                    TrendContextSource(
+                        title=title,
+                        url=source_url,
+                        publisher=_clean_text(getattr(item, "publisher", ""), 120),
+                    )
+                )
 
     context = _clean_text("\n".join(lines), MAX_TREND_CONTEXT_LENGTH)
     if not context:
@@ -254,6 +289,7 @@ def get_trend_context(
         text=context,
         warnings=(warning,),
         source=normalized_source,
+        sources=tuple(sources),
     )
 
 
@@ -267,7 +303,8 @@ def _json_object_from_response(response: str) -> dict:
     data = None
     try:
         data = json.loads(_strip_code_fence(response))
-    except Exception:
+    except Exception as exc:
+        logger.warning(f"content intelligence response was not plain JSON: {exc}")
         match = re.search(r"\{.*\}", response or "", re.DOTALL)
         if match:
             data = json.loads(match.group())
@@ -349,6 +386,27 @@ def _trend_disclaimer(extra_warnings: Sequence[str] | None = None) -> str:
         "No live trend data was used; these are planning suggestions, not current "
         "popularity or virality claims."
     )
+
+
+def _trend_source_payload(
+    sources: Sequence[TrendContextSource] | None = None,
+) -> list[dict[str, str]]:
+    payload = []
+    seen_urls = set()
+    for source in sources or ():
+        url = _clean_source_url(getattr(source, "url", ""))
+        title = _clean_text(getattr(source, "title", ""), 120)
+        if not url or not title or url in seen_urls:
+            continue
+        seen_urls.add(url)
+        payload.append(
+            {
+                "title": title,
+                "url": url,
+                "publisher": _clean_text(getattr(source, "publisher", ""), 120),
+            }
+        )
+    return payload
 
 
 def _normalize_idea(raw: Any, index: int, platform: str) -> dict | None:
@@ -446,6 +504,7 @@ def _normalize_plan_payload(
     idea_count: int,
     source: str,
     extra_warnings: Sequence[str] | None = None,
+    trend_sources: Sequence[TrendContextSource] | None = None,
 ) -> dict:
     ideas = []
     for raw in payload.get("ideas") or []:
@@ -484,6 +543,7 @@ def _normalize_plan_payload(
         "calendar": calendar,
         "warnings": warnings,
         "source": source,
+        "trend_sources": _trend_source_payload(trend_sources),
     }
 
 
@@ -538,6 +598,7 @@ def fallback_content_plan(
     idea_count: int = 7,
     start_date: date | None = None,
     extra_warnings: Sequence[str] | None = None,
+    trend_sources: Sequence[TrendContextSource] | None = None,
     last_error: str = "",
 ) -> dict:
     days = _normalize_days(days)
@@ -570,6 +631,7 @@ def fallback_content_plan(
         "calendar": _build_calendar_from_ideas(ideas, days, daily_count, start_date),
         "warnings": warnings,
         "source": "fallback",
+        "trend_sources": _trend_source_payload(trend_sources),
     }
 
 
@@ -697,6 +759,7 @@ def generate_content_plan(
                 idea_count=idea_count,
                 source="llm",
                 extra_warnings=trend_context.warnings,
+                trend_sources=trend_context.sources,
             )
         except Exception as exc:
             last_error = str(exc)
@@ -721,5 +784,6 @@ def generate_content_plan(
         daily_count=daily_count,
         idea_count=idea_count,
         extra_warnings=trend_context.warnings,
+        trend_sources=trend_context.sources,
         last_error=last_error,
     )

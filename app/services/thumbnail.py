@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import math
 import os
 import subprocess
 from typing import Any
 
+from app.services import video as video_service
 from app.utils import utils
 
 DEFAULT_THUMBNAIL_TIMESTAMPS = (1.0, 3.0, 5.0)
@@ -23,11 +25,18 @@ def _clean_concepts(value: Any, limit: int) -> list[str]:
 def _thumbnail_timestamps(timestamps=None, count: int = DEFAULT_THUMBNAIL_COUNT):
     values = list(timestamps or DEFAULT_THUMBNAIL_TIMESTAMPS)
     result = []
+    seen = set()
     for value in values:
         try:
-            timestamp = max(0.0, float(value))
+            timestamp = float(value)
         except (TypeError, ValueError):
             continue
+        if not math.isfinite(timestamp):
+            continue
+        timestamp = max(0.0, timestamp)
+        if timestamp in seen:
+            continue
+        seen.add(timestamp)
         result.append(timestamp)
         if len(result) >= count:
             break
@@ -59,6 +68,13 @@ def extract_thumbnail_candidates(
 
     for index, timestamp in enumerate(_thumbnail_timestamps(timestamps, count), start=1):
         output_path = os.path.join(output_dir, f"thumbnail-{index}.jpg")
+        try:
+            os.remove(output_path)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            errors.append(f"Could not clear old thumbnail: {str(exc)}")
+            continue
         command = [
             utils.get_ffmpeg_binary(),
             "-y",
@@ -102,6 +118,24 @@ def extract_thumbnail_candidates(
             }
         )
 
+    default_timestamps = _thumbnail_timestamps(None, count)
+    missing_output_errors = errors and all(
+        error.startswith("Thumbnail file was not created:") for error in errors
+    )
+    if (
+        not candidates
+        and timestamps
+        and missing_output_errors
+        and _thumbnail_timestamps(timestamps, count) != default_timestamps
+    ):
+        return extract_thumbnail_candidates(
+            video_path,
+            output_dir,
+            thumbnail_concepts=thumbnail_concepts,
+            timestamps=None,
+            count=count,
+        )
+
     error = "" if candidates else (errors[0] if errors else "No thumbnail generated.")
     return {"candidates": candidates, "error": error}
 
@@ -111,6 +145,7 @@ def generate_thumbnail_candidates(
     task_id: str,
     video_paths,
     thumbnail_concepts=None,
+    hook_timestamps=None,
     count: int = DEFAULT_THUMBNAIL_COUNT,
 ) -> dict[str, Any]:
     first_video = ""
@@ -120,9 +155,21 @@ def generate_thumbnail_candidates(
             break
     if not first_video:
         return {"candidates": [], "error": "Video file not found."}
+
+    timestamps = hook_timestamps
+    if hook_timestamps:
+        duration = video_service.get_video_duration(first_video)
+        if duration is not None:
+            timestamps = [
+                timestamp
+                for timestamp in _thumbnail_timestamps(hook_timestamps, count)
+                if timestamp <= duration
+            ] or None
+
     return extract_thumbnail_candidates(
         first_video,
         thumbnail_output_dir(task_id),
         thumbnail_concepts=thumbnail_concepts,
+        timestamps=timestamps,
         count=count,
     )

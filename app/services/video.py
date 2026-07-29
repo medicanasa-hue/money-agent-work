@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import unicodedata
 from collections.abc import Mapping
 from contextlib import contextmanager, redirect_stdout
 from contextvars import ContextVar
@@ -20,6 +21,7 @@ from moviepy import (
     AudioFileClip,
     CompositeAudioClip,
     CompositeVideoClip,
+    ColorClip,
     ImageClip,
     TextClip,
     VideoFileClip,
@@ -37,8 +39,9 @@ from app.models.schema import (
     VideoParams,
     VideoTransitionMode,
 )
+from app.services import bgm as bgm_service
 from app.services.utils import video_effects
-from app.utils import file_security, utils
+from app.utils import file_security, openmontage_materials, utils, video_quality
 
 class SubClippedVideoClip:
     def __init__(
@@ -50,6 +53,8 @@ class SubClippedVideoClip:
         height=None,
         duration=None,
         source_file_path=None,
+        crop_x_ratio=None,
+        crop_y_ratio=None,
     ):
         self.file_path = file_path
         self.start_time = start_time
@@ -57,6 +62,8 @@ class SubClippedVideoClip:
         self.width = width
         self.height = height
         self.source_file_path = source_file_path or file_path
+        self.crop_x_ratio = crop_x_ratio
+        self.crop_y_ratio = crop_y_ratio
         if duration is None:
             self.duration = end_time - start_time
         else:
@@ -75,18 +82,72 @@ _MAX_AUDIO_BITRATE_KBPS = 512
 audio_bitrate = f"{_DEFAULT_AUDIO_BITRATE_KBPS}k"
 _DEFAULT_VIDEO_FPS = 30
 _MAX_VIDEO_FPS = 120
+_VIDEO_KEYFRAME_INTERVAL_SECONDS = 2
+_DEFAULT_CROSSFADE_DURATION = 0.35
+_DEFAULT_SUBTITLE_BOTTOM_MARGIN_RATIO = 0.05
+_PORTRAIT_SUBTITLE_BOTTOM_SAFE_MARGIN_RATIO = 0.16
+_CUE_CUT_ALIGNMENT_TOLERANCE_SECONDS = 0.75
+_CUE_CUT_DYNAMIC_MIN_DURATION_SECONDS = 1.5
+_CUE_CUT_DYNAMIC_MIN_DURATION_RATIO = 0.5
+_SCENE_CUT_ALIGNMENT_TOLERANCE_SECONDS = 0.75
+_LEADING_DETECTED_SEGMENT_START_TOLERANCE_SECONDS = 0.05
+_MAX_LEADING_DETECTED_SEGMENT_TRIM_SECONDS = 0.75
+_NEAR_BLACK_SEGMENT_LUMA_THRESHOLD = 25.5
+_NEAR_BLACK_SEGMENT_DARK_PIXEL_RATIO = 0.98
+_NEAR_BLACK_SEGMENT_SAMPLE_INTERVAL_SECONDS = 0.25
+_MIN_SUSTAINED_NEAR_BLACK_SECONDS = 0.5
+_COLOR_LEVELING_MIN_LUMA_DIFFERENCE = 24.0
+_COLOR_LEVELING_SAFE_LUMA_RANGE = (48.0, 208.0)
+_MAX_COLOR_LEVELING_BRIGHTNESS_ADJUSTMENT = 0.04
+_COLOR_LEVELING_MIN_SATURATION_DIFFERENCE = 0.12
+_COLOR_LEVELING_SAFE_SATURATION_RANGE = (0.08, 0.80)
+_MIN_COLOR_LEVELING_SATURATION_MULTIPLIER = 0.85
+_MAX_COLOR_LEVELING_SATURATION_MULTIPLIER = 1.15
+_COLOR_LEVELING_MIN_WARMTH_DIFFERENCE = 0.10
+_COLOR_LEVELING_SAFE_WARMTH_RANGE = (-0.30, 0.30)
+_MAX_COLOR_LEVELING_WARMTH_ADJUSTMENT = 0.06
+_COLOR_LEVELING_FRAME_SAMPLE_STRIDE = 16
+_PORTRAIT_FOCAL_CROP_MAX_TARGET_RATIO = 0.65
+_VERTICAL_FOCAL_CROP_MIN_TARGET_RATIO = 0.8
+_FOCAL_POINT_SAMPLE_RATIOS = (0.2, 0.5, 0.8)
+_FOCAL_POINT_MAX_SAMPLE_SPREAD_RATIO = 0.35
+_FOCAL_POINT_MIN_OFFSET_RATIO = 0.1
+_FOCAL_POINT_MAX_FRAME_DIMENSION = 160
 fps = _DEFAULT_VIDEO_FPS
 # FFmpeg 按帧率拼接/转码时，最终时长可能比 MoviePy 读到的理论时长短几十毫秒。
 # 这里给视频素材多留一个很小的安全余量，避免音频末尾因为帧舍入出现黑屏、
 # 卡顿或最后一小段旁白没有画面的情况。
 _VIDEO_DURATION_SAFETY_MARGIN = 0.1
+_MIN_MATERIAL_DIMENSION = 480
+_MIN_DIMENSION_TOLERANCE = 10
 _DEFAULT_VIDEO_TRANSITION_DURATION = 1.0
 _MAX_IMAGE_ZOOM_SCALE = 1.2
+_IMAGE_ZOOM_RATE = 0.03
+_HIGH_QUALITY_SCALE_FLAGS = "lanczos+accurate_rnd+full_chroma_int"
+_BT709_LIMITED_RANGE_SCALE_OPTIONS = ":out_color_matrix=bt709:out_range=tv"
+_CONSERVATIVE_DEBAND_FILTER = (
+    "deband=1thr=0.012:2thr=0.012:3thr=0.012:range=8:blur=1"
+)
 _BGM_EXTENSIONS = (".mp3",)
 _DEFAULT_VIDEO_CODEC = "libx264"
 _DEFAULT_LIBX264_CRF = "20"
 _DEFAULT_LIBX264_PRESET = "medium"
+_MOVIEPY_AMF_PRESET = "quality"
+_AMF_CQP_QP_OFFSET = 8
 _MP4_PIXEL_FORMAT_FFMPEG_PARAMS = ("-pix_fmt", "yuv420p")
+_MP4_BT709_COLOR_FFMPEG_PARAMS = (
+    "-colorspace",
+    "bt709",
+    "-color_primaries",
+    "bt709",
+    "-color_trc",
+    "bt709",
+    "-color_range",
+    "tv",
+)
+_H264_BT709_VUI_BSF = (
+    "h264_metadata=colour_primaries=1:transfer_characteristics=1:matrix_coefficients=1"
+)
 _MP4_FASTSTART_FFMPEG_PARAMS = ("-movflags", "+faststart")
 _SUPPORTED_VIDEO_CODECS = (
     "libx264",
@@ -115,6 +176,7 @@ _VIDEO_QUALITY_CONFIG_KEYS = frozenset(
         "video_encoder_preset",
         "video_fps",
         "audio_bitrate",
+        "video_deband_enabled",
     )
 )
 _video_quality_config: ContextVar[dict[str, object] | None] = ContextVar(
@@ -156,6 +218,18 @@ def _get_video_quality_config_value(key: str, default):
     return config.app.get(key, default)
 
 
+def _is_configured_video_deband_enabled() -> bool:
+    value = _get_video_quality_config_value("video_deband_enabled", False)
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "on")
+    return bool(value)
+
+
+def _optional_deband_filter() -> str:
+    """Return a conservative, opt-in cleanup stage for compressed B-roll."""
+    return f",{_CONSERVATIVE_DEBAND_FILTER}" if _is_configured_video_deband_enabled() else ""
+
+
 def _source_file_key(file_path: str) -> str:
     value = str(file_path or "").replace("\\", "/")
     return os.path.normcase(os.path.normpath(value))
@@ -170,6 +244,277 @@ def _get_required_video_duration(audio_duration: float) -> float:
     轻量余量。函数独立出来，便于测试和后续按实际反馈调整余量大小。
     """
     return max(0.0, float(audio_duration) + _VIDEO_DURATION_SAFETY_MARGIN)
+
+
+def is_material_resolution_acceptable(width: int, height: int) -> bool:
+    """Allow tiny encoder rounding while rejecting genuinely low resolution."""
+    min_dimension = _MIN_MATERIAL_DIMENSION - _MIN_DIMENSION_TOLERANCE
+    return width >= min_dimension and height >= min_dimension
+
+
+def _frame_focal_ratio(frame, *, axis: int) -> float | None:
+    """Return a conservative focal point from visible frame detail on one axis."""
+    if axis not in (0, 1):
+        return None
+    try:
+        frame_array = np.asarray(frame)
+        if frame_array.ndim < 2 or min(frame_array.shape[:2]) < 2:
+            return None
+        if frame_array.ndim == 2:
+            luma = frame_array.astype(np.float32, copy=False)
+        else:
+            rgb = frame_array[..., :3].astype(np.float32, copy=False)
+            if rgb.shape[-1] < 3:
+                return None
+            luma = (
+                rgb[..., 0] * 0.299
+                + rgb[..., 1] * 0.587
+                + rgb[..., 2] * 0.114
+            )
+        if not np.isfinite(luma).all():
+            return None
+
+        largest_dimension = max(luma.shape)
+        sample_stride = max(
+            1,
+            math.ceil(largest_dimension / _FOCAL_POINT_MAX_FRAME_DIMENSION),
+        )
+        luma = luma[::sample_stride, ::sample_stride]
+        if min(luma.shape) < 2:
+            return None
+
+        contrast = np.abs(luma - np.median(luma))
+        horizontal_detail = np.abs(np.diff(luma, axis=1, prepend=luma[:, :1]))
+        vertical_detail = np.abs(np.diff(luma, axis=0, prepend=luma[:1, :]))
+        saliency = contrast * 0.25 + horizontal_detail + vertical_detail
+        threshold = float(np.percentile(saliency, 80))
+        weights = np.maximum(saliency - threshold, 0.0)
+        total_weight = float(weights.sum())
+        if total_weight <= 0 or not math.isfinite(total_weight):
+            return None
+
+        axis_weights = weights.sum(axis=1 - axis)
+        axis_positions = np.arange(axis_weights.size, dtype=np.float32)
+        focal_point = float((axis_weights * axis_positions).sum() / total_weight)
+        focal_ratio = focal_point / max(1, axis_weights.size - 1)
+        if abs(focal_ratio - 0.5) < _FOCAL_POINT_MIN_OFFSET_RATIO:
+            return None
+        return min(1.0, max(0.0, focal_ratio))
+    except (TypeError, ValueError, ArithmeticError):
+        return None
+
+
+def _frame_focal_x_ratio(frame) -> float | None:
+    """Return a conservative horizontal focal point from visible frame detail."""
+    return _frame_focal_ratio(frame, axis=1)
+
+
+def _frame_focal_y_ratio(frame) -> float | None:
+    """Return a conservative vertical focal point from visible frame detail."""
+    return _frame_focal_ratio(frame, axis=0)
+
+
+def _image_focal_ratios(image) -> tuple[float | None, float | None]:
+    """Return conservative focal points for a still image without changing it."""
+    try:
+        frame = np.asarray(image)
+    except (TypeError, ValueError, MemoryError):
+        return None, None
+    return _frame_focal_x_ratio(frame), _frame_focal_y_ratio(frame)
+
+
+def _clip_focal_ratio(
+    clip,
+    frame_focal_ratio,
+    *,
+    start_time: float = 0.0,
+    end_time: float | None = None,
+) -> float | None:
+    """Return a stable focal point for an optional interval within a clip."""
+    get_frame = getattr(clip, "get_frame", None)
+    if not callable(get_frame):
+        return None
+    try:
+        duration = float(getattr(clip, "duration", 0) or 0)
+        if not math.isfinite(duration) or duration <= 0:
+            return None
+        segment_start_time = min(duration, max(0.0, float(start_time)))
+        segment_end_time = duration if end_time is None else float(end_time)
+        segment_end_time = min(
+            duration,
+            max(segment_start_time, segment_end_time),
+        )
+    except Exception:
+        return None
+
+    segment_duration = segment_end_time - segment_start_time
+    if segment_duration <= 0:
+        return None
+
+    focal_points = []
+    for sample_ratio in _FOCAL_POINT_SAMPLE_RATIOS:
+        try:
+            focal_ratio = frame_focal_ratio(
+                get_frame(segment_start_time + segment_duration * sample_ratio)
+            )
+        except Exception:
+            continue
+        if focal_ratio is not None:
+            focal_points.append(focal_ratio)
+
+    if not focal_points:
+        return None
+    if (
+        len(focal_points) > 1
+        and max(focal_points) - min(focal_points)
+        > _FOCAL_POINT_MAX_SAMPLE_SPREAD_RATIO
+    ):
+        return None
+    return float(np.median(focal_points))
+
+
+def _clip_focal_x_ratio(
+    clip,
+    *,
+    start_time: float = 0.0,
+    end_time: float | None = None,
+) -> float | None:
+    return _clip_focal_ratio(
+        clip,
+        _frame_focal_x_ratio,
+        start_time=start_time,
+        end_time=end_time,
+    )
+
+
+def _clip_focal_y_ratio(
+    clip,
+    *,
+    start_time: float = 0.0,
+    end_time: float | None = None,
+) -> float | None:
+    return _clip_focal_ratio(
+        clip,
+        _frame_focal_y_ratio,
+        start_time=start_time,
+        end_time=end_time,
+    )
+
+
+def _bounded_crop_ratio(value) -> float | None:
+    try:
+        ratio = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(ratio):
+        return None
+    return min(1.0, max(0.0, ratio))
+
+
+def _focal_crop_offset_ratios(
+    source_width: int,
+    source_height: int,
+    target_width: int,
+    target_height: int,
+    focal_x_ratio: float | None = None,
+    focal_y_ratio: float | None = None,
+) -> tuple[float | None, float | None]:
+    """Return crop origins as normalized overflow ratios for a target frame."""
+    try:
+        source_width = float(source_width)
+        source_height = float(source_height)
+        target_width = float(target_width)
+        target_height = float(target_height)
+    except (TypeError, ValueError):
+        return None, None
+    dimensions = (source_width, source_height, target_width, target_height)
+    if not all(math.isfinite(value) and value > 0 for value in dimensions):
+        return None, None
+
+    target_ratio = target_width / target_height
+    scale_factor = max(target_width / source_width, target_height / source_height)
+    scaled_width = _ceil_even_dimension(source_width * scale_factor, int(target_width))
+    scaled_height = _ceil_even_dimension(source_height * scale_factor, int(target_height))
+
+    crop_x_ratio = None
+    horizontal_overflow = scaled_width - target_width
+    normalized_focal_x = _bounded_crop_ratio(focal_x_ratio)
+    if (
+        normalized_focal_x is not None
+        and target_ratio <= _PORTRAIT_FOCAL_CROP_MAX_TARGET_RATIO
+        and horizontal_overflow > 0
+    ):
+        crop_origin = min(
+            horizontal_overflow,
+            max(0.0, normalized_focal_x * scaled_width - target_width / 2),
+        )
+        crop_x_ratio = crop_origin / horizontal_overflow
+
+    crop_y_ratio = None
+    vertical_overflow = scaled_height - target_height
+    normalized_focal_y = _bounded_crop_ratio(focal_y_ratio)
+    if (
+        normalized_focal_y is not None
+        and target_ratio >= _VERTICAL_FOCAL_CROP_MIN_TARGET_RATIO
+        and vertical_overflow > 0
+    ):
+        crop_origin = min(
+            vertical_overflow,
+            max(0.0, normalized_focal_y * scaled_height - target_height / 2),
+        )
+        crop_y_ratio = crop_origin / vertical_overflow
+
+    return crop_x_ratio, crop_y_ratio
+
+
+def _clip_focal_crop_offset_ratios(
+    clip,
+    target_width: int,
+    target_height: int,
+    *,
+    start_time: float = 0.0,
+    end_time: float | None = None,
+) -> tuple[float | None, float | None]:
+    """Sample a stable focal point only when the target will crop that axis."""
+    try:
+        clip_width, clip_height = clip.size
+        clip_ratio = clip_width / clip_height
+        target_ratio = target_width / target_height
+    except (AttributeError, TypeError, ValueError, ZeroDivisionError):
+        return None, None
+
+    focal_x_ratio = (
+        _clip_focal_x_ratio(
+            clip,
+            start_time=start_time,
+            end_time=end_time,
+        )
+        if (
+            target_ratio <= _PORTRAIT_FOCAL_CROP_MAX_TARGET_RATIO
+            and clip_ratio > target_ratio
+        )
+        else None
+    )
+    focal_y_ratio = (
+        _clip_focal_y_ratio(
+            clip,
+            start_time=start_time,
+            end_time=end_time,
+        )
+        if (
+            target_ratio >= _VERTICAL_FOCAL_CROP_MIN_TARGET_RATIO
+            and clip_ratio < target_ratio
+        )
+        else None
+    )
+    return _focal_crop_offset_ratios(
+        clip_width,
+        clip_height,
+        target_width,
+        target_height,
+        focal_x_ratio=focal_x_ratio,
+        focal_y_ratio=focal_y_ratio,
+    )
 
 
 def _fit_clip_to_target_frame(clip, target_width: int, target_height: int):
@@ -191,12 +536,595 @@ def _fit_clip_to_target_frame(clip, target_width: int, target_height: int):
     new_width = _ceil_even_dimension(clip_w * scale_factor, target_width)
     new_height = _ceil_even_dimension(clip_h * scale_factor, target_height)
     resized_clip = clip.resized(new_size=(new_width, new_height))
+    crop_x_ratio, crop_y_ratio = _clip_focal_crop_offset_ratios(
+        clip,
+        target_width,
+        target_height,
+    )
+    x_center = new_width / 2
+    if crop_x_ratio is not None:
+        x_center = target_width / 2 + (new_width - target_width) * crop_x_ratio
+    y_center = new_height / 2
+    if crop_y_ratio is not None:
+        y_center = target_height / 2 + (new_height - target_height) * crop_y_ratio
     return resized_clip.cropped(
-        x_center=new_width / 2,
-        y_center=new_height / 2,
+        x_center=x_center,
+        y_center=y_center,
         width=target_width,
         height=target_height,
     )
+
+
+def _is_frame_mostly_near_black(frame) -> bool | None:
+    try:
+        pixels = np.asarray(frame)
+        if not pixels.size:
+            return None
+        if pixels.ndim >= 3 and pixels.shape[-1] >= 3:
+            rgb = pixels[..., :3].astype(float)
+            luma = (
+                (rgb[..., 0] * 0.2126)
+                + (rgb[..., 1] * 0.7152)
+                + (rgb[..., 2] * 0.0722)
+            )
+        elif pixels.ndim == 2:
+            luma = pixels.astype(float)
+        else:
+            return None
+        if not np.isfinite(luma).all():
+            return None
+        if float(luma.max()) <= 1.0:
+            luma *= 255.0
+    except (TypeError, ValueError):
+        return None
+
+    return bool(
+        np.mean(luma <= _NEAR_BLACK_SEGMENT_LUMA_THRESHOLD)
+        >= _NEAR_BLACK_SEGMENT_DARK_PIXEL_RATIO
+    )
+
+
+def _is_subclip_near_black(clip, start_time: float, end_time: float) -> bool:
+    get_frame = getattr(clip, "get_frame", None)
+    if not callable(get_frame):
+        return False
+
+    try:
+        start_time = float(start_time)
+        segment_duration = float(end_time) - start_time
+    except (TypeError, ValueError):
+        return False
+    if segment_duration <= 0:
+        return False
+
+    sample_count = max(
+        1,
+        int(
+            math.ceil(
+                segment_duration / _NEAR_BLACK_SEGMENT_SAMPLE_INTERVAL_SECONDS
+            )
+        ),
+    )
+    sample_interval = segment_duration / sample_count
+    consecutive_near_black_seconds = 0.0
+    all_samples_near_black = True
+    for sample_index in range(sample_count):
+        try:
+            sample_time = start_time + sample_interval * (sample_index + 0.5)
+            is_near_black = _is_frame_mostly_near_black(get_frame(sample_time))
+        except Exception:
+            return False
+        if is_near_black is None:
+            return False
+        if is_near_black:
+            consecutive_near_black_seconds += sample_interval
+            if consecutive_near_black_seconds >= _MIN_SUSTAINED_NEAR_BLACK_SECONDS:
+                return True
+        else:
+            all_samples_near_black = False
+            consecutive_near_black_seconds = 0.0
+
+    return all_samples_near_black
+
+
+def _filter_near_black_subclips(
+    clip,
+    subclipped_items: List[SubClippedVideoClip],
+    *,
+    preserve_when_empty: bool = True,
+):
+    usable_items = [
+        item
+        for item in subclipped_items
+        if not _is_subclip_near_black(clip, item.start_time, item.end_time)
+    ]
+    return usable_items or (subclipped_items if preserve_when_empty else [])
+
+
+def _trim_short_leading_detected_segment(
+    item: SubClippedVideoClip,
+    normalized_segments: list[tuple[float, float]],
+) -> SubClippedVideoClip:
+    """Trim a brief detected defect at a clip's start without changing its crop."""
+    item_start = float(item.start_time)
+    item_end = float(item.end_time)
+    leading_segment_ends = [
+        min(item_end, segment_end)
+        for segment_start, segment_end in normalized_segments
+        if (
+            segment_start
+            <= item_start + _LEADING_DETECTED_SEGMENT_START_TOLERANCE_SECONDS
+            and segment_end > item_start
+        )
+    ]
+    if not leading_segment_ends:
+        return item
+
+    trimmed_start = max(leading_segment_ends)
+    original_duration = item_end - item_start
+    remaining_duration = item_end - trimmed_start
+    minimum_remaining_duration = min(
+        original_duration,
+        _CUE_CUT_DYNAMIC_MIN_DURATION_SECONDS,
+    )
+    if (
+        trimmed_start - item_start > _MAX_LEADING_DETECTED_SEGMENT_TRIM_SECONDS
+        or remaining_duration < minimum_remaining_duration
+    ):
+        return item
+
+    return SubClippedVideoClip(
+        file_path=item.file_path,
+        start_time=trimmed_start,
+        end_time=item_end,
+        width=item.width,
+        height=item.height,
+        duration=remaining_duration,
+        source_file_path=item.source_file_path,
+        crop_x_ratio=item.crop_x_ratio,
+        crop_y_ratio=item.crop_y_ratio,
+    )
+
+
+def _filter_subclips_with_detected_segments(
+    subclipped_items: List[SubClippedVideoClip],
+    detected_segments: list[tuple[float, float]],
+    *,
+    preserve_when_empty: bool = True,
+    trim_leading_prefix: bool = True,
+):
+    normalized_segments = []
+    for segment_start, segment_end in detected_segments:
+        try:
+            segment_start = float(segment_start)
+            segment_end = float(segment_end)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(segment_start) and math.isfinite(segment_end):
+            if segment_end > segment_start:
+                normalized_segments.append((segment_start, segment_end))
+    if not normalized_segments:
+        return subclipped_items
+
+    usable_items = []
+    for item in subclipped_items:
+        try:
+            item_start = float(item.start_time)
+            item_end = float(item.end_time)
+        except (AttributeError, TypeError, ValueError):
+            usable_items.append(item)
+            continue
+        if item_end <= item_start:
+            usable_items.append(item)
+            continue
+        if trim_leading_prefix:
+            item = _trim_short_leading_detected_segment(item, normalized_segments)
+        item_start = float(item.start_time)
+        item_end = float(item.end_time)
+        overlaps_detected_segment = any(
+            max(item_start, segment_start) < min(item_end, segment_end)
+            for segment_start, segment_end in normalized_segments
+        )
+        if not overlaps_detected_segment:
+            usable_items.append(item)
+    return usable_items or (subclipped_items if preserve_when_empty else [])
+
+
+def _filter_subclips_with_detected_black_segments(
+    subclipped_items: List[SubClippedVideoClip],
+    detected_black_segments: list[tuple[float, float]],
+    *,
+    preserve_when_empty: bool = True,
+    trim_leading_prefix: bool = True,
+):
+    return _filter_subclips_with_detected_segments(
+        subclipped_items,
+        detected_black_segments,
+        preserve_when_empty=preserve_when_empty,
+        trim_leading_prefix=trim_leading_prefix,
+    )
+
+
+def _subclip_identity(item: SubClippedVideoClip) -> tuple[str, float, float] | None:
+    try:
+        return item.file_path, float(item.start_time), float(item.end_time)
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
+def _sample_subclip_luma(
+    clip, start_time: float, end_time: float
+) -> float | None:
+    get_frame = getattr(clip, "get_frame", None)
+    if not callable(get_frame):
+        return None
+
+    try:
+        start_time = float(start_time)
+        segment_duration = float(end_time) - start_time
+    except (TypeError, ValueError):
+        return None
+    if segment_duration <= 0:
+        return None
+
+    try:
+        frame = np.asarray(get_frame(start_time + segment_duration / 2))
+        if not frame.size:
+            return None
+        if frame.ndim >= 2:
+            frame = frame[
+                ::_COLOR_LEVELING_FRAME_SAMPLE_STRIDE,
+                ::_COLOR_LEVELING_FRAME_SAMPLE_STRIDE,
+            ]
+        if frame.ndim >= 3 and frame.shape[-1] >= 3:
+            luma = float(
+                np.mean(
+                    frame[..., 0] * 0.2126
+                    + frame[..., 1] * 0.7152
+                    + frame[..., 2] * 0.0722
+                )
+            )
+        else:
+            luma = float(frame.mean())
+        if np.issubdtype(frame.dtype, np.floating) and luma <= 1.0:
+            luma *= 255.0
+    except Exception:
+        return None
+
+    return luma if math.isfinite(luma) else None
+
+
+def _sample_subclip_saturation(
+    clip, start_time: float, end_time: float
+) -> float | None:
+    get_frame = getattr(clip, "get_frame", None)
+    if not callable(get_frame):
+        return None
+
+    try:
+        start_time = float(start_time)
+        segment_duration = float(end_time) - start_time
+    except (TypeError, ValueError):
+        return None
+    if segment_duration <= 0:
+        return None
+
+    try:
+        frame = np.asarray(get_frame(start_time + segment_duration / 2))
+        if not frame.size or frame.ndim < 3 or frame.shape[-1] < 3:
+            return None
+        frame = frame[
+            ::_COLOR_LEVELING_FRAME_SAMPLE_STRIDE,
+            ::_COLOR_LEVELING_FRAME_SAMPLE_STRIDE,
+            :3,
+        ].astype(float)
+        if not frame.size or not np.isfinite(frame).all():
+            return None
+        max_channel = frame.max(axis=-1)
+        min_channel = frame.min(axis=-1)
+        saturation = np.divide(
+            max_channel - min_channel,
+            max_channel,
+            out=np.zeros_like(max_channel, dtype=float),
+            where=max_channel > 0,
+        )
+        sampled_saturation = float(np.mean(saturation))
+    except Exception:
+        return None
+
+    return sampled_saturation if math.isfinite(sampled_saturation) else None
+
+
+def _sample_subclip_warmth(
+    clip, start_time: float, end_time: float
+) -> float | None:
+    """Return a compact warm/cool measurement from a representative RGB frame."""
+    get_frame = getattr(clip, "get_frame", None)
+    if not callable(get_frame):
+        return None
+
+    try:
+        start_time = float(start_time)
+        segment_duration = float(end_time) - start_time
+    except (TypeError, ValueError):
+        return None
+    if segment_duration <= 0:
+        return None
+
+    try:
+        frame = np.asarray(get_frame(start_time + segment_duration / 2))
+        if not frame.size or frame.ndim < 3 or frame.shape[-1] < 3:
+            return None
+        frame = frame[
+            ::_COLOR_LEVELING_FRAME_SAMPLE_STRIDE,
+            ::_COLOR_LEVELING_FRAME_SAMPLE_STRIDE,
+            :3,
+        ].astype(float)
+        if not frame.size or not np.isfinite(frame).all():
+            return None
+        red, _green, blue = (float(value) for value in frame.mean(axis=(0, 1)))
+        warmth = (red - blue) / max(red + blue, 1e-6)
+    except Exception:
+        return None
+
+    return warmth if math.isfinite(warmth) else None
+
+
+def _brightness_adjustment_for_luma(source_luma: float, target_luma: float) -> float:
+    try:
+        source_luma = float(source_luma)
+        target_luma = float(target_luma)
+    except (TypeError, ValueError):
+        return 0.0
+    if not math.isfinite(source_luma) or not math.isfinite(target_luma):
+        return 0.0
+
+    safe_min_luma, safe_max_luma = _COLOR_LEVELING_SAFE_LUMA_RANGE
+    if not (
+        safe_min_luma <= source_luma <= safe_max_luma
+        and safe_min_luma <= target_luma <= safe_max_luma
+    ):
+        return 0.0
+
+    luma_difference = target_luma - source_luma
+    if abs(luma_difference) < _COLOR_LEVELING_MIN_LUMA_DIFFERENCE:
+        return 0.0
+    return max(
+        -_MAX_COLOR_LEVELING_BRIGHTNESS_ADJUSTMENT,
+        min(
+            _MAX_COLOR_LEVELING_BRIGHTNESS_ADJUSTMENT,
+            luma_difference / 255.0,
+        ),
+    )
+
+
+def _saturation_multiplier_for_levels(
+    source_saturation: float, target_saturation: float
+) -> float:
+    try:
+        source_saturation = float(source_saturation)
+        target_saturation = float(target_saturation)
+    except (TypeError, ValueError):
+        return 1.0
+    if not math.isfinite(source_saturation) or not math.isfinite(target_saturation):
+        return 1.0
+
+    safe_min, safe_max = _COLOR_LEVELING_SAFE_SATURATION_RANGE
+    if not (
+        safe_min <= source_saturation <= safe_max
+        and safe_min <= target_saturation <= safe_max
+    ):
+        return 1.0
+    if (
+        abs(target_saturation - source_saturation)
+        < _COLOR_LEVELING_MIN_SATURATION_DIFFERENCE
+    ):
+        return 1.0
+
+    return max(
+        _MIN_COLOR_LEVELING_SATURATION_MULTIPLIER,
+        min(
+            _MAX_COLOR_LEVELING_SATURATION_MULTIPLIER,
+            target_saturation / source_saturation,
+        ),
+    )
+
+
+def _warmth_adjustment_for_levels(
+    source_warmth: float, target_warmth: float
+) -> float:
+    """Return a bounded midtone red/blue adjustment for a clear color cast."""
+    try:
+        source_warmth = float(source_warmth)
+        target_warmth = float(target_warmth)
+    except (TypeError, ValueError):
+        return 0.0
+    if not math.isfinite(source_warmth) or not math.isfinite(target_warmth):
+        return 0.0
+
+    safe_min, safe_max = _COLOR_LEVELING_SAFE_WARMTH_RANGE
+    if not (
+        safe_min <= source_warmth <= safe_max
+        and safe_min <= target_warmth <= safe_max
+    ):
+        return 0.0
+    warmth_difference = target_warmth - source_warmth
+    if abs(warmth_difference) < _COLOR_LEVELING_MIN_WARMTH_DIFFERENCE:
+        return 0.0
+    return max(
+        -_MAX_COLOR_LEVELING_WARMTH_ADJUSTMENT,
+        min(_MAX_COLOR_LEVELING_WARMTH_ADJUSTMENT, warmth_difference),
+    )
+
+
+def _subclip_brightness_adjustments(
+    subclipped_items: List[SubClippedVideoClip],
+) -> dict[tuple[str, float, float], float]:
+    """Return small source-level brightness adjustments when samples agree."""
+    if len(subclipped_items) < 2:
+        return {}
+
+    items_by_file_path = {}
+    for item in subclipped_items:
+        item_key = _subclip_identity(item)
+        if item_key is None:
+            continue
+        items_by_file_path.setdefault(item.file_path, []).append((item, item_key))
+
+    sampled_lumas_by_file_path = {}
+    sampled_item_keys_by_file_path = {}
+    for file_path, items in items_by_file_path.items():
+        clip = None
+        try:
+            clip = _open_video_clip_quietly(file_path)
+            for item, item_key in items:
+                luma = _sample_subclip_luma(
+                    clip,
+                    start_time=item.start_time,
+                    end_time=item.end_time,
+                )
+                if luma is not None:
+                    sampled_lumas_by_file_path.setdefault(file_path, []).append(luma)
+                    sampled_item_keys_by_file_path.setdefault(file_path, []).append(
+                        item_key
+                    )
+        except Exception as exc:
+            logger.debug(
+                f"skipping brightness leveling sample for {os.path.basename(file_path)}: {str(exc)}"
+            )
+        finally:
+            close_clip(clip)
+
+    source_lumas = {
+        file_path: float(np.median(lumas))
+        for file_path, lumas in sampled_lumas_by_file_path.items()
+        if lumas
+    }
+    if len(source_lumas) < 2:
+        return {}
+
+    target_luma = float(np.median(list(source_lumas.values())))
+    if not math.isfinite(target_luma):
+        return {}
+
+    adjustments = {}
+    for file_path, source_luma in source_lumas.items():
+        adjustment = _brightness_adjustment_for_luma(source_luma, target_luma)
+        if adjustment:
+            for item_key in sampled_item_keys_by_file_path[file_path]:
+                adjustments[item_key] = adjustment
+    return adjustments
+
+
+def _subclip_saturation_adjustments(
+    subclipped_items: List[SubClippedVideoClip],
+) -> dict[tuple[str, float, float], float]:
+    """Return bounded saturation multipliers to make adjacent sources less jarring."""
+    if len(subclipped_items) < 2:
+        return {}
+
+    items_by_file_path = {}
+    for item in subclipped_items:
+        item_key = _subclip_identity(item)
+        if item_key is None:
+            continue
+        items_by_file_path.setdefault(item.file_path, []).append((item, item_key))
+
+    source_saturations = {}
+    sampled_item_keys = {}
+    for file_path, items in items_by_file_path.items():
+        clip = None
+        try:
+            clip = _open_video_clip_quietly(file_path)
+            sampled_saturations = []
+            for item, item_key in items:
+                saturation = _sample_subclip_saturation(
+                    clip,
+                    start_time=item.start_time,
+                    end_time=item.end_time,
+                )
+                if saturation is not None:
+                    sampled_saturations.append(saturation)
+                    sampled_item_keys.setdefault(file_path, []).append(item_key)
+            if sampled_saturations:
+                source_saturations[file_path] = float(np.median(sampled_saturations))
+        except Exception as exc:
+            logger.debug(
+                f"skipping saturation leveling sample for {os.path.basename(file_path)}: {str(exc)}"
+            )
+        finally:
+            close_clip(clip)
+
+    if len(source_saturations) < 2:
+        return {}
+    target_saturation = float(np.median(list(source_saturations.values())))
+    if not math.isfinite(target_saturation):
+        return {}
+
+    adjustments = {}
+    for file_path, source_saturation in source_saturations.items():
+        multiplier = _saturation_multiplier_for_levels(
+            source_saturation,
+            target_saturation,
+        )
+        if multiplier != 1.0:
+            for item_key in sampled_item_keys[file_path]:
+                adjustments[item_key] = multiplier
+    return adjustments
+
+
+def _subclip_warmth_adjustments(
+    subclipped_items: List[SubClippedVideoClip],
+) -> dict[tuple[str, float, float], float]:
+    """Return subtle warm/cool adjustments only when sources clearly disagree."""
+    if len(subclipped_items) < 2:
+        return {}
+
+    items_by_file_path = {}
+    for item in subclipped_items:
+        item_key = _subclip_identity(item)
+        if item_key is None:
+            continue
+        items_by_file_path.setdefault(item.file_path, []).append((item, item_key))
+
+    source_warmths = {}
+    sampled_item_keys = {}
+    for file_path, items in items_by_file_path.items():
+        clip = None
+        try:
+            clip = _open_video_clip_quietly(file_path)
+            sampled_warmths = []
+            for item, item_key in items:
+                warmth = _sample_subclip_warmth(
+                    clip,
+                    start_time=item.start_time,
+                    end_time=item.end_time,
+                )
+                if warmth is not None:
+                    sampled_warmths.append(warmth)
+                    sampled_item_keys.setdefault(file_path, []).append(item_key)
+            if sampled_warmths:
+                source_warmths[file_path] = float(np.median(sampled_warmths))
+        except Exception as exc:
+            logger.debug(
+                f"skipping warmth leveling sample for {os.path.basename(file_path)}: {str(exc)}"
+            )
+        finally:
+            close_clip(clip)
+
+    if len(source_warmths) < 2:
+        return {}
+    target_warmth = float(np.median(list(source_warmths.values())))
+    if not math.isfinite(target_warmth):
+        return {}
+
+    adjustments = {}
+    for file_path, source_warmth in source_warmths.items():
+        adjustment = _warmth_adjustment_for_levels(source_warmth, target_warmth)
+        if adjustment:
+            for item_key in sampled_item_keys[file_path]:
+                adjustments[item_key] = adjustment
+    return adjustments
 
 
 def _get_effective_transition_duration(clip_duration: float) -> float:
@@ -204,10 +1132,88 @@ def _get_effective_transition_duration(clip_duration: float) -> float:
     return min(_DEFAULT_VIDEO_TRANSITION_DURATION, safe_duration / 2)
 
 
+def _get_effective_crossfade_duration(
+    previous_duration: float, next_duration: float
+) -> float:
+    """Return a safe overlap that fits entirely inside both neighboring clips."""
+    try:
+        previous_duration = float(previous_duration)
+        next_duration = float(next_duration)
+    except (TypeError, ValueError):
+        return 0.0
+    if not math.isfinite(previous_duration) or not math.isfinite(next_duration):
+        return 0.0
+    return min(
+        _DEFAULT_CROSSFADE_DURATION,
+        max(0.0, previous_duration) / 2,
+        max(0.0, next_duration) / 2,
+    )
+
+
+def _crossfade_timeline_duration(clip_durations: List[float]) -> float:
+    """Return the final duration after neighboring clips overlap by crossfades."""
+    if not clip_durations:
+        return 0.0
+
+    timeline_duration = 0.0
+    previous_duration = None
+    for raw_duration in clip_durations:
+        try:
+            duration = float(raw_duration)
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(duration) or duration <= 0:
+            continue
+        if previous_duration is None:
+            timeline_duration = duration
+        else:
+            timeline_duration += duration - _get_effective_crossfade_duration(
+                previous_duration,
+                duration,
+            )
+        previous_duration = duration
+    return timeline_duration
+
+
+def required_unique_material_count(
+    audio_duration: float,
+    max_clip_duration: int,
+    video_transition_mode=None,
+) -> int:
+    """Return the minimum distinct source clips needed for the selected transition."""
+    try:
+        duration = max(0.0, float(audio_duration or 0))
+    except (TypeError, ValueError):
+        duration = 0.0
+    if not math.isfinite(duration):
+        duration = 0.0
+    try:
+        clip_duration = max(1.0, float(max_clip_duration or 1))
+    except (TypeError, ValueError):
+        clip_duration = 1.0
+    if not math.isfinite(clip_duration):
+        clip_duration = 1.0
+
+    transition_value = getattr(video_transition_mode, "value", video_transition_mode)
+    if transition_value != VideoTransitionMode.crossfade.value:
+        return max(1, math.ceil(duration / clip_duration))
+
+    required_duration = _get_required_video_duration(duration)
+    if required_duration <= clip_duration:
+        return 1
+    overlap = _get_effective_crossfade_duration(clip_duration, clip_duration)
+    additional_duration = clip_duration - overlap
+    if additional_duration <= 0:
+        return max(1, math.ceil(required_duration / clip_duration))
+    return 1 + math.ceil((required_duration - clip_duration) / additional_duration)
+
+
 def _image_zoom_scale(current_time: float, clip_duration: float) -> float:
     safe_time = max(0.0, float(current_time or 0))
     safe_duration = max(0.001, float(clip_duration or 0))
-    linear_scale = 1 + (safe_duration * 0.03) * (safe_time / safe_duration)
+    linear_scale = 1 + (safe_duration * _IMAGE_ZOOM_RATE) * (
+        safe_time / safe_duration
+    )
     return min(_MAX_IMAGE_ZOOM_SCALE, linear_scale)
 
 
@@ -244,6 +1250,32 @@ def _prioritize_unique_source_clips(
     if concat_mode_value != VideoConcatMode.random.value:
         return subclipped_items
 
+    source_keys = {
+        _source_file_key(item.source_file_path) for item in subclipped_items
+    }
+    if (
+        len(source_keys) == 1
+        and openmontage_materials.is_openmontage_output_path(
+            subclipped_items[0].source_file_path
+        )
+    ):
+        # A finished OpenMontage file is a single authored story, not a pool of
+        # interchangeable B-roll. Keep its scenes in timeline order even when
+        # the general video mode is random.
+        ordered_items = sorted(
+            subclipped_items,
+            key=lambda item: (
+                float(item.start_time or 0),
+                float(item.end_time or 0),
+            ),
+        )
+        logger.info(
+            "preserving timeline order for {} OpenMontage clips".format(
+                len(ordered_items)
+            )
+        )
+        return ordered_items
+
     grouped_items: dict[str, list[SubClippedVideoClip]] = {}
     for item in subclipped_items:
         grouped_items.setdefault(_source_file_key(item.source_file_path), []).append(item)
@@ -251,7 +1283,11 @@ def _prioritize_unique_source_clips(
     primary_items = []
     overflow_items = []
     for items in grouped_items.values():
-        primary_item = max(items, key=lambda item: item.duration)
+        longest_duration = max(item.duration for item in items)
+        full_duration_items = [
+            item for item in items if item.duration == longest_duration
+        ]
+        primary_item = random.choice(full_duration_items)
         primary_items.append(primary_item)
         overflow_items.extend(item for item in items if item is not primary_item)
 
@@ -468,20 +1504,140 @@ def _get_configured_libx264_preset() -> str:
     return _DEFAULT_LIBX264_PRESET
 
 
-def _ffmpeg_libx264_quality_args(
+def _ffmpeg_quality_args(
     codec: str | None, *, bitrate=None, existing_params=None
 ) -> list[str]:
     codec = str(codec or "").strip().lower()
     params = list(existing_params or [])
-    if codec != _DEFAULT_VIDEO_CODEC:
+    if codec == _DEFAULT_VIDEO_CODEC:
+        quality_args = []
+        if "-preset" not in params:
+            quality_args.extend(["-preset", _get_configured_libx264_preset()])
+        if not bitrate and "-crf" not in params:
+            quality_args.extend(["-crf", _get_configured_libx264_crf()])
+        return quality_args
+
+    if codec == "h264_amf":
+        explicit_rate_control = {
+            "-b:v",
+            "-rc",
+            "-qp_i",
+            "-qp_p",
+            "-qp_b",
+            "-qvbr_quality_level",
+        }
+        if bitrate or explicit_rate_control.intersection(params):
+            return []
+
+        # AMF QP shares CRF's 0-51 range but not its visual equivalence. A lower
+        # QP keeps the default CRF 20 near the previous AMF quality baseline while
+        # preserving the existing lower-is-higher-quality ordering.
+        qp_i = max(0, int(_get_configured_libx264_crf()) - _AMF_CQP_QP_OFFSET)
+        return [
+            "-rc",
+            "cqp",
+            "-qp_i",
+            str(qp_i),
+            "-qp_p",
+            str(min(51, qp_i + 2)),
+        ]
+
+    if codec == "h264_nvenc":
+        explicit_rate_control = {
+            "-b:v",
+            "-rc",
+            "-cq",
+            "-qp",
+            "-qmin",
+            "-qmax",
+            "-maxrate",
+            "-bufsize",
+        }
+        if bitrate or explicit_rate_control.intersection(params):
+            return []
+
+        # NVENC's constant-quality VBR mode uses CQ rather than x264's CRF.
+        # Both keep the same lower-is-higher-quality ordering, so the existing
+        # quality setting remains meaningful when users switch hardware.
+        quality = _get_configured_libx264_crf()
+        return ["-rc", "vbr", "-cq", quality, "-b:v", "0"]
+
+    if codec == "h264_qsv":
+        explicit_rate_control = {
+            "-b:v",
+            "-global_quality",
+            "-q:v",
+            "-qscale:v",
+            "-maxrate",
+            "-bufsize",
+        }
+        quality_args = []
+        if not bitrate and not explicit_rate_control.intersection(params):
+            # QSV accepts the generic global-quality value as its quality scale.
+            # Its ordering matches CRF: a lower value requests higher quality.
+            quality_args.extend(["-global_quality", _get_configured_libx264_crf()])
+        if "-look_ahead" not in params:
+            quality_args.extend(["-look_ahead", "1"])
+        return quality_args
+
+    return []
+
+
+def _ffmpeg_keyframe_args(*, fps=None, existing_params=None) -> list[str]:
+    params = set(existing_params or [])
+    if {"-g", "-g:v", "-keyint_min"}.intersection(params):
         return []
 
-    quality_args = []
-    if "-preset" not in params:
-        quality_args.extend(["-preset", _get_configured_libx264_preset()])
-    if not bitrate and "-crf" not in params:
-        quality_args.extend(["-crf", _get_configured_libx264_crf()])
-    return quality_args
+    if fps is None:
+        fps = _get_configured_video_fps()
+    if isinstance(fps, bool):
+        return []
+    try:
+        frame_rate = float(fps)
+    except (TypeError, ValueError):
+        return []
+    if not math.isfinite(frame_rate) or frame_rate <= 0:
+        return []
+
+    keyframe_interval = max(
+        1,
+        int(round(frame_rate * _VIDEO_KEYFRAME_INTERVAL_SECONDS)),
+    )
+    return ["-g", str(keyframe_interval)]
+
+
+def _ffmpeg_bt709_color_metadata_args(existing_params=None) -> list[str]:
+    params = set(existing_params or [])
+    color_args = []
+    for flag, value in zip(
+        _MP4_BT709_COLOR_FFMPEG_PARAMS[::2],
+        _MP4_BT709_COLOR_FFMPEG_PARAMS[1::2],
+    ):
+        if flag not in params and f"{flag}:v" not in params:
+            color_args.extend([flag, value])
+    return color_args
+
+
+def _ffmpeg_bt709_h264_vui_args(existing_params=None) -> list[str]:
+    params = set(existing_params or [])
+    if {"-bsf:v", "-bsf"}.intersection(params):
+        return []
+    return ["-bsf:v", _H264_BT709_VUI_BSF]
+
+
+def get_video_encoding_contract() -> dict[str, str | float]:
+    """Return the technical MP4 encoding contract used by rendered videos."""
+    return {
+        "codec": "h264",
+        "pixel_format": "yuv420p",
+        "fps": float(_get_configured_video_fps()),
+        "max_keyframe_gap_seconds": float(_VIDEO_KEYFRAME_INTERVAL_SECONDS),
+        "color_space": "bt709",
+        "color_transfer": "bt709",
+        "color_primaries": "bt709",
+        "color_range": "tv",
+        "sample_aspect_ratio": "1:1",
+    }
 
 
 def _with_mp4_write_ffmpeg_params(
@@ -493,10 +1649,18 @@ def _with_mp4_write_ffmpeg_params(
     existing_params = list(kwargs.get("ffmpeg_params") or [])
     if "-pix_fmt" not in existing_params:
         existing_params.extend(_MP4_PIXEL_FORMAT_FFMPEG_PARAMS)
+    existing_params.extend(_ffmpeg_bt709_color_metadata_args(existing_params))
+    existing_params.extend(_ffmpeg_bt709_h264_vui_args(existing_params))
     existing_params.extend(
-        _ffmpeg_libx264_quality_args(
+        _ffmpeg_quality_args(
             codec,
             bitrate=kwargs.get("bitrate"),
+            existing_params=existing_params,
+        )
+    )
+    existing_params.extend(
+        _ffmpeg_keyframe_args(
+            fps=kwargs.get("fps"),
             existing_params=existing_params,
         )
     )
@@ -527,12 +1691,18 @@ def _write_videofile_with_codec_fallback(clip, output_file: str, codec: str, **k
     """
     effective_codec = _get_effective_video_codec(codec)
     write_kwargs = _with_mp4_write_ffmpeg_params(output_file, kwargs, effective_codec)
+    # MoviePy defaults to `-preset medium`, which h264_amf does not accept.
+    if effective_codec == "h264_amf":
+        write_kwargs["preset"] = _MOVIEPY_AMF_PRESET
     try:
         clip.write_videofile(output_file, codec=effective_codec, **write_kwargs)
         return effective_codec
     except Exception as exc:
         if effective_codec == _DEFAULT_VIDEO_CODEC:
             raise
+        logger.warning(
+            f"video write failed with codec {effective_codec}, trying fallback codec: {str(exc)}"
+        )
         fallback_kwargs = _with_mp4_write_ffmpeg_params(
             output_file, kwargs, _DEFAULT_VIDEO_CODEC
         )
@@ -543,6 +1713,48 @@ def _write_videofile_with_codec_fallback(clip, output_file: str, codec: str, **k
             reason=str(exc),
             **fallback_kwargs,
         )
+
+
+def _video_encoder_result(configured_codec: str, used_codec: str) -> dict[str, str | bool]:
+    return {
+        "configured_codec": configured_codec,
+        "used_codec": used_codec,
+        "fallback_used": used_codec != configured_codec,
+    }
+
+
+def check_video_encoder(
+    video_aspect: VideoAspect | str = VideoAspect.portrait,
+) -> dict[str, str | bool | int]:
+    """Run a short encode at the selected output resolution and report the codec used."""
+    aspect = VideoAspect(video_aspect)
+    width, height = aspect.to_resolution()
+    configured_codec = _get_configured_video_codec()
+    descriptor, probe_file = tempfile.mkstemp(suffix=".mp4")
+    os.close(descriptor)
+    probe_clip = None
+    try:
+        os.remove(probe_file)
+        probe_clip = ColorClip(size=(width, height), color=(0, 0, 0), duration=1)
+        used_codec = _write_videofile_with_codec_fallback(
+            probe_clip,
+            probe_file,
+            codec=configured_codec,
+            fps=24,
+            audio=False,
+            logger=None,
+        )
+        return {
+            **_video_encoder_result(configured_codec, used_codec),
+            "video_aspect": aspect.value,
+            "width": width,
+            "height": height,
+        }
+    finally:
+        if probe_clip is not None:
+            probe_clip.close()
+        if os.path.exists(probe_file):
+            os.remove(probe_file)
 
 
 def _escape_ffmpeg_concat_path(file_path: str) -> str:
@@ -564,18 +1776,120 @@ def _format_ffmpeg_concat_path(file_path: str) -> str:
 
 def _format_ffmpeg_ass_filter_path(file_path: str) -> str:
     absolute_path = os.path.abspath(file_path).replace("\\", "/")
-    return (
+    option_value = (
         absolute_path.replace("\\", "\\\\")
-        .replace(":", r"\:")
         .replace("'", r"\'")
-        .replace(",", r"\,")
-        .replace("[", r"\[")
-        .replace("]", r"\]")
+        .replace(":", r"\:")
+    )
+    return "".join(
+        f"\\{character}" if character in "\\'[],;" else character
+        for character in option_value
     )
 
 
 def _build_ass_subtitles_filter(subtitle_file: str) -> str:
-    return f"subtitles='{_format_ffmpeg_ass_filter_path(subtitle_file)}'"
+    return f"subtitles=filename={_format_ffmpeg_ass_filter_path(subtitle_file)}"
+
+
+def _hex_to_ass_bgr_color(value: str | None, default: str = "#FFFFFF") -> str:
+    color = value if isinstance(value, str) and value.startswith("#") else default
+    color = color.lstrip("#")
+    if len(color) != 6 or any(
+        character not in "0123456789abcdefABCDEF" for character in color
+    ):
+        color = default.lstrip("#")
+    red, green, blue = color[0:2], color[2:4], color[4:6]
+    return f"&H00{blue}{green}{red}".upper()
+
+
+def _srt_subtitle_ffmpeg_supported(params: VideoParams) -> bool:
+    if not params.subtitle_enabled:
+        return False
+    if getattr(params, "subtitle_style", "classic") != "classic":
+        return False
+    if params.subtitle_position not in {"bottom", "top", "center"}:
+        return False
+    if getattr(params, "rounded_subtitle_background", False):
+        return False
+    bg_color = params.text_background_color
+    if isinstance(bg_color, bool):
+        return not bg_color
+    return not bool(bg_color)
+
+
+def _srt_subtitle_alignment_and_margin(
+    params: VideoParams,
+    video_height: int,
+    video_aspect: VideoAspect,
+) -> tuple[int, int]:
+    if params.subtitle_position == "top":
+        return 8, int(video_height * 0.05)
+    if params.subtitle_position == "center":
+        return 5, 10
+    return 2, int(video_height * get_subtitle_bottom_safe_margin_ratio(video_aspect))
+
+
+def _subtitle_font_family(font_path: str, fallback_name: str) -> str:
+    try:
+        font_family = ImageFont.truetype(font_path, 12).getname()[0]
+    except (AttributeError, OSError, ValueError):
+        font_family = os.path.splitext(os.path.basename(fallback_name or font_path))[0]
+    safe_font_family = "".join(
+        character
+        for character in str(font_family)
+        if character.isalnum() or character in {" ", "_", "-", "."}
+    ).strip()
+    return safe_font_family or "Arial"
+
+
+def _format_ass_style_number(value: object, default: float) -> str:
+    try:
+        numeric_value = float(value)
+    except (TypeError, ValueError):
+        numeric_value = default
+    if not math.isfinite(numeric_value) or numeric_value < 0:
+        numeric_value = default
+    return f"{numeric_value:g}"
+
+
+def _build_srt_subtitles_filter(
+    subtitle_file: str,
+    params: VideoParams,
+    video_width: int,
+    video_height: int,
+    video_aspect: VideoAspect,
+    font_path: str,
+) -> str:
+    font_name = _subtitle_font_family(font_path, params.font_name or "")
+    alignment, margin_v = _srt_subtitle_alignment_and_margin(
+        params,
+        video_height,
+        video_aspect,
+    )
+    horizontal_margin = int(video_width * 0.05)
+    style = ",".join(
+        [
+            f"PlayResX={video_width}",
+            f"PlayResY={video_height}",
+            f"Fontname={font_name}",
+            f"Fontsize={int(params.font_size)}",
+            f"PrimaryColour={_hex_to_ass_bgr_color(params.text_fore_color)}",
+            f"OutlineColour={_hex_to_ass_bgr_color(params.stroke_color, '#000000')}",
+            f"Outline={_format_ass_style_number(params.stroke_width, 1.5)}",
+            "Shadow=0",
+            "BorderStyle=1",
+            f"Alignment={alignment}",
+            f"MarginL={horizontal_margin}",
+            f"MarginR={horizontal_margin}",
+            f"MarginV={margin_v}",
+        ]
+    )
+    return (
+        f"subtitles=filename={_format_ffmpeg_ass_filter_path(subtitle_file)}"
+        f":charenc=UTF-8"
+        f":fontsdir={_format_ffmpeg_ass_filter_path(utils.font_dir())}"
+        f":force_style='{style}'"
+    )
 
 
 def _ass_burn_temp_output_file(output_file: str) -> str:
@@ -583,6 +1897,13 @@ def _ass_burn_temp_output_file(output_file: str) -> str:
     output_name = os.path.basename(output_file)
     output_stem, output_ext = os.path.splitext(output_name)
     return os.path.join(output_dir, f"{output_stem}.assburn.tmp{output_ext or '.mp4'}")
+
+
+def _srt_burn_temp_output_file(output_file: str) -> str:
+    output_dir = os.path.dirname(output_file) or "."
+    output_name = os.path.basename(output_file)
+    output_stem, output_ext = os.path.splitext(output_name)
+    return os.path.join(output_dir, f"{output_stem}.srtburn.tmp{output_ext or '.mp4'}")
 
 
 def _remove_file_quietly(file_path: str):
@@ -598,7 +1919,7 @@ def _burn_ass_subtitles_with_ffmpeg(
     subtitle_file: str,
     output_file: str,
     threads: int | None,
-) -> bool:
+) -> str | None:
     temp_output_file = _ass_burn_temp_output_file(output_file)
 
     def run_burn(codec: str):
@@ -619,7 +1940,10 @@ def _burn_ass_subtitles_with_ffmpeg(
                 str(threads or 2),
                 "-pix_fmt",
                 "yuv420p",
-                *_ffmpeg_libx264_quality_args(codec),
+                *_ffmpeg_bt709_color_metadata_args(),
+                *_ffmpeg_bt709_h264_vui_args(),
+                *_ffmpeg_quality_args(codec),
+                *_ffmpeg_keyframe_args(),
                 *_ffmpeg_mp4_faststart_args(temp_output_file),
                 temp_output_file,
             ],
@@ -639,7 +1963,7 @@ def _burn_ass_subtitles_with_ffmpeg(
     try:
         result = run_burn(codec)
         if result.returncode == 0 and finalize_burn_output():
-            return True
+            return codec
 
         reason = (result.stderr or result.stdout or "").strip()
         logger.warning(f"failed to burn ASS subtitles with {codec}: {reason}")
@@ -647,18 +1971,101 @@ def _burn_ass_subtitles_with_ffmpeg(
             fallback_result = run_burn(_DEFAULT_VIDEO_CODEC)
             if fallback_result.returncode == 0 and finalize_burn_output():
                 _disable_runtime_video_codec(codec, reason)
-                return True
+                return _DEFAULT_VIDEO_CODEC
             reason = (fallback_result.stderr or fallback_result.stdout or "").strip()
             logger.error(f"failed to burn ASS subtitles with fallback codec: {reason}")
     except (OSError, subprocess.SubprocessError) as exc:
         logger.error(f"failed to burn ASS subtitles: {str(exc)}")
 
     _remove_file_quietly(temp_output_file)
-    return False
+    return None
+
+
+def _burn_srt_subtitles_with_ffmpeg(
+    input_file: str,
+    subtitle_file: str,
+    output_file: str,
+    params: VideoParams,
+    video_width: int,
+    video_height: int,
+    video_aspect: VideoAspect,
+    font_path: str,
+    threads: int | None,
+) -> str | None:
+    temp_output_file = _srt_burn_temp_output_file(output_file)
+
+    def run_burn(codec: str):
+        _remove_file_quietly(temp_output_file)
+        return subprocess.run(
+            [
+                utils.get_ffmpeg_binary(),
+                "-y",
+                "-i",
+                input_file,
+                "-vf",
+                _build_srt_subtitles_filter(
+                    subtitle_file,
+                    params=params,
+                    video_width=video_width,
+                    video_height=video_height,
+                    video_aspect=video_aspect,
+                    font_path=font_path,
+                ),
+                "-c:v",
+                codec,
+                "-c:a",
+                "copy",
+                "-threads",
+                str(threads or 2),
+                "-pix_fmt",
+                "yuv420p",
+                *_ffmpeg_bt709_color_metadata_args(),
+                *_ffmpeg_bt709_h264_vui_args(),
+                *_ffmpeg_quality_args(codec),
+                *_ffmpeg_keyframe_args(),
+                *_ffmpeg_mp4_faststart_args(temp_output_file),
+                temp_output_file,
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    def finalize_burn_output() -> bool:
+        if not os.path.exists(temp_output_file):
+            logger.error("SRT subtitle burn-in did not create an output file")
+            return False
+        os.replace(temp_output_file, output_file)
+        return True
+
+    codec = _get_effective_video_codec(_get_configured_video_codec())
+    try:
+        result = run_burn(codec)
+        if result.returncode == 0 and finalize_burn_output():
+            return codec
+
+        reason = (result.stderr or result.stdout or "").strip()
+        logger.warning(f"failed to burn SRT subtitles with {codec}: {reason}")
+        if codec != _DEFAULT_VIDEO_CODEC:
+            fallback_result = run_burn(_DEFAULT_VIDEO_CODEC)
+            if fallback_result.returncode == 0 and finalize_burn_output():
+                _disable_runtime_video_codec(codec, reason)
+                return _DEFAULT_VIDEO_CODEC
+            reason = (fallback_result.stderr or fallback_result.stdout or "").strip()
+            logger.error(f"failed to burn SRT subtitles with fallback codec: {reason}")
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.error(f"failed to burn SRT subtitles: {str(exc)}")
+
+    _remove_file_quietly(temp_output_file)
+    return None
 
 
 def concat_video_clips_with_ffmpeg(
-    clip_files: List[str], output_file: str, threads: int, output_dir: str
+    clip_files: List[str],
+    output_file: str,
+    threads: int,
+    output_dir: str,
+    max_duration: float | None = None,
 ):
     concat_list_file = os.path.join(output_dir, "ffmpeg-concat-list.txt")
     with open(concat_list_file, "w", encoding="utf-8") as fp:
@@ -677,14 +2084,18 @@ def concat_video_clips_with_ffmpeg(
             concat_list_file,
         ]
         if stream_copy:
-            return [
+            stream_copy_command = [
                 *command,
                 "-c",
                 "copy",
+                *_ffmpeg_bt709_h264_vui_args(),
                 *_ffmpeg_mp4_faststart_args(output_file),
-                output_file,
             ]
-        return [
+            if max_duration is not None and max_duration > 0:
+                stream_copy_command.extend(["-t", f"{max_duration:.3f}"])
+            stream_copy_command.append(output_file)
+            return stream_copy_command
+        encode_command = [
             *command,
             "-c:v",
             codec,
@@ -692,10 +2103,16 @@ def concat_video_clips_with_ffmpeg(
             str(threads or 2),
             "-pix_fmt",
             "yuv420p",
-            *_ffmpeg_libx264_quality_args(codec),
+            *_ffmpeg_bt709_color_metadata_args(),
+            *_ffmpeg_bt709_h264_vui_args(),
+            *_ffmpeg_quality_args(codec),
+            *_ffmpeg_keyframe_args(),
             *_ffmpeg_mp4_faststart_args(output_file),
-            output_file,
         ]
+        if max_duration is not None and max_duration > 0:
+            encode_command.extend(["-t", f"{max_duration:.3f}"])
+        encode_command.append(output_file)
+        return encode_command
 
     def run_concat(codec: str, stream_copy: bool = False):
         command = build_command(codec, stream_copy=stream_copy)
@@ -731,6 +2148,116 @@ def concat_video_clips_with_ffmpeg(
             return result_codec
     finally:
         delete_files(concat_list_file)
+
+
+def crossfade_video_clips_with_ffmpeg(
+    clip_files: List[str],
+    clip_durations: List[float],
+    output_file: str,
+    threads: int,
+    max_duration: float | None = None,
+):
+    """Join normalized clips with FFmpeg's fade crossfade filter."""
+    if len(clip_files) < 2 or len(clip_files) != len(clip_durations):
+        raise ValueError("crossfade requires matching lists of at least two clips")
+
+    durations = []
+    for raw_duration in clip_durations:
+        try:
+            duration = float(raw_duration)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("crossfade clip durations must be numeric") from exc
+        if not math.isfinite(duration) or duration <= 0:
+            raise ValueError("crossfade clip durations must be positive")
+        durations.append(duration)
+
+    filter_parts = [
+        f"[{index}:v]settb=AVTB,setpts=PTS-STARTPTS[v{index}]"
+        for index in range(len(clip_files))
+    ]
+    output_label = "v0"
+    timeline_duration = durations[0]
+    for index, duration in enumerate(durations[1:], start=1):
+        transition_duration = _get_effective_crossfade_duration(
+            durations[index - 1],
+            duration,
+        )
+        next_output_label = f"xf{index}"
+        offset = max(0.0, timeline_duration - transition_duration)
+        filter_parts.append(
+            f"[{output_label}][v{index}]xfade=transition=fade:"
+            f"duration={transition_duration:.3f}:offset={offset:.3f}"
+            f"[{next_output_label}]"
+        )
+        timeline_duration += duration - transition_duration
+        output_label = next_output_label
+    filter_parts.append(f"[{output_label}]setsar=1[square]")
+    output_label = "square"
+    filter_graph = ";".join(filter_parts)
+    try:
+        normalized_max_duration = float(max_duration)
+    except (TypeError, ValueError):
+        normalized_max_duration = None
+    if (
+        normalized_max_duration is not None
+        and (not math.isfinite(normalized_max_duration) or normalized_max_duration <= 0)
+    ):
+        normalized_max_duration = None
+    output_fps = _get_configured_video_fps()
+
+    def build_command(codec: str) -> list[str]:
+        command = [utils.get_ffmpeg_binary(), "-y"]
+        for clip_file in clip_files:
+            command.extend(["-i", clip_file])
+        return [
+            *command,
+            "-filter_complex",
+            filter_graph,
+            "-map",
+            f"[{output_label}]",
+            "-an",
+            *(
+                ["-t", f"{normalized_max_duration:.3f}"]
+                if normalized_max_duration is not None
+                else []
+            ),
+            "-r",
+            str(output_fps),
+            "-c:v",
+            codec,
+            "-threads",
+            str(threads or 2),
+            "-pix_fmt",
+            "yuv420p",
+            *_ffmpeg_bt709_color_metadata_args(),
+            *_ffmpeg_bt709_h264_vui_args(),
+            *_ffmpeg_quality_args(codec),
+            *_ffmpeg_keyframe_args(fps=output_fps),
+            *_ffmpeg_mp4_faststart_args(output_file),
+            output_file,
+        ]
+
+    def run_crossfade(codec: str):
+        result = subprocess.run(
+            build_command(codec),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            error_message = (result.stderr or result.stdout or "").strip()
+            raise RuntimeError(error_message or "ffmpeg crossfade failed")
+        return codec
+
+    effective_codec = _get_effective_video_codec()
+    try:
+        return run_crossfade(effective_codec)
+    except Exception as exc:
+        if effective_codec == _DEFAULT_VIDEO_CODEC:
+            raise
+        result_codec = run_crossfade(_DEFAULT_VIDEO_CODEC)
+        _disable_runtime_video_codec(effective_codec, str(exc))
+        return result_codec
 
 
 def _sanitize_image_file(image_path: str) -> str:
@@ -791,11 +2318,32 @@ def _open_video_clip_quietly(video_path: str, audio: bool = False) -> VideoFileC
     return clip
 
 
+def get_video_duration(video_path: str) -> float | None:
+    """Read a video's usable duration without keeping its reader open."""
+    clip = None
+    try:
+        clip = _open_video_clip_quietly(video_path)
+        duration = float(getattr(clip, "duration", 0) or 0)
+    except Exception as exc:
+        logger.debug(f"failed to read video duration: {video_path}, error: {str(exc)}")
+        return None
+    finally:
+        close_clip(clip)
+
+    if duration <= 0 or not math.isfinite(duration):
+        return None
+    return duration
+
+
 def close_clip(clip):
     if clip is None:
         return
         
     try:
+        close_method = getattr(clip, "close", None)
+        if callable(close_method):
+            close_method()
+
         # close main resources
         if hasattr(clip, 'reader') and clip.reader is not None:
             clip.reader.close()
@@ -832,11 +2380,14 @@ def delete_files(files: List[str] | str):
     if isinstance(files, str):
         files = [files]
 
-    for file in files:
+    unique_files = dict.fromkeys(file for file in files if file)
+    for file in unique_files:
         try:
             os.remove(file)
-        except Exception as e:
-            logger.debug(f"failed to delete file {file}: {str(e)}")
+        except FileNotFoundError:
+            continue
+        except OSError as e:
+            logger.warning(f"failed to delete temporary file {file}: {str(e)}")
 
 
 def _resolve_bgm_file_path(song_dir: str, bgm_file: str) -> str:
@@ -884,16 +2435,638 @@ def get_bgm_file(bgm_type: str = "random", bgm_file: str = ""):
         return resolved_bgm_file
 
     if bgm_type == "random":
-        suffix = "*.mp3"
+        # Random playback is limited to the explicitly audited CC0 additions.
+        suffix = "cc0_*.mp3"
         song_dir = utils.song_dir()
         files = glob.glob(os.path.join(song_dir, suffix))
         # 当背景音乐目录为空时，直接回退为“不使用 BGM”，避免 random.choice([]) 抛异常。
         if not files:
-            logger.warning(f"no bgm files found in song directory: {song_dir}")
+            logger.warning(f"no verified CC0 bgm files found in song directory: {song_dir}")
             return ""
         return random.choice(files)
 
     return ""
+
+
+def _fast_render_clip_with_ffmpeg(
+    input_file: str,
+    output_file: str,
+    start_time: float,
+    duration: float,
+    target_width: int,
+    target_height: int,
+    threads: int,
+    brightness_adjustment: float = 0.0,
+    saturation_multiplier: float = 1.0,
+    warmth_adjustment: float = 0.0,
+    crop_x_ratio: float | None = None,
+    crop_y_ratio: float | None = None,
+) -> bool:
+    """Render a plain trimmed clip without routing every frame through MoviePy."""
+    try:
+        duration = float(duration)
+    except (TypeError, ValueError):
+        return False
+    if duration <= 0 or not os.path.isfile(input_file):
+        return False
+
+    try:
+        brightness_adjustment = float(brightness_adjustment)
+    except (TypeError, ValueError):
+        brightness_adjustment = 0.0
+    if not math.isfinite(brightness_adjustment):
+        brightness_adjustment = 0.0
+    brightness_adjustment = max(
+        -_MAX_COLOR_LEVELING_BRIGHTNESS_ADJUSTMENT,
+        min(_MAX_COLOR_LEVELING_BRIGHTNESS_ADJUSTMENT, brightness_adjustment),
+    )
+    try:
+        saturation_multiplier = float(saturation_multiplier)
+    except (TypeError, ValueError):
+        saturation_multiplier = 1.0
+    if not math.isfinite(saturation_multiplier):
+        saturation_multiplier = 1.0
+    saturation_multiplier = max(
+        _MIN_COLOR_LEVELING_SATURATION_MULTIPLIER,
+        min(_MAX_COLOR_LEVELING_SATURATION_MULTIPLIER, saturation_multiplier),
+    )
+    try:
+        warmth_adjustment = float(warmth_adjustment)
+    except (TypeError, ValueError):
+        warmth_adjustment = 0.0
+    if not math.isfinite(warmth_adjustment):
+        warmth_adjustment = 0.0
+    warmth_adjustment = max(
+        -_MAX_COLOR_LEVELING_WARMTH_ADJUSTMENT,
+        min(_MAX_COLOR_LEVELING_WARMTH_ADJUSTMENT, warmth_adjustment),
+    )
+    eq_options = []
+    if brightness_adjustment:
+        eq_options.append(f"brightness={brightness_adjustment:.4f}")
+    if saturation_multiplier != 1.0:
+        eq_options.append(f"saturation={saturation_multiplier:.4f}")
+    color_filter = f",eq={':'.join(eq_options)}" if eq_options else ""
+    warmth_filter = (
+        ",colorbalance="
+        f"rm={warmth_adjustment:.4f}:bm={-warmth_adjustment:.4f}:pl=1"
+        if warmth_adjustment
+        else ""
+    )
+    crop_x_ratio = _bounded_crop_ratio(crop_x_ratio)
+    crop_y_ratio = _bounded_crop_ratio(crop_y_ratio)
+    crop_filter = f"crop={target_width}:{target_height}"
+    if crop_x_ratio is not None or crop_y_ratio is not None:
+        crop_x = (
+            f"(iw-ow)*{crop_x_ratio:.6f}"
+            if crop_x_ratio is not None
+            else "(iw-ow)/2"
+        )
+        crop_y = (
+            f"(ih-oh)*{crop_y_ratio:.6f}"
+            if crop_y_ratio is not None
+            else "(ih-oh)/2"
+        )
+        crop_filter = f"{crop_filter}:{crop_x}:{crop_y}"
+
+    codec = _get_effective_video_codec()
+    output_fps = _get_configured_video_fps()
+    deband_filter = _optional_deband_filter()
+
+    def build_command(
+        include_optional_deband: bool,
+        include_color_normalization: bool,
+    ) -> list[str]:
+        color_normalization_options = (
+            _BT709_LIMITED_RANGE_SCALE_OPTIONS
+            if include_color_normalization
+            else ""
+        )
+        command = [
+            utils.get_ffmpeg_binary(),
+            "-y",
+            "-ss",
+            str(start_time or 0),
+            "-i",
+            input_file,
+            "-t",
+            str(duration),
+            "-map",
+            "0:v:0",
+            "-vf",
+            (
+                # Preserve progressive frames; yadif only cleans frames marked interlaced.
+                "yadif=deint=interlaced,"
+                f"scale={target_width}:{target_height}:"
+                "force_original_aspect_ratio=increase:"
+                f"flags={_HIGH_QUALITY_SCALE_FLAGS}"
+                f"{color_normalization_options},"
+                f"{crop_filter}{color_filter}{warmth_filter}"
+                f"{deband_filter if include_optional_deband else ''},setsar=1"
+            ),
+            "-r",
+            str(output_fps),
+            "-fps_mode",
+            "cfr",
+            "-c:v",
+            codec,
+            "-threads",
+            str(threads or 2),
+            "-pix_fmt",
+            "yuv420p",
+            *_ffmpeg_bt709_color_metadata_args(),
+            *_ffmpeg_bt709_h264_vui_args(),
+            *_ffmpeg_quality_args(codec),
+            *_ffmpeg_keyframe_args(fps=output_fps),
+        ]
+        if codec != _DEFAULT_VIDEO_CODEC:
+            preset = (
+                _MOVIEPY_AMF_PRESET
+                if codec == "h264_amf"
+                else _DEFAULT_LIBX264_PRESET
+            )
+            command.extend(["-preset", preset])
+        command.extend(["-an", *_ffmpeg_mp4_faststart_args(output_file), output_file])
+        return command
+
+    def run_fast_render(
+        include_optional_deband: bool,
+        include_color_normalization: bool,
+    ):
+        try:
+            result = subprocess.run(
+                build_command(include_optional_deband, include_color_normalization),
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            logger.debug(f"ffmpeg clip fast path unavailable: {str(exc)}")
+            return None, str(exc)
+        return result, (result.stderr or result.stdout or "").strip()
+
+    attempts = [(bool(deband_filter), True)]
+    if deband_filter:
+        attempts.append((False, True))
+    attempts.append((False, False))
+    reason = ""
+    for include_optional_deband, include_color_normalization in attempts:
+        result, attempt_reason = run_fast_render(
+            include_optional_deband,
+            include_color_normalization,
+        )
+        if result is not None and result.returncode == 0:
+            return True
+        reason = attempt_reason or reason
+        if include_optional_deband:
+            logger.info("optional video debanding failed; retrying without cleanup")
+        elif include_color_normalization:
+            logger.info("BT.709 color normalization failed; retrying without conversion")
+
+    logger.debug(f"ffmpeg clip fast path failed: {reason}")
+    return False
+
+
+def _fast_render_image_with_ffmpeg(
+    input_file: str,
+    output_file: str,
+    width: int,
+    height: int,
+    duration: float,
+    threads: int = 2,
+    codec: str | None = None,
+    focal_x_ratio: float | None = None,
+    focal_y_ratio: float | None = None,
+    target_width: int | None = None,
+    target_height: int | None = None,
+) -> bool:
+    """Render an image zoom without routing frames through MoviePy."""
+    try:
+        duration = float(duration)
+        fps = int(_get_configured_video_fps())
+        output_width, output_height = _even_video_size((width, height))
+        if target_width and target_height:
+            output_width, output_height = _even_video_size((target_width, target_height))
+        threads = max(1, int(threads or 2))
+    except (TypeError, ValueError):
+        return False
+    if (
+        duration <= 0
+        or not math.isfinite(duration)
+        or fps <= 0
+        or not os.path.isfile(input_file)
+    ):
+        return False
+
+    codec = codec or _get_effective_video_codec()
+    scale_filter = (
+        f"scale=iw:ih:flags={_HIGH_QUALITY_SCALE_FLAGS}"
+    )
+    crop_filter = ""
+    zoom_x = "iw/2-(iw/zoom/2)"
+    normalized_focal_x = _bounded_crop_ratio(focal_x_ratio)
+    if normalized_focal_x is not None:
+        zoom_x = (
+            f"clip({normalized_focal_x:.6f}*iw-iw/(2*zoom)\\,0\\,iw-iw/zoom)"
+        )
+    zoom_y = "ih/2-(ih/zoom/2)"
+    normalized_focal_y = _bounded_crop_ratio(focal_y_ratio)
+    if normalized_focal_y is not None:
+        zoom_y = (
+            f"clip({normalized_focal_y:.6f}*ih-ih/(2*zoom)\\,0\\,ih-ih/zoom)"
+        )
+    if target_width and target_height:
+        crop_x_ratio, crop_y_ratio = _focal_crop_offset_ratios(
+            width,
+            height,
+            output_width,
+            output_height,
+            focal_x_ratio=focal_x_ratio,
+            focal_y_ratio=focal_y_ratio,
+        )
+        crop_x = "(iw-ow)/2"
+        if crop_x_ratio is not None:
+            crop_x = f"(iw-ow)*{crop_x_ratio:.6f}"
+        crop_y = "(ih-oh)/2"
+        if crop_y_ratio is not None:
+            crop_y = f"(ih-oh)*{crop_y_ratio:.6f}"
+        scale_filter = (
+            f"scale={output_width}:{output_height}:"
+            "force_original_aspect_ratio=increase:"
+            f"flags={_HIGH_QUALITY_SCALE_FLAGS}"
+        )
+        crop_filter = f"crop={output_width}:{output_height}:{crop_x}:{crop_y},"
+        zoom_x = "iw/2-(iw/zoom/2)"
+        zoom_y = "ih/2-(ih/zoom/2)"
+    def build_command(include_color_normalization: bool) -> list[str]:
+        color_normalization_options = (
+            _BT709_LIMITED_RANGE_SCALE_OPTIONS
+            if include_color_normalization
+            else ""
+        )
+        zoom_filter = (
+            f"{scale_filter}{color_normalization_options},{crop_filter}"
+            f"zoompan=z='min(1+{_IMAGE_ZOOM_RATE}*on/{fps},"
+            f"{_MAX_IMAGE_ZOOM_SCALE})':"
+            f"x='{zoom_x}':"
+            f"y='{zoom_y}':"
+            f"d=1:s={output_width}x{output_height}:fps={fps},setsar=1"
+        )
+        command = [
+            utils.get_ffmpeg_binary(),
+            "-y",
+            "-loop",
+            "1",
+            "-framerate",
+            str(fps),
+            "-i",
+            input_file,
+            "-vf",
+            zoom_filter,
+            "-t",
+            str(duration),
+            "-c:v",
+            codec,
+            "-threads",
+            str(threads),
+            "-pix_fmt",
+            "yuv420p",
+            *_ffmpeg_bt709_color_metadata_args(),
+            *_ffmpeg_bt709_h264_vui_args(),
+            *_ffmpeg_quality_args(codec),
+            *_ffmpeg_keyframe_args(fps=fps),
+        ]
+        if codec != _DEFAULT_VIDEO_CODEC:
+            preset = (
+                _MOVIEPY_AMF_PRESET
+                if codec == "h264_amf"
+                else _DEFAULT_LIBX264_PRESET
+            )
+            command.extend(["-preset", preset])
+        command.extend(["-an", *_ffmpeg_mp4_faststart_args(output_file), output_file])
+        return command
+
+    reason = ""
+    for include_color_normalization in (True, False):
+        try:
+            result = subprocess.run(
+                build_command(include_color_normalization),
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            logger.debug(f"ffmpeg image fast path unavailable: {str(exc)}")
+            return False
+
+        if result.returncode == 0:
+            return True
+        reason = (result.stderr or result.stdout or "").strip() or reason
+        if include_color_normalization:
+            logger.info("BT.709 color normalization failed; retrying without conversion")
+
+    logger.debug(f"ffmpeg image fast path failed: {reason}")
+    if codec != _DEFAULT_VIDEO_CODEC:
+        return _fast_render_image_with_ffmpeg(
+            input_file=input_file,
+            output_file=output_file,
+            width=width,
+            height=height,
+            duration=duration,
+            threads=threads,
+            codec=_DEFAULT_VIDEO_CODEC,
+            focal_x_ratio=focal_x_ratio,
+            focal_y_ratio=focal_y_ratio,
+            target_width=target_width,
+            target_height=target_height,
+        )
+    return False
+
+
+def _fast_mux_video_with_audio(
+    video_path: str,
+    audio_path: str,
+    output_file: str,
+    video_duration: float,
+    audio_bitrate: str,
+    voice_volume: float = 1.0,
+) -> bool:
+    """Attach narration without re-encoding an already rendered video stream."""
+    try:
+        video_duration = float(video_duration)
+        voice_volume = float(voice_volume)
+    except (TypeError, ValueError):
+        return False
+    if (
+        video_duration <= 0
+        or not math.isfinite(video_duration)
+        or not math.isfinite(voice_volume)
+        or not os.path.isfile(video_path)
+        or not os.path.isfile(audio_path)
+    ):
+        return False
+    if not _video_stream_matches_encoding_contract(video_path):
+        logger.debug(
+            "ffmpeg audio mux fast path skipped because source video does not meet the encoding contract"
+        )
+        return False
+
+    command = [
+        utils.get_ffmpeg_binary(),
+        "-y",
+        "-i",
+        video_path,
+        "-i",
+        audio_path,
+        "-map",
+        "0:v:0",
+        "-map",
+        "1:a:0",
+        "-filter:a",
+        _narration_peak_limiter_filter(voice_volume),
+        "-c:v",
+        "copy",
+        "-c:a",
+        audio_codec,
+        "-b:a",
+        str(audio_bitrate),
+        "-t",
+        str(video_duration),
+        *_ffmpeg_mp4_faststart_args(output_file),
+        output_file,
+    ]
+    try:
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.debug(f"ffmpeg audio mux fast path unavailable: {str(exc)}")
+        return False
+
+    if result.returncode == 0:
+        return True
+    reason = (result.stderr or result.stdout or "").strip()
+    logger.debug(f"ffmpeg audio mux fast path failed: {reason}")
+    return False
+
+
+_BGM_DUCKING_THRESHOLD = 0.03
+_BGM_DUCKING_RATIO = 8
+_BGM_DUCKING_ATTACK_MS = 20
+_BGM_DUCKING_RELEASE_MS = 300
+_BGM_FALLBACK_DUCKING_FACTOR = 0.45
+_AUDIO_PEAK_LIMITER_FILTER = "alimiter=limit=0.95:level=0:latency=1"
+
+
+def _audio_limiter_temp_output_file(output_file: str) -> str:
+    output_dir = os.path.dirname(output_file) or "."
+    output_name = os.path.basename(output_file)
+    output_stem, output_ext = os.path.splitext(output_name)
+    return os.path.join(
+        output_dir,
+        f"{output_stem}.audiolimit.tmp{output_ext or '.mp4'}",
+    )
+
+
+def _limit_rendered_audio_peaks_with_ffmpeg(
+    output_file: str,
+    audio_bitrate: str,
+) -> bool:
+    """Limit a MoviePy-rendered audio track without re-encoding video frames."""
+    if not os.path.isfile(output_file):
+        return False
+
+    temp_output_file = _audio_limiter_temp_output_file(output_file)
+    _remove_file_quietly(temp_output_file)
+    command = [
+        utils.get_ffmpeg_binary(),
+        "-y",
+        "-i",
+        output_file,
+        "-map",
+        "0:v:0",
+        "-map",
+        "0:a:0",
+        "-filter:a",
+        _AUDIO_PEAK_LIMITER_FILTER,
+        "-c:v",
+        "copy",
+        "-c:a",
+        audio_codec,
+        "-b:a",
+        str(audio_bitrate),
+        *_ffmpeg_mp4_faststart_args(temp_output_file),
+        temp_output_file,
+    ]
+    try:
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.debug(f"ffmpeg post-render audio limiter unavailable: {str(exc)}")
+        return False
+
+    if result.returncode == 0 and os.path.isfile(temp_output_file):
+        os.replace(temp_output_file, output_file)
+        return True
+
+    reason = (result.stderr or result.stdout or "").strip()
+    logger.debug(f"ffmpeg post-render audio limiter failed: {reason}")
+    _remove_file_quietly(temp_output_file)
+    return False
+
+
+def _narration_peak_limiter_filter(voice_volume: float) -> str:
+    """Apply gain first, then retain headroom before AAC encoding."""
+    return (
+        f"volume={voice_volume},{_AUDIO_PEAK_LIMITER_FILTER}"
+        if voice_volume != 1.0
+        else _AUDIO_PEAK_LIMITER_FILTER
+    )
+
+
+def _narration_ducked_bgm_volume(bgm_volume: float) -> float:
+    try:
+        return max(0.0, float(bgm_volume) * _BGM_FALLBACK_DUCKING_FACTOR)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _narration_relative_ducking_filter(voice_volume: float) -> str:
+    try:
+        voice_gain = float(voice_volume)
+    except (TypeError, ValueError):
+        voice_gain = 1.0
+
+    if not math.isfinite(voice_gain):
+        voice_gain = 1.0
+    if voice_gain <= 0:
+        threshold = 1.0
+    else:
+        # The sidechain already includes this gain, so scale its trigger too.
+        threshold = min(0.99, max(0.001, _BGM_DUCKING_THRESHOLD * voice_gain))
+
+    return (
+        f"threshold={threshold:g}:ratio={_BGM_DUCKING_RATIO}:"
+        f"attack={_BGM_DUCKING_ATTACK_MS}:release={_BGM_DUCKING_RELEASE_MS}"
+    )
+
+
+def _video_stream_matches_encoding_contract(video_path: str) -> bool:
+    """Fail closed before stream-copying a video that may miss output settings."""
+    try:
+        # render_quality imports video helpers, so this remains local to avoid a
+        # module-import cycle while still sharing the encoding-only probe.
+        from app.services import render_quality
+
+        return render_quality.video_stream_matches_encoding_contract(
+            video_path,
+            get_video_encoding_contract(),
+        )
+    except Exception as exc:
+        logger.debug(f"could not verify video encoding contract for fast mux: {str(exc)}")
+        return False
+
+
+def _fast_mux_video_with_audio_and_bgm(
+    video_path: str,
+    audio_path: str,
+    bgm_file: str,
+    output_file: str,
+    video_duration: float,
+    audio_bitrate: str,
+    bgm_volume: float,
+    voice_volume: float = 1.0,
+) -> bool:
+    """Attach narration and looped BGM without re-encoding the video stream."""
+    try:
+        video_duration = float(video_duration)
+        bgm_volume = float(bgm_volume)
+        voice_volume = float(voice_volume)
+    except (TypeError, ValueError):
+        return False
+    if (
+        video_duration <= 0
+        or not math.isfinite(video_duration)
+        or not math.isfinite(bgm_volume)
+        or not math.isfinite(voice_volume)
+        or not os.path.isfile(video_path)
+        or not os.path.isfile(audio_path)
+        or not os.path.isfile(bgm_file)
+    ):
+        return False
+    if not _video_stream_matches_encoding_contract(video_path):
+        logger.debug(
+            "ffmpeg BGM audio mux fast path skipped because source video does not meet the encoding contract"
+        )
+        return False
+
+    fade_duration = min(3.0, video_duration)
+    fade_start = max(0.0, video_duration - fade_duration)
+    voice_filter = (
+        f"[1:a]volume={voice_volume}[voice_input];"
+        if voice_volume != 1.0
+        else ""
+    )
+    voice_input_label = "voice_input" if voice_volume != 1.0 else "1:a"
+    filter_graph = voice_filter + (
+        f"[{voice_input_label}]asplit=2[voice][sidechain];"
+        f"[2:a]volume={bgm_volume},"
+        f"afade=t=out:st={fade_start}:d={fade_duration}[bgm];"
+        f"[bgm][sidechain]sidechaincompress="
+        f"{_narration_relative_ducking_filter(voice_volume)}[ducked];"
+        f"[voice][ducked]amix=inputs=2:duration=longest:normalize=0,"
+        f"{_AUDIO_PEAK_LIMITER_FILTER}[mixed]"
+    )
+    command = [
+        utils.get_ffmpeg_binary(),
+        "-y",
+        "-i",
+        video_path,
+        "-i",
+        audio_path,
+        "-stream_loop",
+        "-1",
+        "-i",
+        bgm_file,
+        "-filter_complex",
+        filter_graph,
+        "-map",
+        "0:v:0",
+        "-map",
+        "[mixed]",
+        "-c:v",
+        "copy",
+        "-c:a",
+        audio_codec,
+        "-b:a",
+        str(audio_bitrate),
+        "-t",
+        str(video_duration),
+        *_ffmpeg_mp4_faststart_args(output_file),
+        output_file,
+    ]
+    try:
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.debug(f"ffmpeg BGM audio mux fast path unavailable: {str(exc)}")
+        return False
+
+    if result.returncode == 0:
+        return True
+    reason = (result.stderr or result.stdout or "").strip()
+    logger.debug(f"ffmpeg BGM audio mux fast path failed: {reason}")
+    return False
 
 
 def combine_videos(
@@ -905,6 +3078,8 @@ def combine_videos(
     video_transition_mode: VideoTransitionMode = None,
     max_clip_duration: int = 5,
     threads: int = 2,
+    cue_end_times: list[float] | None = None,
+    clip_speed: float = 1.0,
 ) -> str:
     audio_clip = AudioFileClip(audio_file)
     try:
@@ -923,7 +3098,19 @@ def combine_videos(
 
     # 兼容 API 直接调用时未传转场模式的情况，避免后续访问 .value 时崩溃。
     transition_value = getattr(video_transition_mode, "value", video_transition_mode)
+    normalized_clip_speed = utils.normalize_clip_speed(clip_speed)
+    if normalized_clip_speed != 1.0:
+        logger.info(f"clip playback speed: {normalized_clip_speed:.2f}x")
     concat_mode_value = getattr(video_concat_mode, "value", video_concat_mode)
+    is_single_openmontage_story = (
+        len(video_paths) == 1
+        and openmontage_materials.is_openmontage_output_path(video_paths[0])
+    )
+    if is_single_openmontage_story:
+        # This source is already a composed explainer. Splitting it into
+        # generic B-roll windows or fading within a scene makes it worse.
+        transition_value = VideoTransitionMode.none.value
+        logger.info("preserving the single OpenMontage story without transitions")
     output_dir = os.path.dirname(combined_video_path) or "."
 
     aspect = VideoAspect(video_aspect)
@@ -931,23 +3118,88 @@ def combine_videos(
 
     processed_clips = []
     subclipped_items = []
+    all_subclipped_items = []
+    scene_change_times_by_source = {}
     video_duration = 0
+    crossfade_enabled = transition_value == VideoTransitionMode.crossfade.value
+
+    def append_processed_clip(processed_clip: SubClippedVideoClip):
+        nonlocal video_duration
+        previous_clip = processed_clips[-1] if processed_clips else None
+        processed_clips.append(processed_clip)
+        if crossfade_enabled and previous_clip is not None:
+            overlap = _get_effective_crossfade_duration(
+                previous_clip.duration,
+                processed_clip.duration,
+            )
+            video_duration += processed_clip.duration - overlap
+        else:
+            video_duration += processed_clip.duration
+
+    fast_path_available = transition_value in (
+        None,
+        VideoTransitionMode.none.value,
+        VideoTransitionMode.crossfade.value,
+    ) and normalized_clip_speed == 1.0
     for video_path in video_paths:
         clip = _open_video_clip_quietly(video_path)
         clip_duration = clip.duration
         clip_w, clip_h = clip.size
-        close_clip(clip)
+        source_clip_duration_limit = (
+            clip_duration
+            if is_single_openmontage_story
+            else max_clip_duration * normalized_clip_speed
+        )
+        detected_scene_change_times = []
+        if (
+            not is_single_openmontage_story
+            and source_clip_duration_limit > 0
+            and clip_duration > source_clip_duration_limit
+        ):
+            try:
+                detected_scene_change_times = (
+                    video_quality.detect_scene_change_timestamps(video_path) or []
+                )
+            except Exception as exc:
+                logger.debug(f"skipping scene-change detection: {str(exc)}")
+        scene_change_times_by_source[video_path] = detected_scene_change_times
         
         start_time = 0
+        source_subclipped_items = []
 
         while start_time < clip_duration:
-            end_time = min(start_time + max_clip_duration, clip_duration)
+            end_time = min(start_time + source_clip_duration_limit, clip_duration)
+            if end_time < clip_duration:
+                end_time = _scene_aligned_subclip_end_time(
+                    start_time=start_time,
+                    planned_end_time=end_time,
+                    scene_change_times=detected_scene_change_times,
+                    minimum_duration=min(
+                        end_time - start_time,
+                        max(
+                            _CUE_CUT_DYNAMIC_MIN_DURATION_SECONDS,
+                            (end_time - start_time)
+                            * _CUE_CUT_DYNAMIC_MIN_DURATION_RATIO,
+                        ),
+                    ),
+                )
 
             # 保留所有有效分段。
             # 这样既不会丢掉“整段视频本身就短于 max_clip_duration”的素材，
             # 也不会吞掉长视频最后剩下的一小段尾部内容。
             if end_time > start_time:
-                subclipped_items.append(
+                crop_x_ratio, crop_y_ratio = (
+                    _clip_focal_crop_offset_ratios(
+                        clip,
+                        video_width,
+                        video_height,
+                        start_time=start_time,
+                        end_time=end_time,
+                    )
+                    if fast_path_available
+                    else (None, None)
+                )
+                source_subclipped_items.append(
                     SubClippedVideoClip(
                         file_path=video_path,
                         start_time=start_time,
@@ -955,24 +3207,158 @@ def combine_videos(
                         width=clip_w,
                         height=clip_h,
                         source_file_path=video_path,
+                        crop_x_ratio=crop_x_ratio,
+                        crop_y_ratio=crop_y_ratio,
                     )
                 )
 
             start_time = end_time
-            if concat_mode_value == VideoConcatMode.sequential.value:
+            if (
+                not is_single_openmontage_story
+                and concat_mode_value == VideoConcatMode.sequential.value
+                and len(video_paths) > 1
+            ):
                 break
+
+        all_subclipped_items.extend(source_subclipped_items)
+
+        quality_clip = clip
+        try:
+            detected_black_segments = (
+                video_quality.detect_sustained_near_black_segments(video_path)
+            )
+            if detected_black_segments is None:
+                filtered_items = _filter_near_black_subclips(
+                    quality_clip,
+                    source_subclipped_items,
+                    preserve_when_empty=False,
+                )
+            else:
+                filtered_items = _filter_subclips_with_detected_black_segments(
+                    source_subclipped_items,
+                    detected_black_segments,
+                    preserve_when_empty=False,
+                    trim_leading_prefix=not is_single_openmontage_story,
+                )
+        except Exception:
+            filtered_items = source_subclipped_items
+        try:
+            detected_frozen_segments = (
+                video_quality.detect_sustained_frozen_segments(video_path)
+            )
+            if detected_frozen_segments is not None:
+                filtered_items = _filter_subclips_with_detected_segments(
+                    filtered_items,
+                    detected_frozen_segments,
+                    preserve_when_empty=False,
+                    trim_leading_prefix=not is_single_openmontage_story,
+                )
+        except Exception:
+            pass
+        finally:
+            close_clip(quality_clip)
+        subclipped_items.extend(filtered_items)
+
+    if not subclipped_items:
+        subclipped_items = all_subclipped_items
 
     subclipped_items = _prioritize_unique_source_clips(
         subclipped_items=subclipped_items,
         concat_mode=video_concat_mode,
     )
-        
+
+    brightness_adjustments = {}
+    saturation_adjustments = {}
+    warmth_adjustments = {}
+    if fast_path_available:
+        try:
+            brightness_adjustments = _subclip_brightness_adjustments(subclipped_items)
+        except Exception as exc:
+            logger.debug(f"skipping brightness leveling: {str(exc)}")
+        try:
+            saturation_adjustments = _subclip_saturation_adjustments(subclipped_items)
+        except Exception as exc:
+            logger.debug(f"skipping saturation leveling: {str(exc)}")
+        try:
+            warmth_adjustments = _subclip_warmth_adjustments(subclipped_items)
+        except Exception as exc:
+            logger.debug(f"skipping warmth leveling: {str(exc)}")
+
     logger.debug(f"total subclipped items: {len(subclipped_items)}")
     
     # Add downloaded clips over and over until the duration of the audio (max_duration) has been reached
     for i, subclipped_item in enumerate(subclipped_items):
         if video_duration >= required_video_duration:
             break
+
+        preferred_clip_duration = (
+            min(
+                subclipped_item.duration / normalized_clip_speed,
+                required_video_duration,
+            )
+            if is_single_openmontage_story
+            else min(
+                subclipped_item.duration / normalized_clip_speed,
+                max_clip_duration,
+            )
+        )
+        minimum_cue_aligned_duration = min(
+            preferred_clip_duration,
+            max(
+                _CUE_CUT_DYNAMIC_MIN_DURATION_SECONDS,
+                preferred_clip_duration * _CUE_CUT_DYNAMIC_MIN_DURATION_RATIO,
+            ),
+        )
+        if crossfade_enabled and processed_clips:
+            planned_clip_duration = _crossfade_cue_aligned_clip_duration(
+                timeline_duration=video_duration,
+                previous_clip_duration=processed_clips[-1].duration,
+                preferred_clip_duration=preferred_clip_duration,
+                cue_end_times=cue_end_times,
+                minimum_duration=minimum_cue_aligned_duration,
+            )
+        else:
+            planned_clip_duration = _cue_aligned_clip_duration(
+                timeline_start=video_duration,
+                clip_duration=preferred_clip_duration,
+                cue_end_times=cue_end_times,
+                minimum_duration=minimum_cue_aligned_duration,
+            )
+        planned_source_duration = planned_clip_duration * normalized_clip_speed
+        planned_clip_end_time = (
+            subclipped_item.start_time + planned_source_duration
+        )
+        if (
+            planned_clip_duration < preferred_clip_duration
+            and normalized_clip_speed == 1.0
+            and not crossfade_enabled
+            and concat_mode_value != VideoConcatMode.sequential.value
+        ):
+            scene_aligned_end_time = _scene_aligned_subclip_end_time(
+                start_time=subclipped_item.start_time,
+                planned_end_time=planned_clip_end_time,
+                scene_change_times=scene_change_times_by_source.get(
+                    subclipped_item.source_file_path
+                ),
+                minimum_duration=minimum_cue_aligned_duration,
+            )
+            planned_clip_duration = (
+                scene_aligned_end_time - subclipped_item.start_time
+            )
+            planned_source_duration = planned_clip_duration
+            planned_clip_end_time = scene_aligned_end_time
+        brightness_adjustment = brightness_adjustments.get(
+            _subclip_identity(subclipped_item),
+            0.0,
+        )
+        saturation_multiplier = saturation_adjustments.get(
+            _subclip_identity(subclipped_item),
+            1.0,
+        )
+        warmth_adjustment = warmth_adjustments.get(
+            _subclip_identity(subclipped_item),
+            0.0,
+        )
         
         logger.debug(
             f"processing clip {i+1}: {subclipped_item.width}x{subclipped_item.height}, "
@@ -981,11 +3367,41 @@ def combine_videos(
             f"remaining: {required_video_duration - video_duration:.2f}s"
         )
         
+        clip_file = os.path.join(output_dir, f"temp-clip-{i+1}.mp4")
+        if fast_path_available:
+            if _fast_render_clip_with_ffmpeg(
+                input_file=subclipped_item.file_path,
+                output_file=clip_file,
+                start_time=subclipped_item.start_time,
+                duration=planned_source_duration,
+                target_width=video_width,
+                target_height=video_height,
+                threads=threads,
+                brightness_adjustment=brightness_adjustment,
+                saturation_multiplier=saturation_multiplier,
+                warmth_adjustment=warmth_adjustment,
+                crop_x_ratio=subclipped_item.crop_x_ratio,
+                crop_y_ratio=subclipped_item.crop_y_ratio,
+            ):
+                append_processed_clip(
+                    SubClippedVideoClip(
+                        file_path=clip_file,
+                        duration=planned_clip_duration,
+                        width=subclipped_item.width,
+                        height=subclipped_item.height,
+                        source_file_path=subclipped_item.source_file_path,
+                    )
+                )
+                continue
+            fast_path_available = False
+
         clip = None
         try:
             clip = _open_video_clip_quietly(subclipped_item.file_path).subclipped(
-                subclipped_item.start_time, subclipped_item.end_time
+                subclipped_item.start_time, planned_clip_end_time
             )
+            if normalized_clip_speed != 1.0:
+                clip = clip.with_speed_scaled(normalized_clip_speed)
             clip_duration = clip.duration
             # Not all videos are same size, so we need to resize them
             clip_w, clip_h = clip.size
@@ -1006,6 +3422,10 @@ def combine_videos(
                 clip = video_effects.slidein_transition(clip, transition_duration, shuffle_side)
             elif transition_value == VideoTransitionMode.slide_out.value:
                 clip = video_effects.slideout_transition(clip, transition_duration, shuffle_side)
+            elif transition_value == VideoTransitionMode.zoom_in.value:
+                clip = video_effects.zoomin_transition(clip, transition_duration)
+            elif transition_value == VideoTransitionMode.zoom_out.value:
+                clip = video_effects.zoomout_transition(clip, transition_duration)
             elif transition_value == VideoTransitionMode.shuffle.value:
                 transition_funcs = [
                     lambda c: video_effects.fadein_transition(c, transition_duration),
@@ -1016,27 +3436,29 @@ def combine_videos(
                     lambda c: video_effects.slideout_transition(
                         c, transition_duration, shuffle_side
                     ),
+                    lambda c: video_effects.zoomin_transition(c, transition_duration),
+                    lambda c: video_effects.zoomout_transition(c, transition_duration),
                 ]
                 shuffle_transition = random.choice(transition_funcs)
                 clip = shuffle_transition(clip)
 
-            if clip.duration > max_clip_duration:
+            if not is_single_openmontage_story and clip.duration > max_clip_duration:
                 clip = clip.subclipped(0, max_clip_duration)
                 
             # wirte clip to temp file
-            clip_file = os.path.join(output_dir, f"temp-clip-{i+1}.mp4")
             _write_videofile_with_codec_fallback(
                 clip,
                 clip_file,
                 codec=_get_configured_video_codec(),
                 logger=None,
                 fps=_get_configured_video_fps(),
+                threads=threads,
             )
 
             # Store clip duration before closing
             clip_duration_saved = clip.duration
 
-            processed_clips.append(
+            append_processed_clip(
                 SubClippedVideoClip(
                     file_path=clip_file,
                     duration=clip_duration_saved,
@@ -1045,7 +3467,6 @@ def combine_videos(
                     source_file_path=subclipped_item.source_file_path,
                 )
             )
-            video_duration += clip_duration_saved
             
         except Exception as e:
             logger.error(f"failed to process clip: {str(e)}")
@@ -1063,8 +3484,7 @@ def combine_videos(
         for clip in itertools.cycle(base_clips):
             if video_duration >= required_video_duration:
                 break
-            processed_clips.append(clip)
-            video_duration += clip.duration
+            append_processed_clip(clip)
         logger.info(
             f"video duration: {video_duration:.2f}s, audio duration: {audio_duration:.2f}s, "
             f"required duration: {required_video_duration:.2f}s, "
@@ -1087,12 +3507,22 @@ def combine_videos(
 
     clip_files = [clip.file_path for clip in processed_clips]
     logger.info(f"concatenating {len(clip_files)} clips with ffmpeg")
-    concat_video_clips_with_ffmpeg(
-        clip_files=clip_files,
-        output_file=combined_video_path,
-        threads=threads,
-        output_dir=output_dir,
-    )
+    if crossfade_enabled:
+        crossfade_video_clips_with_ffmpeg(
+            clip_files=clip_files,
+            clip_durations=[clip.duration for clip in processed_clips],
+            output_file=combined_video_path,
+            threads=threads,
+            max_duration=required_video_duration,
+        )
+    else:
+        concat_video_clips_with_ffmpeg(
+            clip_files=clip_files,
+            output_file=combined_video_path,
+            threads=threads,
+            output_dir=output_dir,
+            max_duration=required_video_duration,
+        )
     
     # clean temp files
     delete_files(clip_files)
@@ -1251,14 +3681,295 @@ def _get_visible_center_position(
     return x, y
 
 
+def get_subtitle_bottom_safe_margin_ratio(video_aspect) -> float:
+    try:
+        is_portrait = VideoAspect(video_aspect) == VideoAspect.portrait
+    except (TypeError, ValueError):
+        is_portrait = False
+    return (
+        _PORTRAIT_SUBTITLE_BOTTOM_SAFE_MARGIN_RATIO
+        if is_portrait
+        else _DEFAULT_SUBTITLE_BOTTOM_MARGIN_RATIO
+    )
+
+
+def _subtitle_y_within_frame(
+    video_height, subtitle_height, requested_y, margin: float = 10.0
+) -> float:
+    """Keep a subtitle visible even when a caption grows unusually tall."""
+    try:
+        frame_height = float(video_height)
+        caption_height = float(subtitle_height)
+        requested_y = float(requested_y)
+        margin = float(margin)
+    except (TypeError, ValueError):
+        return 0.0
+    if not all(
+        math.isfinite(value)
+        for value in (frame_height, caption_height, requested_y, margin)
+    ):
+        return 0.0
+
+    frame_height = max(0.0, frame_height)
+    caption_height = max(0.0, caption_height)
+    usable_margin = min(max(0.0, margin), max(0.0, (frame_height - caption_height) / 2))
+    max_y = max(usable_margin, frame_height - caption_height - usable_margin)
+    return max(usable_margin, min(requested_y, max_y))
+
+
+def _subtitle_bottom_y(video_height, subtitle_height, video_aspect) -> float:
+    margin_ratio = get_subtitle_bottom_safe_margin_ratio(video_aspect)
+    return _subtitle_y_within_frame(
+        video_height,
+        subtitle_height,
+        video_height * (1 - margin_ratio) - subtitle_height,
+    )
+
+
+def _scene_aligned_subclip_end_time(
+    start_time: float,
+    planned_end_time: float,
+    scene_change_times: list[float] | None,
+    tolerance_seconds: float = _SCENE_CUT_ALIGNMENT_TOLERANCE_SECONDS,
+    minimum_duration: float | None = None,
+) -> float:
+    """Use the nearest safe source-scene boundary around a planned B-roll cut."""
+    try:
+        start_time = float(start_time)
+        planned_end_time = float(planned_end_time)
+        tolerance_seconds = float(tolerance_seconds)
+    except (TypeError, ValueError):
+        return planned_end_time
+    if (
+        planned_end_time <= start_time
+        or tolerance_seconds <= 0
+        or not scene_change_times
+    ):
+        return planned_end_time
+
+    if minimum_duration is None:
+        earliest_end_time = start_time
+    else:
+        try:
+            minimum_duration = float(minimum_duration)
+        except (TypeError, ValueError):
+            return planned_end_time
+        earliest_end_time = start_time + min(
+            planned_end_time - start_time,
+            max(0.0, minimum_duration),
+        )
+
+    matching_scene_changes = []
+    for scene_change_time in scene_change_times:
+        try:
+            scene_change_time = float(scene_change_time)
+        except (TypeError, ValueError):
+            continue
+        if (
+            earliest_end_time <= scene_change_time <= planned_end_time
+            and scene_change_time >= planned_end_time - tolerance_seconds
+        ):
+            matching_scene_changes.append(scene_change_time)
+    if not matching_scene_changes:
+        return planned_end_time
+    return min(
+        matching_scene_changes,
+        key=lambda scene_change_time: (
+            abs(scene_change_time - planned_end_time),
+            scene_change_time,
+        ),
+    )
+
+
+def _cue_aligned_clip_duration(
+    timeline_start: float,
+    clip_duration: float,
+    cue_end_times: list[float] | None,
+    tolerance_seconds: float = _CUE_CUT_ALIGNMENT_TOLERANCE_SECONDS,
+    minimum_duration: float | None = None,
+) -> float:
+    """Align a B-roll cut to a nearby or safely earlier subtitle cue end."""
+    try:
+        timeline_start = float(timeline_start)
+        clip_duration = float(clip_duration)
+        tolerance_seconds = float(tolerance_seconds)
+    except (TypeError, ValueError):
+        return clip_duration
+    if clip_duration <= 0 or tolerance_seconds <= 0 or not cue_end_times:
+        return clip_duration
+
+    planned_cut = timeline_start + clip_duration
+    if minimum_duration is None:
+        earliest_cut = planned_cut - tolerance_seconds
+    else:
+        try:
+            minimum_duration = float(minimum_duration)
+        except (TypeError, ValueError):
+            return clip_duration
+        earliest_cut = timeline_start + min(
+            clip_duration,
+            max(0.0, minimum_duration),
+        )
+    matching_cuts = []
+    for cue_end_time in cue_end_times:
+        try:
+            cue_end_time = float(cue_end_time)
+        except (TypeError, ValueError):
+            continue
+        if timeline_start < cue_end_time <= planned_cut and cue_end_time >= earliest_cut:
+            matching_cuts.append(cue_end_time)
+    if not matching_cuts:
+        return clip_duration
+    return max(matching_cuts) - timeline_start
+
+
+def _crossfade_cue_aligned_clip_duration(
+    timeline_duration: float,
+    previous_clip_duration: float,
+    preferred_clip_duration: float,
+    cue_end_times: list[float] | None,
+    minimum_duration: float | None = None,
+) -> float:
+    """Align a crossfaded clip end to a cue using its actual overlap."""
+    try:
+        timeline_duration = float(timeline_duration)
+        previous_clip_duration = float(previous_clip_duration)
+        preferred_clip_duration = float(preferred_clip_duration)
+    except (TypeError, ValueError):
+        return preferred_clip_duration
+    if (
+        not math.isfinite(timeline_duration)
+        or not math.isfinite(previous_clip_duration)
+        or not math.isfinite(preferred_clip_duration)
+        or preferred_clip_duration <= 0
+        or not cue_end_times
+    ):
+        return preferred_clip_duration
+
+    if minimum_duration is None:
+        minimum_duration = 0.0
+    else:
+        try:
+            minimum_duration = float(minimum_duration)
+        except (TypeError, ValueError):
+            return preferred_clip_duration
+    minimum_duration = min(
+        preferred_clip_duration,
+        max(0.0, minimum_duration),
+    )
+    max_overlap = min(
+        _DEFAULT_CROSSFADE_DURATION,
+        max(0.0, previous_clip_duration) / 2,
+    )
+    candidates = []
+    for cue_end_time in cue_end_times:
+        try:
+            cue_end_time = float(cue_end_time)
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(cue_end_time):
+            continue
+
+        short_duration = 2 * (cue_end_time - timeline_duration)
+        if (
+            minimum_duration <= short_duration <= preferred_clip_duration
+            and short_duration <= 2 * max_overlap
+        ):
+            candidates.append((cue_end_time, short_duration))
+
+        long_duration = cue_end_time - timeline_duration + max_overlap
+        if (
+            minimum_duration <= long_duration <= preferred_clip_duration
+            and long_duration >= 2 * max_overlap
+        ):
+            candidates.append((cue_end_time, long_duration))
+
+    if not candidates:
+        return preferred_clip_duration
+    return max(candidates, key=lambda candidate: candidate[0])[1]
+
+
+def _video_clip_matches_target_resolution(
+    video_clip,
+    target_width: int,
+    target_height: int,
+) -> bool:
+    """Require the source clip to have the requested frame before stream copy."""
+    try:
+        width, height = (int(value) for value in getattr(video_clip, "size", ()))
+    except (TypeError, ValueError):
+        return False
+    return (width, height) == (int(target_width), int(target_height))
+
+
+def subtitle_colors_are_indistinguishable(params: VideoParams) -> bool:
+    """判断字幕文字和背景是否同色，提醒用户可能无法看清字幕。"""
+    if not params.subtitle_enabled or not params.text_background_color:
+        return False
+
+    def normalize_color(value):
+        if isinstance(value, bool):
+            return "#000000" if value else ""
+        return str(value or "").strip().lower()
+
+    text_color = normalize_color(params.text_fore_color)
+    background_color = normalize_color(params.text_background_color)
+    return bool(text_color and text_color == background_color)
+
+
+@lru_cache(maxsize=64)
+def _subtitle_font_supports_sample(font_path: str, sample: str) -> bool:
+    """检查字体是否包含样本文字需要的字形，并缓存重复检查结果。"""
+    try:
+        font = ImageFont.truetype(font_path, 30)
+        missing_mask = font.getmask("\U0010ffff")
+        missing_signature = (
+            missing_mask.size,
+            missing_mask.getbbox(),
+            bytes(missing_mask),
+        )
+        for char in sample:
+            char_mask = font.getmask(char)
+            char_signature = (
+                char_mask.size,
+                char_mask.getbbox(),
+                bytes(char_mask),
+            )
+            if char_mask.getbbox() is None or char_signature == missing_signature:
+                return False
+        return True
+    except Exception as e:
+        # 字体探测失败不应阻止用户生成；保留日志供环境兼容问题排查。
+        logger.warning(f"failed to inspect subtitle font glyphs: {font_path}, {e}")
+        return True
+
+
+def subtitle_font_supports_text(font_path: str, text: str) -> bool:
+    """检查字体能否绘制文本中的字母和数字，忽略空白及标点符号。"""
+    sample = "".join(
+        dict.fromkeys(
+            char
+            for char in str(text or "")
+            if unicodedata.category(char)[0] in {"L", "N"}
+        )
+    )[:64]
+    if not sample:
+        return True
+    return _subtitle_font_supports_sample(font_path, sample)
+
+
 def generate_video(
     video_path: str,
     audio_path: str,
     subtitle_path: str,
     output_file: str,
     params: VideoParams,
+    video_aspect: VideoAspect | None = None,
+    return_encoder_result: bool = False,
+    prefer_ffmpeg_srt_subtitles: bool = True,
+    bgm_file_override: str | None = None,
 ):
-    aspect = VideoAspect(params.video_aspect)
+    aspect = video_aspect or VideoAspect(params.video_aspect)
     video_width, video_height = aspect.to_resolution()
 
     logger.info(f"generating video: {video_width} x {video_height}")
@@ -1272,6 +3983,7 @@ def generate_video(
     # write into the same directory as the output file
     output_dir = os.path.dirname(output_file) or "."
     ass_subtitle_path = ""
+    ffmpeg_srt_subtitle_path = ""
     srt_fallback_subtitle_path = ""
     moviepy_subtitle_path = subtitle_path
     moviepy_output_file = output_file
@@ -1293,6 +4005,17 @@ def generate_video(
             font_path = font_path.replace("\\", "/")
 
         logger.info(f"  ⑤ font: {font_path}")
+
+    if (
+        prefer_ffmpeg_srt_subtitles
+        and moviepy_subtitle_path
+        and moviepy_subtitle_path.lower().endswith(".srt")
+        and _srt_subtitle_ffmpeg_supported(params)
+    ):
+        ffmpeg_srt_subtitle_path = moviepy_subtitle_path
+        moviepy_subtitle_path = ""
+        output_root, output_ext = os.path.splitext(output_file)
+        moviepy_output_file = f"{output_root}.nosub{output_ext or '.mp4'}"
 
     def resolve_subtitle_background_color():
         # 兼容历史参数：API 里 `text_background_color` 既可能是布尔值，
@@ -1432,29 +4155,123 @@ def generate_video(
         _clip = _clip.with_end(subtitle_item[0][1])
         _clip = _clip.with_duration(duration)
         if params.subtitle_position == "bottom":
-            _clip = _clip.with_position(("center", video_height * 0.95 - _clip.h))
+            _clip = _clip.with_position(
+                ("center", _subtitle_bottom_y(video_height, _clip.h, aspect))
+            )
         elif params.subtitle_position == "top":
-            _clip = _clip.with_position(("center", video_height * 0.05))
+            _clip = _clip.with_position(
+                ("center", _subtitle_y_within_frame(video_height, _clip.h, video_height * 0.05))
+            )
         elif params.subtitle_position == "custom":
-            # Ensure the subtitle is fully within the screen bounds
-            margin = 10  # Additional margin, in pixels
-            max_y = video_height - _clip.h - margin
-            min_y = margin
             custom_y = (video_height - _clip.h) * (params.custom_position / 100)
-            custom_y = max(
-                min_y, min(custom_y, max_y)
-            )  # Constrain the y value within the valid range
-            _clip = _clip.with_position(("center", custom_y))
+            _clip = _clip.with_position(
+                ("center", _subtitle_y_within_frame(video_height, _clip.h, custom_y))
+            )
         else:  # center
-            _clip = _clip.with_position(("center", "center"))
+            _clip = _clip.with_position(
+                (
+                    "center",
+                    _subtitle_y_within_frame(
+                        video_height,
+                        _clip.h,
+                        (video_height - _clip.h) / 2,
+                    ),
+                )
+            )
         return _clip
 
-    video_clip = None
-    try:
-        video_clip = _open_video_clip_quietly(video_path)
-        audio_clip = AudioFileClip(audio_path).with_effects(
-            [afx.MultiplyVolume(params.voice_volume)]
+    configured_codec = _get_configured_video_codec()
+    bgm_enabled = bgm_service.should_use_bgm(params.bgm_type, params.bgm_volume)
+    if not bgm_enabled and params.bgm_type:
+        logger.info(
+            "skipping background music because volume is not positive: "
+            f"type={params.bgm_type}, volume={params.bgm_volume}"
         )
+    bgm_file = ""
+    if bgm_enabled:
+        bgm_file = (
+            bgm_file_override
+            if bgm_file_override is not None
+            else get_bgm_file(bgm_type=params.bgm_type, bgm_file=params.bgm_file)
+        )
+    bgm_mix_succeeded = True
+
+    def encoder_result(used_codec: str) -> dict:
+        result = _video_encoder_result(configured_codec, used_codec)
+        result["bgm_mix_succeeded"] = bgm_mix_succeeded
+        return result
+    try:
+        # ASS and visually compatible classic SRT subtitles are burned in a
+        # later FFmpeg pass. MoviePy remains the fallback for complex SRT styles.
+        voice_volume = float(params.voice_volume)
+        use_fast_audio_mux = (
+            not moviepy_subtitle_path
+            and math.isfinite(voice_volume)
+        )
+    except (TypeError, ValueError):
+        voice_volume = 1.0
+        use_fast_audio_mux = False
+    used_codec = ""
+    source_video_clip = None
+    video_clip = None
+    voice_source_clip = None
+    bgm_source_clip = None
+    composite_audio_clip = None
+    subtitle_clip = None
+    text_clips = []
+    try:
+        source_video_clip = _open_video_clip_quietly(video_path)
+        video_clip = source_video_clip
+        voice_source_clip = AudioFileClip(audio_path)
+        audio_clip = voice_source_clip
+        try:
+            audio_duration = float(getattr(audio_clip, "duration", 0) or 0)
+            video_duration = float(getattr(video_clip, "duration", 0) or 0)
+        except (TypeError, ValueError):
+            audio_duration = 0
+            video_duration = 0
+        fast_audio_muxed = False
+        fast_audio_mux_candidate = use_fast_audio_mux and 0 < audio_duration <= video_duration
+        if fast_audio_mux_candidate and not _video_clip_matches_target_resolution(
+            video_clip,
+            video_width,
+            video_height,
+        ):
+            logger.debug(
+                "ffmpeg audio mux fast path skipped because source resolution does not match the requested output"
+            )
+        elif fast_audio_mux_candidate:
+            if bgm_file:
+                fast_audio_muxed = _fast_mux_video_with_audio_and_bgm(
+                    video_path=video_path,
+                    audio_path=audio_path,
+                    bgm_file=bgm_file,
+                    output_file=moviepy_output_file,
+                    video_duration=video_duration,
+                    audio_bitrate=_get_configured_audio_bitrate(),
+                    bgm_volume=params.bgm_volume,
+                    voice_volume=voice_volume,
+                )
+            else:
+                fast_audio_muxed = _fast_mux_video_with_audio(
+                    video_path=video_path,
+                    audio_path=audio_path,
+                    output_file=moviepy_output_file,
+                    video_duration=video_duration,
+                    audio_bitrate=_get_configured_audio_bitrate(),
+                    voice_volume=voice_volume,
+                )
+        if fast_audio_muxed:
+            used_codec = _get_effective_video_codec(configured_codec)
+            if not ass_subtitle_path and not ffmpeg_srt_subtitle_path:
+                if return_encoder_result:
+                    return encoder_result(used_codec)
+                return bgm_mix_succeeded
+
+        if not fast_audio_muxed:
+            audio_clip = audio_clip.with_effects(
+                [afx.MultiplyVolume(params.voice_volume)]
+            )
 
         def make_textclip(text):
             return TextClip(
@@ -1464,63 +4281,92 @@ def generate_video(
             )
 
         if moviepy_subtitle_path and os.path.exists(moviepy_subtitle_path):
-            sub = SubtitlesClip(
+            subtitle_clip = SubtitlesClip(
                 subtitles=moviepy_subtitle_path,
                 encoding="utf-8",
                 make_textclip=make_textclip,
             )
-            text_clips = []
-            for item in sub.subtitles:
+            for item in subtitle_clip.subtitles:
                 clip = create_text_clip(subtitle_item=item)
                 text_clips.append(clip)
             video_clip = CompositeVideoClip([video_clip, *text_clips])
 
-        bgm_file = get_bgm_file(bgm_type=params.bgm_type, bgm_file=params.bgm_file)
-        if bgm_file:
+        if not fast_audio_muxed and bgm_file:
             try:
-                bgm_clip = AudioFileClip(bgm_file).with_effects(
-                    [
-                        afx.MultiplyVolume(params.bgm_volume),
-                        afx.AudioFadeOut(3),
-                        afx.AudioLoop(duration=video_clip.duration),
-                    ]
+                bgm_effects = [
+                    afx.MultiplyVolume(
+                        _narration_ducked_bgm_volume(params.bgm_volume)
+                    ),
+                    afx.AudioFadeOut(3),
+                ]
+                if bgm_file_override is None:
+                    bgm_effects.append(afx.AudioLoop(duration=video_clip.duration))
+                bgm_source_clip = AudioFileClip(bgm_file)
+                bgm_clip = bgm_source_clip.with_effects(bgm_effects)
+                composite_audio_clip = CompositeAudioClip([audio_clip, bgm_clip])
+                audio_clip = composite_audio_clip
+            except Exception:
+                bgm_mix_succeeded = False
+                logger.exception(
+                    f"failed to mix background music: type={params.bgm_type}, "
+                    f"file={bgm_file}"
                 )
-                audio_clip = CompositeAudioClip([audio_clip, bgm_clip])
-            except Exception as e:
-                logger.error(f"failed to add bgm: {str(e)}")
 
-        video_clip = video_clip.with_audio(audio_clip)
+        if not fast_audio_muxed:
+            video_clip = video_clip.with_audio(audio_clip)
         # 显式沿用输入音频的采样率；如果取不到，再回退到 MoviePy 默认的 44100Hz。
         # 这样可以减少不同运行环境，尤其是 Docker 环境中再次重采样带来的音质波动。
-        output_audio_fps = int(getattr(audio_clip, "fps", 0) or 44100)
-        _write_videofile_with_codec_fallback(
-            video_clip,
-            output_file=moviepy_output_file,
-            codec=_get_configured_video_codec(),
-            audio_codec=audio_codec,
-            audio_fps=output_audio_fps,
-            audio_bitrate=_get_configured_audio_bitrate(),
-            temp_audiofile_path=_get_temp_audio_dir(output_dir),
-            threads=params.n_threads or 2,
-            logger=None,
-            fps=_get_configured_video_fps(),
-        )
+        if not fast_audio_muxed:
+            output_audio_fps = int(getattr(audio_clip, "fps", 0) or 44100)
+            output_audio_bitrate = _get_configured_audio_bitrate()
+            used_codec = _write_videofile_with_codec_fallback(
+                video_clip,
+                output_file=moviepy_output_file,
+                codec=configured_codec,
+                audio_codec=audio_codec,
+                audio_fps=output_audio_fps,
+                audio_bitrate=output_audio_bitrate,
+                temp_audiofile_path=_get_temp_audio_dir(output_dir),
+                threads=params.n_threads or 2,
+                logger=None,
+                fps=_get_configured_video_fps(),
+            )
+            if not _limit_rendered_audio_peaks_with_ffmpeg(
+                moviepy_output_file,
+                audio_bitrate=output_audio_bitrate,
+            ):
+                logger.debug("kept MoviePy audio output without post-render limiting")
     finally:
-        if video_clip is not None:
-            video_clip.close()
-            video_clip = None
+        closed_clip_ids = set()
+        for managed_clip in (
+            video_clip,
+            source_video_clip,
+            composite_audio_clip,
+            bgm_source_clip,
+            voice_source_clip,
+            subtitle_clip,
+            *text_clips,
+        ):
+            if (
+                managed_clip is not None
+                and id(managed_clip) not in closed_clip_ids
+            ):
+                close_clip(managed_clip)
+                closed_clip_ids.add(id(managed_clip))
 
     if ass_subtitle_path:
-        burned = _burn_ass_subtitles_with_ffmpeg(
+        burned_codec = _burn_ass_subtitles_with_ffmpeg(
             input_file=moviepy_output_file,
             subtitle_file=ass_subtitle_path,
             output_file=output_file,
             threads=params.n_threads,
         )
-        if burned:
+        if burned_codec:
             if moviepy_output_file != output_file and os.path.exists(moviepy_output_file):
                 os.remove(moviepy_output_file)
-            return
+            if return_encoder_result:
+                return encoder_result(burned_codec)
+            return bgm_mix_succeeded
 
         if srt_fallback_subtitle_path:
             logger.warning("ASS subtitle burn-in failed, fallback to SRT subtitles")
@@ -1532,14 +4378,60 @@ def generate_video(
                 subtitle_path=srt_fallback_subtitle_path,
                 output_file=output_file,
                 params=params,
+                video_aspect=video_aspect,
+                return_encoder_result=return_encoder_result,
+                prefer_ffmpeg_srt_subtitles=False,
+                bgm_file_override=bgm_file_override,
             )
 
         logger.warning("ASS subtitle burn-in failed, keeping video without subtitles")
         if moviepy_output_file != output_file and os.path.exists(moviepy_output_file):
             os.replace(moviepy_output_file, output_file)
 
+    if ffmpeg_srt_subtitle_path:
+        burned_codec = _burn_srt_subtitles_with_ffmpeg(
+            input_file=moviepy_output_file,
+            subtitle_file=ffmpeg_srt_subtitle_path,
+            output_file=output_file,
+            params=params,
+            video_width=video_width,
+            video_height=video_height,
+            video_aspect=aspect,
+            font_path=font_path,
+            threads=params.n_threads,
+        )
+        if burned_codec:
+            if moviepy_output_file != output_file and os.path.exists(moviepy_output_file):
+                os.remove(moviepy_output_file)
+            if return_encoder_result:
+                return encoder_result(burned_codec)
+            return bgm_mix_succeeded
 
-def preprocess_video(materials: List[MaterialInfo], clip_duration=4):
+        logger.warning("SRT subtitle burn-in failed, fallback to MoviePy subtitles")
+        if moviepy_output_file != output_file and os.path.exists(moviepy_output_file):
+            os.remove(moviepy_output_file)
+        return generate_video(
+            video_path=video_path,
+            audio_path=audio_path,
+            subtitle_path=ffmpeg_srt_subtitle_path,
+            output_file=output_file,
+            params=params,
+            video_aspect=video_aspect,
+            return_encoder_result=return_encoder_result,
+            prefer_ffmpeg_srt_subtitles=False,
+            bgm_file_override=bgm_file_override,
+        )
+
+    if return_encoder_result:
+        return encoder_result(used_codec)
+    return bgm_mix_succeeded
+
+
+def preprocess_video(
+    materials: List[MaterialInfo],
+    clip_duration=4,
+    video_aspect: VideoAspect | str | None = None,
+):
     # WebUI 在某些二次生成场景下可能传入空素材列表，这里直接返回空结果，避免抛出 NoneType 异常。
     if not materials:
         return []
@@ -1547,12 +4439,25 @@ def preprocess_video(materials: List[MaterialInfo], clip_duration=4):
     # 仅返回通过预处理校验的素材，避免低分辨率图片继续进入后续的视频合成流程。
     valid_materials = []
     seen_material_paths = set()
+    target_image_width = None
+    target_image_height = None
+    if video_aspect is not None:
+        try:
+            target_image_width, target_image_height = VideoAspect(
+                video_aspect
+            ).to_resolution()
+        except (TypeError, ValueError):
+            target_image_width = None
+            target_image_height = None
     local_videos_dir = utils.storage_dir("local_videos", create=True)
 
     for material in materials:
         if not material.url:
             continue
 
+        is_openmontage_output = openmontage_materials.is_openmontage_output_path(
+            material.url
+        )
         try:
             material_source_path = file_security.resolve_path_within_directory(
                 local_videos_dir, material.url
@@ -1561,11 +4466,32 @@ def preprocess_video(materials: List[MaterialInfo], clip_duration=4):
             # local video_source 的素材路径来自 API 参数，必须限制在专用素材目录。
             # 允许用户传文件名，也兼容历史返回的绝对路径，但不允许逃逸到系统
             # 其他目录，避免任意文件读取或通过 MoviePy 探测本地敏感文件。
-            logger.warning(
-                f"skip unsafe local material: {material.url}, "
-                f"local_videos_dir: {local_videos_dir}, error: {str(exc)}"
+            if not is_openmontage_output:
+                logger.warning(
+                    f"skip unsafe local material: {material.url}, "
+                    f"local_videos_dir: {local_videos_dir}, error: {str(exc)}"
+                )
+                continue
+            material_source_path = os.path.realpath(material.url)
+            logger.info(f"using bundled OpenMontage material: {material_source_path}")
+
+        if is_openmontage_output and video_aspect is not None:
+            output_report = openmontage_materials.validate_openmontage_output(
+                material_source_path,
+                video_aspect=video_aspect,
             )
-            continue
+            if not isinstance(output_report, dict) or not output_report.get("valid"):
+                issue_codes = (
+                    ", ".join(output_report.get("issues", []))
+                    if isinstance(output_report, dict)
+                    else "validation_unavailable"
+                )
+                logger.warning(
+                    "skip OpenMontage material without a native {} render: {}",
+                    getattr(video_aspect, "value", video_aspect),
+                    issue_codes,
+                )
+                continue
 
         material_source_key = _source_file_key(material_source_path)
         if material_source_key in seen_material_paths:
@@ -1573,16 +4499,26 @@ def preprocess_video(materials: List[MaterialInfo], clip_duration=4):
         seen_material_paths.add(material_source_key)
 
         ext = utils.parse_extension(material_source_path)
+        clip = None
+        image_size = None
+        image_focal_x_ratio = None
+        image_focal_y_ratio = None
         try:
             # 图片素材直接按图片方式读取，避免先走 VideoFileClip 误判后触发不稳定的回退分支。
             if ext in const.FILE_TYPE_IMAGES:
-                clip, material_source_path = _open_image_clip_with_fallback(
-                    material_source_path
-                )
+                with Image.open(material_source_path) as image:
+                    image_size = image.size
+                    image_focal_x_ratio, image_focal_y_ratio = _image_focal_ratios(
+                        image
+                    )
             else:
                 clip = _open_video_clip_quietly(material_source_path)
-        except Exception:
+        except Exception as exc:
             # 非标准扩展名或探测失败时再回退到图片模式，兼容历史上直接传本地图片路径的情况。
+            logger.warning(
+                f"failed to open local material as video, trying image fallback: "
+                f"{material_source_path}, error: {str(exc)}"
+            )
             try:
                 clip, material_source_path = _open_image_clip_with_fallback(
                     material_source_path
@@ -1593,10 +4529,17 @@ def preprocess_video(materials: List[MaterialInfo], clip_duration=4):
                 )
                 continue
         try:
-            width = clip.size[0]
-            height = clip.size[1]
-            if width < 480 or height < 480:
-                logger.warning(f"low resolution material: {width}x{height}, minimum 480x480 required")
+            if image_size is not None:
+                width, height = image_size
+            else:
+                width = clip.size[0]
+                height = clip.size[1]
+            if not is_material_resolution_acceptable(width, height):
+                logger.warning(
+                    f"low resolution material: {width}x{height}, minimum "
+                    f"{_MIN_MATERIAL_DIMENSION}x{_MIN_MATERIAL_DIMENSION} required "
+                    f"(tolerance {_MIN_DIMENSION_TOLERANCE}px)"
+                )
                 # 探测到低分辨率素材后立即关闭资源，并且不要把该素材返回给后续流程。
                 close_clip(clip)
                 continue
@@ -1607,6 +4550,22 @@ def preprocess_video(materials: List[MaterialInfo], clip_duration=4):
                 close_clip(clip)
                 clip = None
                 final_clip = None
+                video_file = f"{material_source_path}.mp4"
+                if _fast_render_image_with_ffmpeg(
+                    input_file=material_source_path,
+                    output_file=video_file,
+                    width=width,
+                    height=height,
+                    duration=clip_duration,
+                    focal_x_ratio=image_focal_x_ratio,
+                    focal_y_ratio=image_focal_y_ratio,
+                    target_width=target_image_width,
+                    target_height=target_image_height,
+                ):
+                    material.url = video_file
+                    logger.success(f"image processed: {video_file}")
+                    valid_materials.append(material)
+                    continue
                 try:
                     # Create an image clip and set its duration to 3 seconds
                     clip = (
@@ -1632,7 +4591,6 @@ def preprocess_video(materials: List[MaterialInfo], clip_duration=4):
                     )
 
                     # Output the video to a file.
-                    video_file = f"{material_source_path}.mp4"
                     _write_videofile_with_codec_fallback(
                         final_clip,
                         output_file=video_file,
@@ -1653,7 +4611,11 @@ def preprocess_video(materials: List[MaterialInfo], clip_duration=4):
                 # Update url to the resolved absolute path so that downstream
                 # stages (combine_videos) can open the file without re-resolving.
                 material.url = material_source_path
-        except Exception:
+        except Exception as exc:
+            logger.warning(
+                f"failed to validate local material, closing clip: "
+                f"{material_source_path}, error: {str(exc)}"
+            )
             close_clip(clip)
             raise
 

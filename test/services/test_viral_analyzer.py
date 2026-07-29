@@ -18,6 +18,7 @@ class TestViralAnalyzer(unittest.TestCase):
           "hook_suggestions": ["Open with the surprising number."],
           "title_variants": ["The coffee mistake everyone makes"],
           "thumbnail_concepts": ["Cup close-up with bold mistake text"],
+          "thumbnail_timestamps": [0.75, 3.5, "invalid"],
           "warnings": [],
           "platform_fit": {"tiktok": 0.9, "youtube_shorts": 82}
         }
@@ -39,6 +40,7 @@ class TestViralAnalyzer(unittest.TestCase):
         self.assertEqual(
             result["title_variants"], ["The coffee mistake everyone makes"]
         )
+        self.assertEqual(result["thumbnail_timestamps"], [0.75, 3.5])
 
     def test_analyze_viral_potential_falls_back_when_llm_unavailable(self):
         with patch.object(
@@ -59,7 +61,36 @@ class TestViralAnalyzer(unittest.TestCase):
         self.assertLessEqual(result["overall_score"], 100)
         self.assertTrue(result["hook_suggestions"])
         self.assertTrue(result["title_variants"])
+        self.assertEqual(result["thumbnail_timestamps"], [])
         self.assertIn("instagram_reels", result["platform_fit"])
+
+    def test_analyze_viral_potential_ignores_thumbnail_timestamps_past_video_duration(self):
+        payload = """
+        {
+          "overall_score": 80,
+          "hook_score": 75,
+          "pacing_score": 70,
+          "retention_curve": "strong",
+          "emotional_arc": "crescendo",
+          "summary": "A concise review.",
+          "hook_suggestions": ["Lead with the payoff."],
+          "title_variants": ["A useful title"],
+          "thumbnail_concepts": ["A clear visual"],
+          "thumbnail_timestamps": [0.75, 8, 13],
+          "warnings": [],
+          "platform_fit": {"tiktok": 0.9}
+        }
+        """
+
+        with patch.object(viral_analyzer.llm, "_generate_response", return_value=payload):
+            result = viral_analyzer.analyze_viral_potential(
+                video_subject="Duration-aware thumbnail",
+                video_script="A short script.",
+                video_duration_sec=12.5,
+                target_platforms=["tiktok"],
+            )
+
+        self.assertEqual(result["thumbnail_timestamps"], [0.75, 8.0])
 
     def test_fallback_accepts_turkish_diacritic_cta(self):
         with patch.object(
@@ -119,6 +150,14 @@ class TestViralAnalyzer(unittest.TestCase):
         self.assertIn("Hashtags: #budget #money", prompt)
         self.assertIn("Budget image", prompt)
         self.assertIn("CC BY-SA", prompt)
+
+    def test_build_prompt_bounds_thumbnail_timestamps_when_duration_is_known(self):
+        prompt = viral_analyzer.build_viral_analysis_prompt(
+            video_subject="Budget planning",
+            video_duration_sec=12.5,
+        )
+
+        self.assertIn("between 0 and 12.5 seconds", prompt)
 
 
 if __name__ == "__main__":

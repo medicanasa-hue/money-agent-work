@@ -1,56 +1,101 @@
 import os
+import re
 import sys
 
 from loguru import logger
 
 from app.config import config
 from app.utils import utils
+from app.utils.logging_utils import configure_terminal_logger, format_log_record
+
+
+DEFAULT_LOG_RETENTION_DAYS = 14
+MAX_LOG_RETENTION_DAYS = 365
+_QUERY_SECRET_PATTERN = re.compile(
+    r"([?&](?:api[_-]?key|token|secret|password)=)[^&\s]+",
+    re.IGNORECASE,
+)
+_AUTHORIZATION_PATTERN = re.compile(
+    r"\b(authorization)\s*[:=]\s*(?:(?:bearer|apikey)\s+)?[^\s,;]+",
+    re.IGNORECASE,
+)
+_AUTH_SCHEME_PATTERN = re.compile(r"\b(bearer|apikey)\s+[^\s,;]+", re.IGNORECASE)
+_SECRET_ASSIGNMENT_PATTERN = re.compile(
+    r"\b(api[_-]?key|access[_-]?token|token|secret|password)\s*([:=])\s*[^\s,;]+",
+    re.IGNORECASE,
+)
+
+
+def redact_log_message(value: object) -> str:
+    """Strip common credentials from text before writing it to any log sink."""
+    message = str(value or "")
+    message = _QUERY_SECRET_PATTERN.sub(r"\1<redacted>", message)
+    message = _AUTHORIZATION_PATTERN.sub(r"\1: <redacted>", message)
+    message = _AUTH_SCHEME_PATTERN.sub(r"\1 <redacted>", message)
+    return _SECRET_ASSIGNMENT_PATTERN.sub(r"\1\2<redacted>", message)
+
+
+def normalized_log_retention_days(value: object) -> int:
+    try:
+        days = int(value)
+    except (TypeError, ValueError):
+        return DEFAULT_LOG_RETENTION_DAYS
+    return min(MAX_LOG_RETENTION_DAYS, max(1, days))
+
+
+def daily_log_file_path(log_dir: str) -> str:
+    return os.path.join(str(log_dir), "server_{time:YYYY-MM-DD}.log")
+
+
+def _redact_log_record(record) -> bool:
+    record["message"] = redact_log_message(record["message"])
+    return True
+
+
+def _config_bool(value: object, default: bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().casefold()
+        if normalized in {"true", "1", "yes", "on"}:
+            return True
+        if normalized in {"false", "0", "no", "off"}:
+            return False
+    return default
 
 
 def __init_logger():
-    # _log_file = utils.storage_dir("logs/server.log")
     _lvl = config.log_level
-    root_dir = os.path.dirname(
-        os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
-    )
 
-    def format_record(record):
-        # 获取日志记录中的文件全路径
-        file_path = record["file"].path
-        # 将绝对路径转换为相对于项目根目录的路径
-        relative_path = os.path.relpath(file_path, root_dir)
-        # 更新记录中的文件路径
-        record["file"].path = f"./{relative_path}"
-        # 返回修改后的格式字符串
-        # 您可以根据需要调整这里的格式
-        _format = (
-            "<green>{time:%Y-%m-%d %H:%M:%S}</> | "
-            + "<level>{level}</> | "
-            + '"{file.path}:{line}":<blue> {function}</> '
-            + "- <level>{message}</>"
-            + "\n"
-        )
-        return _format
-
-    logger.remove()
-
-    logger.add(
+    configure_terminal_logger(
         sys.stdout,
         level=_lvl,
-        format=format_record,
         colorize=True,
+        filter=_redact_log_record,
     )
 
-    # logger.add(
-    #     _log_file,
-    #     level=_lvl,
-    #     format=format_record,
-    #     rotation="00:00",
-    #     retention="3 days",
-    #     backtrace=True,
-    #     diagnose=True,
-    #     enqueue=True,
-    # )
+    if not _config_bool(config.app.get("log_file_enabled", True), True):
+        return
+
+    try:
+        log_dir = utils.storage_dir("logs", create=True)
+        retention_days = normalized_log_retention_days(
+            config.app.get("log_retention_days", DEFAULT_LOG_RETENTION_DAYS)
+        )
+        logger.add(
+            daily_log_file_path(log_dir),
+            level=_lvl,
+            format=format_log_record,
+            rotation="00:00",
+            retention=f"{retention_days} days",
+            encoding="utf-8",
+            backtrace=False,
+            diagnose=False,
+            enqueue=True,
+            filter=_redact_log_record,
+        )
+    except Exception:
+        logger.warning("File logging could not be configured.")
 
 
 __init_logger()

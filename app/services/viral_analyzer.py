@@ -1,4 +1,5 @@
 import json
+import math
 import re
 from typing import Any
 
@@ -13,6 +14,7 @@ MAX_ANALYSIS_SCRIPT_LENGTH = 8000
 MAX_ANALYSIS_TITLE_LENGTH = 200
 MAX_ANALYSIS_LANGUAGE_LENGTH = 64
 MAX_ANALYSIS_CONTEXT_LENGTH = 500
+MAX_THUMBNAIL_TIMESTAMP_SECONDS = 600.0
 
 
 def _clamp_text(value: Any, max_length: int) -> str:
@@ -52,6 +54,52 @@ def _normalize_string_list(value: Any, limit: int = 5, max_length: int = 140) ->
             continue
         seen.add(key)
         result.append(text)
+        if len(result) >= limit:
+            break
+    return result
+
+
+def _known_video_duration(value: Any) -> float | None:
+    try:
+        duration = float(value)
+    except (TypeError, ValueError):
+        return None
+    if duration <= 0 or not math.isfinite(duration):
+        return None
+    return duration
+
+
+def _normalize_thumbnail_timestamps(
+    value: Any,
+    limit: int = 3,
+    max_seconds: float | None = None,
+) -> list[float]:
+    if not isinstance(value, (list, tuple)):
+        return []
+
+    timestamp_limit = _known_video_duration(max_seconds)
+    if timestamp_limit is None:
+        timestamp_limit = MAX_THUMBNAIL_TIMESTAMP_SECONDS
+    timestamp_limit = min(timestamp_limit, MAX_THUMBNAIL_TIMESTAMP_SECONDS)
+
+    result: list[float] = []
+    seen = set()
+    for item in value:
+        try:
+            timestamp = float(item)
+        except (TypeError, ValueError):
+            continue
+        if (
+            not math.isfinite(timestamp)
+            or timestamp < 0
+            or timestamp > timestamp_limit
+        ):
+            continue
+        timestamp = round(timestamp, 3)
+        if timestamp in seen:
+            continue
+        seen.add(timestamp)
+        result.append(timestamp)
         if len(result) >= limit:
             break
     return result
@@ -130,7 +178,8 @@ def _extract_json_object(response: str) -> dict[str, Any]:
     text = _strip_code_fence(response)
     try:
         data = json.loads(text)
-    except Exception:
+    except Exception as exc:
+        logger.warning(f"viral analysis response was not plain JSON: {exc}")
         match = re.search(r"\{.*\}", text, re.DOTALL)
         if not match:
             raise
@@ -171,7 +220,13 @@ def build_viral_analysis_prompt(
     title = _clamp_text(title, MAX_ANALYSIS_TITLE_LENGTH)
     language = _clamp_text(language or "auto", MAX_ANALYSIS_LANGUAGE_LENGTH) or "auto"
     platforms = _normalize_platforms(target_platforms)
-    duration = video_duration_sec or "unknown"
+    known_duration = _known_video_duration(video_duration_sec)
+    duration = f"{known_duration:g}" if known_duration is not None else "unknown"
+    timestamp_constraint = (
+        f" Each timestamp must be between 0 and {duration} seconds."
+        if known_duration is not None
+        else ""
+    )
     social_caption = _clamp_text(social_caption, MAX_ANALYSIS_CONTEXT_LENGTH)
     hashtags_text = _normalize_hashtag_context(hashtags)
     material_context = _normalize_material_context(material_attributions)
@@ -187,6 +242,8 @@ review, not a promise of real-world virality.
 2. Scores must be integers from 0 to 100.
 3. Keep suggestions practical and short.
 4. Use the same language as the script unless language is explicitly set.
+5. For thumbnail timestamps, return up to three visual hook or payoff moments
+   in seconds from the start.{timestamp_constraint} Use an empty list when no reliable time is known.
 
 ## Required JSON keys
 {{
@@ -199,6 +256,7 @@ review, not a promise of real-world virality.
   "hook_suggestions": ["...", "...", "..."],
   "title_variants": ["...", "...", "..."],
   "thumbnail_concepts": ["...", "...", "..."],
+  "thumbnail_timestamps": [0.0, 0.0, 0.0],
   "warnings": ["..."],
   "platform_fit": {{"tiktok": 0.0, "youtube_shorts": 0.0, "instagram_reels": 0.0}}
 }}
@@ -223,6 +281,7 @@ def _parse_viral_analysis(
     platforms: list[str],
     fallback_subject: str,
     fallback_script: str,
+    video_duration_sec: int | float | None = None,
 ) -> dict[str, Any]:
     data = _extract_json_object(response)
 
@@ -245,6 +304,10 @@ def _parse_viral_analysis(
         "title_variants": _normalize_string_list(data.get("title_variants"), 5),
         "thumbnail_concepts": _normalize_string_list(
             data.get("thumbnail_concepts"), 5, 180
+        ),
+        "thumbnail_timestamps": _normalize_thumbnail_timestamps(
+            data.get("thumbnail_timestamps"),
+            max_seconds=video_duration_sec,
         ),
         "warnings": _normalize_string_list(data.get("warnings"), 6, 180),
         "platform_fit": _normalize_platform_fit(data.get("platform_fit"), platforms),
@@ -341,6 +404,7 @@ def _fallback_viral_analysis(
             "Before/after split showing the main change",
             "Close-up reaction plus one bold keyword",
         ],
+        "thumbnail_timestamps": [],
         "warnings": warnings,
         "platform_fit": {platform: fit_base for platform in platforms},
     }
@@ -382,7 +446,13 @@ def analyze_viral_potential(
         if isinstance(response, str) and "Error: " in response:
             logger.warning(f"viral analysis LLM unavailable: {response}")
             raise ValueError(response)
-        return _parse_viral_analysis(response, platforms, subject, script)
+        return _parse_viral_analysis(
+            response,
+            platforms,
+            subject,
+            script,
+            video_duration_sec=video_duration_sec,
+        )
     except Exception as e:
         logger.warning(f"falling back to heuristic viral analysis: {str(e)}")
         return _fallback_viral_analysis(
