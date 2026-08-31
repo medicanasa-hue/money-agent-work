@@ -45,6 +45,7 @@ from loguru import logger
 
 from app.config import config
 from app.services import material
+from app.services.providers.utils import safe_error_details
 
 DEFAULT_MARENGO_MODEL = "marengo3.0"
 DEFAULT_PEGASUS_MODEL = "pegasus1.5"
@@ -98,7 +99,9 @@ def embed_text(text: str, model: Optional[str] = None) -> Optional[List[float]]:
         # cached, so a transient API error never poisons the cache.
         return _embed_text_cached(text.strip(), model)
     except Exception as e:  # noqa: BLE001 - never break the pipeline on TL errors
-        logger.warning(f"TwelveLabs embed_text failed, skipping rerank: {e}")
+        logger.warning(
+            f"TwelveLabs embed_text failed, skipping rerank: {safe_error_details(e)}"
+        )
         return None
 
 
@@ -137,7 +140,10 @@ def embed_multimodal_text(
     try:
         return _embed_multimodal_text_cached(normalized_text, str(model))
     except Exception as e:  # noqa: BLE001 - visual reranking is fail-open
-        logger.warning(f"TwelveLabs visual text embedding failed, skipping rerank: {e}")
+        logger.warning(
+            "TwelveLabs visual text embedding failed, skipping rerank: "
+            f"{safe_error_details(e)}"
+        )
         return None
 
 
@@ -170,7 +176,10 @@ def embed_video_visual(
     try:
         return _embed_video_visual_cached(normalized_url, str(model))
     except Exception as e:  # noqa: BLE001 - provider URLs can expire or block access
-        logger.warning(f"TwelveLabs visual video embedding failed, skipping rerank: {e}")
+        logger.warning(
+            "TwelveLabs visual video embedding failed, skipping rerank: "
+            f"{safe_error_details(e)}"
+        )
         return None
 
 
@@ -291,7 +300,7 @@ def analyze_clip(
         )
         return resp.data
     except Exception as e:  # noqa: BLE001
-        logger.warning(f"TwelveLabs analyze_clip failed: {e}")
+        logger.warning(f"TwelveLabs analyze_clip failed: {safe_error_details(e)}")
         return None
 
 

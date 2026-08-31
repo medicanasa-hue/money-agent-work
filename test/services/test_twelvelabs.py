@@ -319,6 +319,47 @@ class TestTwelveLabsService(unittest.TestCase):
         # any failure must preserve the original order (never make things worse)
         self.assertEqual(result, terms)
 
+    def test_embedding_failure_logs_do_not_expose_signed_urls(self):
+        config.app["twelvelabs_api_keys"] = ["tlk_test"]
+        sensitive_error = RuntimeError(
+            "request failed for https://cdn.example/clip.mp4?signature=secret"
+        )
+        cases = (
+            (
+                "text",
+                "_embed_text_cached",
+                lambda: twelvelabs.embed_text("city skyline"),
+            ),
+            (
+                "visual_text",
+                "_embed_multimodal_text_cached",
+                lambda: twelvelabs.embed_multimodal_text("city skyline"),
+            ),
+            (
+                "visual_video",
+                "_embed_video_visual_cached",
+                lambda: twelvelabs.embed_video_visual(
+                    "https://example.com/clip.mp4"
+                ),
+            ),
+        )
+
+        for case_name, cached_function, invoke in cases:
+            with self.subTest(case=case_name):
+                with (
+                    patch.object(
+                        twelvelabs,
+                        cached_function,
+                        side_effect=sensitive_error,
+                    ),
+                    patch.object(twelvelabs.logger, "warning") as warning,
+                ):
+                    self.assertIsNone(invoke())
+
+                message = warning.call_args.args[0]
+                self.assertIn("RuntimeError", message)
+                self.assertNotIn("signature=secret", message)
+
     def test_rerank_noop_for_single_term(self):
         config.app["twelvelabs_api_keys"] = ["tlk_test"]
         config.app["twelvelabs_rerank_terms"] = True
@@ -344,6 +385,31 @@ class TestTwelveLabsService(unittest.TestCase):
             sys.modules, {"twelvelabs": stub_pkg, "twelvelabs.types": stub_types}
         ):
             self._run_analyze_clip_assertions()
+
+    def test_analyze_clip_failure_log_does_not_expose_signed_url(self):
+        config.app["twelvelabs_api_keys"] = ["tlk_test"]
+        stub_types = type(sys)("twelvelabs.types")
+        stub_types.VideoContext_Url = lambda *, url: {"url": url}
+        stub_pkg = sys.modules.get("twelvelabs") or type(sys)("twelvelabs")
+        client = MagicMock()
+        client.analyze.side_effect = RuntimeError(
+            "request failed for https://cdn.example/clip.mp4?signature=secret"
+        )
+
+        with (
+            patch.dict(
+                sys.modules,
+                {"twelvelabs": stub_pkg, "twelvelabs.types": stub_types},
+            ),
+            patch.object(twelvelabs, "_client", return_value=client),
+            patch.object(twelvelabs.logger, "warning") as warning,
+        ):
+            result = twelvelabs.analyze_clip("https://example.com/clip.mp4")
+
+        self.assertIsNone(result)
+        message = warning.call_args.args[0]
+        self.assertIn("RuntimeError", message)
+        self.assertNotIn("signature=secret", message)
 
     def _run_analyze_clip_assertions(self):
         resp = MagicMock()

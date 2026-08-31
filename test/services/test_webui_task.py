@@ -12,7 +12,7 @@ from loguru import logger
 from app.models import const
 from app.models.schema import VideoParams
 from app.services import webui_task
-from app.utils import logging_utils
+from app.utils import file_security, logging_utils
 
 
 ROOT_DIR = Path(__file__).parent.parent.parent
@@ -52,6 +52,34 @@ def test_generation_controls_submit_background_task_instead_of_blocking_page():
 
     assert "webui_task.submit_generation" in calls
     assert "tm.start" not in calls
+
+
+def test_upload_filename_sanitizer_strips_client_directory_components():
+    assert (
+        file_security.sanitize_upload_filename("../../private/clip.mp4")
+        == "clip.mp4"
+    )
+    assert (
+        file_security.sanitize_upload_filename(r"C:\private\portrait.mov")
+        == "portrait.mov"
+    )
+
+
+def test_prepare_task_params_confines_uploaded_videos_to_local_directory():
+    tree = ast.parse(WEBUI_MAIN.read_text(encoding="utf-8"))
+    function = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "_prepare_task_params"
+    )
+    calls = {
+        _attribute_name(node.func)
+        for node in ast.walk(function)
+        if isinstance(node, ast.Call)
+    }
+
+    assert "file_security.sanitize_upload_filename" in calls
+    assert "file_security.resolve_path_within_directory" in calls
 
 
 def test_submit_generation_returns_while_pipeline_is_still_running():

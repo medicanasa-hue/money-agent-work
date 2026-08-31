@@ -1802,7 +1802,10 @@ def _format_ffmpeg_ass_filter_path(file_path: str) -> str:
 
 
 def _build_ass_subtitles_filter(subtitle_file: str) -> str:
-    return f"subtitles=filename={_format_ffmpeg_ass_filter_path(subtitle_file)}"
+    return (
+        f"subtitles=filename={_format_ffmpeg_ass_filter_path(subtitle_file)}"
+        f":fontsdir={_format_ffmpeg_ass_filter_path(utils.font_dir())}"
+    )
 
 
 def _hex_to_ass_bgr_color(value: str | None, default: str = "#FFFFFF") -> str:
@@ -2796,6 +2799,73 @@ def _fast_render_image_with_ffmpeg(
     return False
 
 
+def append_outro_card(
+    video_file: str,
+    image_file: str | None,
+    duration: float,
+    video_aspect: VideoAspect = VideoAspect.portrait,
+    threads: int = 2,
+) -> str:
+    """Append a branded still image after the completed content timeline."""
+    requested_image = str(image_file or "").strip()
+    try:
+        normalized_duration = float(duration)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("outro duration must be numeric") from exc
+    if not requested_image or normalized_duration <= 0:
+        return video_file
+    if not math.isfinite(normalized_duration):
+        raise ValueError("outro duration must be finite")
+    if not os.path.isfile(video_file):
+        raise ValueError("video file does not exist")
+
+    resolved_image = file_security.resolve_path_within_directory(
+        utils.root_dir(),
+        requested_image,
+    )
+    if (utils.parse_extension(resolved_image) or "").lower() not in const.FILE_TYPE_IMAGES:
+        raise ValueError("outro file must be a supported image")
+
+    aspect = VideoAspect(video_aspect)
+    video_width, video_height = aspect.to_resolution()
+    output_dir = os.path.dirname(video_file) or "."
+    output_stem, _ = os.path.splitext(os.path.basename(video_file))
+    outro_clip_file = os.path.join(output_dir, f"{output_stem}.outro-card.mp4")
+    merged_file = os.path.join(output_dir, f"{output_stem}.with-outro.mp4")
+    _remove_file_quietly(outro_clip_file)
+    _remove_file_quietly(merged_file)
+
+    try:
+        if not _fast_render_image_with_ffmpeg(
+            input_file=resolved_image,
+            output_file=outro_clip_file,
+            width=video_width,
+            height=video_height,
+            duration=normalized_duration,
+            threads=threads,
+            target_width=video_width,
+            target_height=video_height,
+        ):
+            raise RuntimeError("failed to render outro image")
+        concat_video_clips_with_ffmpeg(
+            clip_files=[video_file, outro_clip_file],
+            output_file=merged_file,
+            threads=threads,
+            output_dir=output_dir,
+        )
+        os.replace(merged_file, video_file)
+    finally:
+        _remove_file_quietly(outro_clip_file)
+        _remove_file_quietly(merged_file)
+
+    logger.info(
+        "appended branded outro card: file={}, duration={:.2f}s",
+        os.path.basename(resolved_image),
+        normalized_duration,
+    )
+    return video_file
+
+
 def _fast_mux_video_with_audio(
     video_path: str,
     audio_path: str,
@@ -3094,6 +3164,8 @@ def combine_videos(
     threads: int = 2,
     cue_end_times: list[float] | None = None,
     clip_speed: float = 1.0,
+    outro_image_file: str | None = None,
+    outro_duration: float = 0,
 ) -> str:
     audio_clip = AudioFileClip(audio_file)
     try:
@@ -3516,6 +3588,13 @@ def combine_videos(
         logger.info("using single clip directly")
         shutil.copy(processed_clips[0].file_path, combined_video_path)
         delete_files([processed_clips[0].file_path])
+        append_outro_card(
+            video_file=combined_video_path,
+            image_file=outro_image_file,
+            duration=outro_duration,
+            video_aspect=video_aspect,
+            threads=threads,
+        )
         logger.info("video combining completed")
         return combined_video_path
 
@@ -3540,6 +3619,13 @@ def combine_videos(
     
     # clean temp files
     delete_files(clip_files)
+    append_outro_card(
+        video_file=combined_video_path,
+        image_file=outro_image_file,
+        duration=outro_duration,
+        video_aspect=video_aspect,
+        threads=threads,
+    )
             
     logger.info("video combining completed")
     return combined_video_path

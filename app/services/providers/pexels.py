@@ -96,7 +96,12 @@ class PexelsProvider(VideoProvider):
                 return video_items
 
             for v in response["videos"]:
-                duration = v["duration"]
+                if not isinstance(v, dict):
+                    continue
+                try:
+                    duration = float(v.get("duration"))
+                except (TypeError, ValueError):
+                    continue
                 if duration < minimum_duration:
                     continue
                 best_file = select_best_video_variant(
@@ -106,9 +111,12 @@ class PexelsProvider(VideoProvider):
                 )
                 if best_file:
                     vf, w, h = best_file
+                    video_url = vf.get("link")
+                    if not isinstance(video_url, str) or not video_url.strip():
+                        continue
                     item = MaterialInfo()
                     item.provider = "pexels"
-                    item.url = vf["link"]
+                    item.url = video_url
                     item.preview_url = str(v.get("image") or "").strip()
                     item.title = _pexels_page_title(v.get("url"))
                     item.duration = duration

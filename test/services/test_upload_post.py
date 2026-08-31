@@ -17,8 +17,6 @@ import requests
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from app.services.upload_post import UploadPostService
-
 
 _CONFIG_BASE = {
     "upload_post_enabled": True,

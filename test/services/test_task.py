@@ -34,6 +34,18 @@ class TestTaskService(unittest.TestCase):
         with tm._cross_post_registry_lock:
             tm._cross_post_futures.clear()
 
+    def test_karaoke_ass_style_options_include_custom_position(self):
+        params = VideoParams(
+            video_subject="subtitle position",
+            subtitle_position="custom",
+            custom_position=70.0,
+        )
+
+        style_options = tm._karaoke_ass_style_options(params)
+
+        self.assertEqual(style_options["subtitle_position"], "custom")
+        self.assertEqual(style_options["custom_position"], 70.0)
+
     def test_is_task_busy_covers_generation_and_cross_posting(self):
         """删除入口必须同时识别视频生成和跨平台发布的活跃状态。"""
         busy_tasks = (
@@ -110,6 +122,35 @@ class TestTaskService(unittest.TestCase):
             )
 
         self.assertEqual(combine_videos.call_args.kwargs["clip_speed"], 1.25)
+
+    def test_generate_final_videos_forwards_branded_outro_card(self):
+        """The task orchestrator must preserve the configured branded ending."""
+        params = VideoParams(
+            video_subject="test",
+            video_count=1,
+            outro_image_file="resource/branding/cebin_bilimi_outro.jpeg",
+            outro_duration=2.0,
+        )
+
+        with (
+            patch.object(tm.video, "combine_videos") as combine_videos,
+            patch.object(tm.video, "generate_video"),
+            patch.object(tm.sm.state, "update_task"),
+        ):
+            tm.generate_final_videos(
+                task_id="outro-card-task",
+                params=params,
+                downloaded_videos=["material.mp4"],
+                audio_file="audio.mp3",
+                subtitle_path="",
+                audio_duration=5,
+            )
+
+        self.assertEqual(
+            combine_videos.call_args.kwargs["outro_image_file"],
+            "resource/branding/cebin_bilimi_outro.jpeg",
+        )
+        self.assertEqual(combine_videos.call_args.kwargs["outro_duration"], 2.0)
 
     def test_generate_final_videos_uses_generated_sonilo_music(self):
         """Sonilo 必须针对每条拼接后的视频生成配乐，并传给最终混音。"""

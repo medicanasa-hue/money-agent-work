@@ -2,7 +2,6 @@ import html
 import json
 import math
 import os
-import shutil
 import subprocess
 import tempfile
 
@@ -274,8 +273,9 @@ def _is_caption_over_black_frame(frame) -> bool:
 
 
 def _sampled_audio_peak(audio, video_duration: float) -> float | None:
+    get_frame = getattr(audio, "get_frame", None)
     to_soundarray = getattr(audio, "to_soundarray", None)
-    if not callable(to_soundarray):
+    if not callable(get_frame) and not callable(to_soundarray):
         return None
 
     audio_duration = _as_non_negative_float(getattr(audio, "duration", 0))
@@ -300,7 +300,19 @@ def _sampled_audio_peak(audio, video_duration: float) -> float | None:
         )
 
     try:
-        samples = np.asarray(to_soundarray(tt=np.asarray(sample_times)), dtype=float)
+        if callable(get_frame):
+            # MoviePy's vector ``tt`` reader can return a constant near-zero
+            # value for otherwise audible AAC/WAV streams. Scalar reads use
+            # the same decoder without that false-silence behaviour.
+            samples = np.asarray(
+                [get_frame(float(sample_time)) for sample_time in sample_times],
+                dtype=float,
+            )
+        else:
+            samples = np.asarray(
+                to_soundarray(tt=np.asarray(sample_times)),
+                dtype=float,
+            )
     except Exception:
         return None
     magnitudes = np.abs(samples)
@@ -311,17 +323,7 @@ def _sampled_audio_peak(audio, video_duration: float) -> float | None:
 
 
 def _get_ffprobe_binary() -> str | None:
-    try:
-        ffmpeg_binary = str(utils.get_ffmpeg_binary() or "").strip()
-    except Exception:
-        ffmpeg_binary = ""
-
-    if ffmpeg_binary:
-        probe_name = "ffprobe.exe" if ffmpeg_binary.lower().endswith(".exe") else "ffprobe"
-        probe_path = os.path.join(os.path.dirname(ffmpeg_binary), probe_name)
-        if probe_path and os.path.isfile(probe_path):
-            return probe_path
-    return shutil.which("ffprobe")
+    return utils.get_ffprobe_binary()
 
 
 def _detect_sustained_near_black_segments(video_path: str) -> list[tuple[float, float]] | None:

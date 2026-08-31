@@ -179,6 +179,23 @@ def get_ffmpeg_binary() -> str:
     return "ffmpeg"
 
 
+def get_ffprobe_binary() -> str | None:
+    """Resolve FFprobe beside the configured FFmpeg before checking PATH."""
+    try:
+        ffmpeg_binary = str(get_ffmpeg_binary() or "").strip()
+    except Exception:
+        ffmpeg_binary = ""
+
+    if ffmpeg_binary:
+        probe_name = (
+            "ffprobe.exe" if ffmpeg_binary.lower().endswith(".exe") else "ffprobe"
+        )
+        probe_path = os.path.join(os.path.dirname(ffmpeg_binary), probe_name)
+        if probe_path and os.path.isfile(probe_path):
+            return probe_path
+    return shutil.which("ffprobe")
+
+
 def run_in_background(func, *args, **kwargs):
     def run():
         try:

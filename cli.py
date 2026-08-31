@@ -1037,6 +1037,8 @@ def build_video_params(args: argparse.Namespace) -> VideoParams:
         "video_aspect": args.video_aspect,
         "voice_name": args.voice_name,
         "subtitle_enabled": args.subtitle_enabled,
+        "outro_image_file": config.ui.get("outro_image_file", ""),
+        "outro_duration": config.ui.get("outro_duration", 2.0),
     }
     additional_aspects = getattr(args, "video_aspects", None)
     if additional_aspects:

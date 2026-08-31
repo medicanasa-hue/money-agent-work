@@ -10,9 +10,9 @@ from pydantic import ValidationError
 ROOT_DIR = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(ROOT_DIR))
 
-from app.models import schema as schema_models
-from app.config import config
-from app.models.schema import (
+from app.models import schema as schema_models  # noqa: E402
+from app.config import config  # noqa: E402
+from app.models.schema import (  # noqa: E402
     MaterialInfo,
     VideoAspect,
     VideoParams,

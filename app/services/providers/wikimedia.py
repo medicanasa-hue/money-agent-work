@@ -139,7 +139,16 @@ class WikimediaProvider(VideoProvider):
             return []
 
         # ── 2. Toplu videoinfo çek ────────────────────────────────────────
-        titles = "|".join(res["title"] for res in results[:10])
+        titles = "|".join(
+            title.strip()
+            for result in results[:10]
+            if isinstance(result, dict)
+            and isinstance((title := result.get("title")), str)
+            and title.strip()
+        )
+        if not titles:
+            logger.info("[wikimedia] search returned no usable video titles")
+            return []
         info_params = {
             **_COMMON_PARAMS,
             "action": "query",
@@ -164,14 +173,20 @@ class WikimediaProvider(VideoProvider):
             )
             return []
 
+        if not isinstance(pages, dict):
+            logger.error("[wikimedia] videoinfo returned unexpected response")
+            return []
+
         video_items: List[MaterialInfo] = []
         for page_id, page in pages.items():
-            if page_id == "-1":
+            if page_id == "-1" or not isinstance(page, dict):
                 continue
             vi_list = page.get("videoinfo", [])
-            if not vi_list:
+            if not isinstance(vi_list, (list, tuple)) or not vi_list:
                 continue
             vi = vi_list[0]
+            if not isinstance(vi, dict):
+                continue
 
             # Sadece VIDEO medya tipi
             if vi.get("mediatype", "") != "VIDEO":

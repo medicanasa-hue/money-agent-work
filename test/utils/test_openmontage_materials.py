@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from app.models.schema import VideoAspect
@@ -8,6 +9,38 @@ from app.utils import openmontage_materials
 
 
 class FindOpenMontageOutputTest(unittest.TestCase):
+    def test_probe_uses_ffprobe_beside_configured_ffmpeg(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            binary_directory = Path(temporary_directory)
+            ffmpeg_binary = binary_directory / "ffmpeg.exe"
+            ffprobe_binary = binary_directory / "ffprobe.exe"
+            video_path = binary_directory / "video.mp4"
+            ffmpeg_binary.touch()
+            ffprobe_binary.touch()
+            video_path.touch()
+
+            with (
+                patch(
+                    "app.utils.utils.get_ffmpeg_binary",
+                    return_value=str(ffmpeg_binary),
+                ),
+                patch.object(
+                    openmontage_materials.subprocess,
+                    "run",
+                    return_value=SimpleNamespace(
+                        returncode=0,
+                        stdout=(
+                            '{"streams": [{"width": 1080, "height": 1920}], '
+                            '"format": {"duration": "8"}}'
+                        ),
+                    ),
+                ) as run,
+            ):
+                metadata = openmontage_materials._probe_openmontage_video(video_path)
+
+        self.assertEqual(metadata["width"], 1080)
+        self.assertEqual(run.call_args.args[0][0], str(ffprobe_binary))
+
     def test_finds_matching_narrated_openmontage_output(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             project_root = Path(temporary_directory)

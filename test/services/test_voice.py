@@ -1227,6 +1227,31 @@ class TestVoiceService(unittest.TestCase):
 
             self.assertFalse(created)
             self.assertFalse(subtitle_file.exists())
+
+    def test_create_karaoke_ass_subtitle_uses_srt_timings_without_edge_cues(self):
+        subtitle_items = [
+            (
+                1,
+                "00:00:00,000 --> 00:00:02,000",
+                "Merhaba dünya",
+            )
+        ]
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            subtitle_file = Path(tmp_dir) / "karaoke.ass"
+            created = vs.create_karaoke_ass_subtitle(
+                sub_maker=SimpleNamespace(),
+                subtitle_file=str(subtitle_file),
+                subtitle_items=subtitle_items,
+                video_aspect="9:16",
+            )
+            subtitle_content = subtitle_file.read_text(encoding="utf-8")
+
+        self.assertTrue(created)
+        self.assertIn("Style: Karaoke,Arial,56", subtitle_content)
+        self.assertIn(r"{\kf", subtitle_content)
+        self.assertIn("Merhaba", subtitle_content)
+        self.assertIn("dünya", subtitle_content)
     def test_create_karaoke_ass_subtitle_uses_matching_srt_text_overrides(self):
         sub_maker = SimpleNamespace(
             cues=[
@@ -1534,6 +1559,66 @@ class TestVoiceService(unittest.TestCase):
         self.assertGreater(len(rendered_items), 1)
         self.assertEqual(len(dialogue_lines), len(rendered_items))
         self.assertIn(r"{\kf", ass_content)
+
+    def test_generate_subtitle_builds_karaoke_ass_from_reflowed_subtitle_cues_without_word_timings(self):
+        long_caption = (
+            "Sepetinde uc yuz seksen liralik urun var kargo kirk bes lira "
+            "ucretsiz kargo siniri bes yuz"
+        )
+
+        def write_whisper_subtitle(*, subtitle_file, **_):
+            Path(subtitle_file).write_text(
+                "1\n00:00:00,000 --> 00:00:08,000\n"
+                f"{long_caption}\n\n",
+                encoding="utf-8",
+            )
+
+        with tempfile.TemporaryDirectory() as tmp_dir, patch.object(
+            task_service.config,
+            "app",
+            dict(task_service.config.app, subtitle_provider="whisper"),
+        ), patch.object(
+            task_service.subtitle,
+            "create",
+            side_effect=write_whisper_subtitle,
+        ), patch.object(
+            task_service.subtitle,
+            "correct",
+        ), patch.object(
+            task_service.subtitle,
+            "read_word_timings",
+            return_value=[],
+        ), patch(
+            "app.utils.utils.task_dir",
+            lambda tid="": str(Path(tmp_dir) / tid) if tid else str(Path(tmp_dir)),
+        ):
+            task_id = "reflowed-karaoke-without-word-timings-task"
+            task_directory = Path(tmp_dir, task_id)
+            task_directory.mkdir(parents=True, exist_ok=True)
+            subtitle_path = task_service.generate_subtitle(
+                task_id=task_id,
+                params=SimpleNamespace(
+                    subtitle_enabled=True,
+                    subtitle_style="karaoke",
+                    video_aspect="9:16",
+                ),
+                video_script=long_caption,
+                sub_maker=None,
+                audio_file="narration.mp3",
+            )
+            rendered_items = task_service.subtitle.file_to_subtitles(
+                str(task_directory / "subtitle.render.srt")
+            )
+            ass_content = Path(subtitle_path).read_text(encoding="utf-8")
+
+        dialogue_lines = [
+            line for line in ass_content.splitlines() if line.startswith("Dialogue:")
+        ]
+        self.assertEqual(Path(subtitle_path).name, "subtitle.ass")
+        self.assertGreater(len(rendered_items), 1)
+        self.assertEqual(len(dialogue_lines), len(rendered_items))
+        self.assertIn(r"{\kf", ass_content)
+
     def test_create_karaoke_ass_from_word_timings_returns_false_without_timings(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             subtitle_file = Path(tmp_dir) / "karaoke.ass"
@@ -1685,6 +1770,17 @@ class TestVoiceService(unittest.TestCase):
         self.assertIn(",2,80,80,307,1", portrait_header)
         self.assertIn(",2,80,80,80,1", landscape_header)
         self.assertIn(",2,80,80,80,1", four_five_header)
+
+    def test_karaoke_ass_header_uses_custom_vertical_position(self):
+        header = voice_subtitles._build_ass_header(
+            VideoAspect.portrait,
+            style_options={
+                "subtitle_position": "custom",
+                "custom_position": 70.0,
+            },
+        )
+
+        self.assertIn(",2,80,80,576,1", header)
     def test_create_karaoke_ass_variant_rebuilds_header_and_preserves_events(self):
         source_content = (
             "[Script Info]\n"

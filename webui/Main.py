@@ -71,7 +71,7 @@ from app.utils.openmontage_materials import (
     validate_openmontage_output,
 )
 from app.utils.logging_utils import configure_terminal_logger
-from app.utils import utils
+from app.utils import file_security, utils
 
 st.set_page_config(
     page_title="MoneyPrinterTurbo",
@@ -6776,7 +6776,11 @@ def _render_main_workspace_tabs(params, selected_social_platform):
 
 
 def _initialize_video_params():
-    params = VideoParams(video_subject="")
+    params = VideoParams(
+        video_subject="",
+        outro_image_file=config.ui.get("outro_image_file", ""),
+        outro_duration=config.ui.get("outro_duration", 2.0),
+    )
     params.match_materials_to_script = bool(
         st.session_state.get("match_materials_to_script", False)
     )
@@ -7309,7 +7313,17 @@ def _prepare_task_params(
         run_params.video_materials = []
         persisted_local_materials = []
         for file in uploaded_video_files:
-            file_path = os.path.join(local_videos_dir, f"{file.file_id}_{file.name}")
+            safe_name = file_security.sanitize_upload_filename(file.name)
+            safe_file_id = re.sub(
+                r"[^A-Za-z0-9_-]",
+                "_",
+                str(getattr(file, "file_id", "")),
+            )[:64].strip("_") or uuid4().hex
+            file_path = file_security.resolve_path_within_directory(
+                local_videos_dir,
+                f"{safe_file_id}_{safe_name}",
+                require_file=False,
+            )
             with open(file_path, "wb") as f:
                 f.write(file.getbuffer())
             m = MaterialInfo()

@@ -42,6 +42,15 @@ class _FakeAudio:
         sample_count = len(tt) if tt is not None else 0
         return [[self.peak, -self.peak] for _ in range(sample_count)]
 
+    def get_frame(self, _time):
+        return [self.peak, -self.peak]
+
+
+class _VectorSamplingBugAudio(_FakeAudio):
+    def to_soundarray(self, tt=None, **_kwargs):
+        sample_count = len(tt) if tt is not None else 0
+        return [[0.0001, -0.0001] for _ in range(sample_count)]
+
 
 class _FakeClip:
     def __init__(
@@ -805,6 +814,20 @@ class TestRenderQuality(unittest.TestCase):
         self.assertFalse(report["ok"])
         self.assertAlmostEqual(report["sampled_audio_peak"], 0.0001)
         self.assertIn("sampled audio is near-silent", report["warnings"])
+
+    def test_inspect_rendered_video_avoids_moviepy_vector_audio_sampling_bug(self):
+        clip = _FakeClip()
+        clip.audio = _VectorSamplingBugAudio(peak=0.2)
+
+        with (
+            patch.object(render_quality.os.path, "isfile", return_value=True),
+            patch.object(render_quality, "VideoFileClip", return_value=clip),
+        ):
+            report = render_quality.inspect_rendered_video("final.mp4")
+
+        self.assertTrue(report["ok"])
+        self.assertAlmostEqual(report["sampled_audio_peak"], 0.2)
+        self.assertNotIn("sampled audio is near-silent", report["warnings"])
 
     def test_inspect_rendered_video_warns_when_audio_is_effectively_silent(self):
         clip = _FakeClip(audio_peak=0.0025)

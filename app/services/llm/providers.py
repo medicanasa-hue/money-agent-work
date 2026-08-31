@@ -1,6 +1,4 @@
-import json
 import re
-import requests
 from time import perf_counter
 
 from loguru import logger

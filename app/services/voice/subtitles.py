@@ -10,6 +10,7 @@ from edge_tts import SubMaker
 from loguru import logger
 from moviepy.audio.io.AudioFileClip import AudioFileClip
 from moviepy.video.tools import subtitles
+from PIL import ImageFont
 
 from app.models.schema import VideoAspect
 from app.utils import utils
@@ -23,6 +24,12 @@ _PORTRAIT_ASS_SAFE_MARGIN_RATIO = 0.16
 _DEFAULT_SUBTITLE_MAX_CHARACTERS_PER_SECOND = 17.0
 _DEFAULT_SUBTITLE_MAX_LINES = 2
 _DEFAULT_SUBTITLE_MAX_CHARACTERS_PER_LINE = 42
+_DEFAULT_KARAOKE_FONT_NAME = "Arial"
+_DEFAULT_KARAOKE_FONT_SIZE = 56
+_DEFAULT_KARAOKE_TEXT_COLOR = "#FFFFFF"
+_DEFAULT_KARAOKE_HIGHLIGHT_COLOR = "#FFD700"
+_DEFAULT_KARAOKE_STROKE_COLOR = "#000000"
+_DEFAULT_KARAOKE_STROKE_WIDTH = 3
 
 
 def mktimestamp(time_unit: float) -> str:
@@ -431,9 +438,79 @@ def _ass_subtitle_margin_v(video_aspect=None) -> int:
     return int(round(height * _PORTRAIT_ASS_SAFE_MARGIN_RATIO))
 
 
-def _build_ass_header(video_aspect=None) -> str:
+def _ass_color(value: object, default: str, alpha: str = "00") -> str:
+    color = value if isinstance(value, str) and value.startswith("#") else default
+    color = color.lstrip("#")
+    if len(color) != 6 or any(
+        character not in "0123456789abcdefABCDEF" for character in color
+    ):
+        color = default.lstrip("#")
+    red, green, blue = color[0:2], color[2:4], color[4:6]
+    return f"&H{alpha}{blue}{green}{red}".upper()
+
+
+def _ass_style_number(value: object, default: float) -> str:
+    try:
+        numeric_value = float(value)
+    except (TypeError, ValueError):
+        numeric_value = default
+    if not math.isfinite(numeric_value) or numeric_value < 0:
+        numeric_value = default
+    return f"{numeric_value:g}"
+
+
+def _ass_font_family(font_name: object) -> str:
+    fallback_name = str(font_name or _DEFAULT_KARAOKE_FONT_NAME).strip()
+    font_path = os.path.join(utils.font_dir(), fallback_name)
+    try:
+        font_family = ImageFont.truetype(font_path, 12).getname()[0]
+    except (AttributeError, OSError, ValueError):
+        font_family = os.path.splitext(os.path.basename(fallback_name))[0]
+    safe_font_family = "".join(
+        character
+        for character in str(font_family)
+        if character.isalnum() or character in {" ", "_", "-", "."}
+    ).strip()
+    return safe_font_family or _DEFAULT_KARAOKE_FONT_NAME
+
+
+def _ass_alignment_and_margin(
+    video_aspect=None,
+    subtitle_position: object = "bottom",
+    custom_position: object = None,
+):
+    _, play_res_y = _ass_play_resolution(video_aspect)
+    position = str(subtitle_position or "bottom").strip().lower()
+    if position == "top":
+        return 8, int(round(play_res_y * 0.05))
+    if position == "center":
+        return 5, 10
+    if position == "custom":
+        try:
+            custom_percent = float(custom_position)
+        except (TypeError, ValueError):
+            return 2, _ass_subtitle_margin_v(video_aspect)
+        if not math.isfinite(custom_percent):
+            return 2, _ass_subtitle_margin_v(video_aspect)
+        custom_percent = max(0.0, min(100.0, custom_percent))
+        return 2, int(round(play_res_y * (1.0 - custom_percent / 100.0)))
+    return 2, _ass_subtitle_margin_v(video_aspect)
+
+
+def _build_ass_header(video_aspect=None, style_options: dict | None = None) -> str:
     play_res_x, play_res_y = _ass_play_resolution(video_aspect)
-    margin_v = _ass_subtitle_margin_v(video_aspect)
+    style_options = style_options or {}
+    alignment, margin_v = _ass_alignment_and_margin(
+        video_aspect,
+        style_options.get("subtitle_position", "bottom"),
+        style_options.get("custom_position"),
+    )
+    font_size = _ass_style_number(
+        style_options.get("font_size"), _DEFAULT_KARAOKE_FONT_SIZE
+    )
+    stroke_width = _ass_style_number(
+        style_options.get("stroke_width"), _DEFAULT_KARAOKE_STROKE_WIDTH
+    )
     return "\n".join(
         [
             "[Script Info]",
@@ -452,8 +529,13 @@ def _build_ass_header(video_aspect=None) -> str:
                 "Alignment, MarginL, MarginR, MarginV, Encoding"
             ),
             (
-                "Style: Karaoke,Arial,56,&H00FFFFFF,&H0000D7FF,&H8A000000,"
-                f"&H80000000,1,0,0,0,100,100,0,0,1,3,1,2,80,80,{margin_v},1"
+                f"Style: Karaoke,{_ass_font_family(style_options.get('font_name'))},"
+                f"{font_size},"
+                f"{_ass_color(style_options.get('text_fore_color'), _DEFAULT_KARAOKE_TEXT_COLOR)},"
+                f"{_ass_color(style_options.get('highlight_color'), _DEFAULT_KARAOKE_HIGHLIGHT_COLOR)},"
+                f"{_ass_color(style_options.get('stroke_color'), _DEFAULT_KARAOKE_STROKE_COLOR)},"
+                f"&H00000000,1,0,0,0,100,100,0,0,1,{stroke_width},0,"
+                f"{alignment},80,80,{margin_v},1"
             ),
             "",
             "[Events]",
@@ -466,6 +548,7 @@ def create_karaoke_ass_variant(
     source_subtitle_file: str,
     subtitle_file: str,
     video_aspect=None,
+    style_options: dict | None = None,
 ) -> bool:
     """Copy karaoke events into an ASS file with aspect-appropriate styling."""
     try:
@@ -496,7 +579,10 @@ def create_karaoke_ass_variant(
             return False
         ensure_file_path_exists(subtitle_file)
         with open(subtitle_file, "w", encoding="utf-8") as file:
-            file.write(f"{_build_ass_header(video_aspect)}\n{event_body}\n")
+            file.write(
+                f"{_build_ass_header(video_aspect, style_options=style_options)}\n"
+                f"{event_body}\n"
+            )
         logger.info(f"completed, ASS karaoke subtitle variant created: {subtitle_file}")
         return True
     except Exception as e:
@@ -848,6 +934,7 @@ def _build_karaoke_ass_from_word_timings(
     subtitle_items,
     word_timings,
     video_aspect=None,
+    style_options: dict | None = None,
 ) -> str:
     events = []
     for subtitle_item in subtitle_items:
@@ -889,7 +976,11 @@ def _build_karaoke_ass_from_word_timings(
 
     if not events:
         return ""
-    return f"{_build_ass_header(video_aspect)}\n" + "\n".join(events) + "\n"
+    return (
+        f"{_build_ass_header(video_aspect, style_options=style_options)}\n"
+        + "\n".join(events)
+        + "\n"
+    )
 
 
 def create_karaoke_ass_from_word_timings(
@@ -897,12 +988,14 @@ def create_karaoke_ass_from_word_timings(
     word_timings,
     subtitle_file: str,
     video_aspect=None,
+    style_options: dict | None = None,
 ) -> bool:
     try:
         subtitle_text = _build_karaoke_ass_from_word_timings(
             subtitle_items,
             word_timings,
             video_aspect=video_aspect,
+            style_options=style_options,
         )
         if not subtitle_text:
             logger.warning(
@@ -923,11 +1016,46 @@ def create_karaoke_ass_from_word_timings(
         return False
 
 
+def _estimated_word_timings_from_subtitle_items(subtitle_items) -> list[dict]:
+    word_timings = []
+    for subtitle_item in subtitle_items or []:
+        if not isinstance(subtitle_item, (tuple, list)) or len(subtitle_item) < 3:
+            continue
+        time_range = _subtitle_item_time_range(subtitle_item[1])
+        tokens = re.findall(r"\S+", str(subtitle_item[2] or ""))
+        if time_range is None or not tokens:
+            continue
+
+        start_seconds, end_seconds = time_range
+        duration = end_seconds - start_seconds
+        if duration <= 0:
+            continue
+        weights = [
+            max(1, len(re.sub(r"[^\w]+", "", token, flags=re.UNICODE)))
+            for token in tokens
+        ]
+        total_weight = sum(weights)
+        elapsed_weight = 0
+        for token, weight in zip(tokens, weights):
+            word_start = start_seconds + (duration * elapsed_weight / total_weight)
+            elapsed_weight += weight
+            word_end = start_seconds + (duration * elapsed_weight / total_weight)
+            word_timings.append(
+                {
+                    "text": token,
+                    "start_time": word_start,
+                    "end_time": word_end,
+                }
+            )
+    return word_timings
+
+
 def _build_karaoke_ass_from_edge_cues(
     sub_maker: SubMaker,
     video_aspect=None,
     text: str = "",
     subtitle_items=None,
+    style_options: dict | None = None,
 ) -> str:
     events = []
     current_tokens = []
@@ -1009,7 +1137,11 @@ def _build_karaoke_ass_from_edge_cues(
     if not events:
         return ""
 
-    return f"{_build_ass_header(video_aspect)}\n" + "\n".join(events) + "\n"
+    return (
+        f"{_build_ass_header(video_aspect, style_options=style_options)}\n"
+        + "\n".join(events)
+        + "\n"
+    )
 
 
 def create_karaoke_ass_subtitle(
@@ -1018,18 +1150,38 @@ def create_karaoke_ass_subtitle(
     video_aspect=None,
     text: str = "",
     subtitle_items=None,
+    style_options: dict | None = None,
 ) -> bool:
     try:
-        if not getattr(sub_maker, "cues", []):
-            logger.warning("ASS karaoke subtitle requested, but no edge cues found")
-            return False
-
-        subtitle_text = _build_karaoke_ass_from_edge_cues(
-            sub_maker,
-            video_aspect=video_aspect,
-            text=text,
-            subtitle_items=subtitle_items,
-        )
+        if getattr(sub_maker, "cues", []):
+            subtitle_text = _build_karaoke_ass_from_edge_cues(
+                sub_maker,
+                video_aspect=video_aspect,
+                text=text,
+                subtitle_items=subtitle_items,
+                style_options=style_options,
+            )
+        else:
+            if not subtitle_items:
+                logger.warning("ASS karaoke subtitle requested, but no edge cues found")
+                return False
+            estimated_word_timings = _estimated_word_timings_from_subtitle_items(
+                subtitle_items
+            )
+            subtitle_text = _build_karaoke_ass_from_word_timings(
+                subtitle_items,
+                estimated_word_timings,
+                video_aspect=video_aspect,
+                style_options=style_options,
+            )
+            if subtitle_text:
+                logger.info(
+                    "created ASS karaoke timing from subtitle intervals because "
+                    "the TTS provider supplied no word cues"
+                )
+            else:
+                logger.warning("ASS karaoke subtitle requested, but no edge cues found")
+                return False
         if not subtitle_text:
             logger.warning("ASS karaoke subtitle requested, but no valid cues found")
             return False

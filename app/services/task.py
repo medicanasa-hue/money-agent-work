@@ -780,6 +780,18 @@ def _create_script_timed_subtitle_for_custom_audio(
     return bool(subtitle.file_to_subtitles(subtitle_file))
 
 
+def _karaoke_ass_style_options(params) -> dict:
+    return {
+        "font_name": getattr(params, "font_name", None),
+        "font_size": getattr(params, "font_size", None),
+        "text_fore_color": getattr(params, "text_fore_color", None),
+        "stroke_color": getattr(params, "stroke_color", None),
+        "stroke_width": getattr(params, "stroke_width", None),
+        "subtitle_position": getattr(params, "subtitle_position", None),
+        "custom_position": getattr(params, "custom_position", None),
+    }
+
+
 def generate_subtitle(task_id, params, video_script, sub_maker, audio_file):
     '''
     Generate subtitle for the video script.
@@ -937,13 +949,24 @@ def generate_subtitle(task_id, params, video_script, sub_maker, audio_file):
 
     if subtitle_style == "karaoke":
         ass_subtitle_path = path.join(task_directory, "subtitle.ass")
+        ass_style_options = _karaoke_ass_style_options(params)
         if subtitle_provider == "whisper" or subtitle_fallback:
             ass_created = voice.create_karaoke_ass_from_word_timings(
                 subtitle_items=render_subtitle_lines,
                 word_timings=word_timings,
                 subtitle_file=ass_subtitle_path,
                 video_aspect=getattr(params, "video_aspect", None),
+                style_options=ass_style_options,
             )
+            if not ass_created:
+                ass_created = voice.create_karaoke_ass_subtitle(
+                    sub_maker=voice.SubMaker(),
+                    subtitle_file=ass_subtitle_path,
+                    video_aspect=getattr(params, "video_aspect", None),
+                    text=video_script,
+                    subtitle_items=render_subtitle_lines,
+                    style_options=ass_style_options,
+                )
             if ass_created:
                 selected_subtitle_path = ass_subtitle_path
         elif edge_karaoke_subtitle_created:
@@ -953,6 +976,7 @@ def generate_subtitle(task_id, params, video_script, sub_maker, audio_file):
                 video_aspect=getattr(params, "video_aspect", None),
                 text=video_script,
                 subtitle_items=render_subtitle_lines,
+                style_options=ass_style_options,
             )
             if ass_created:
                 selected_subtitle_path = ass_subtitle_path
@@ -1245,6 +1269,16 @@ def generate_final_videos(
         audio_duration = expected_audio_duration
     if not isinstance(audio_duration, (int, float)) or audio_duration <= 0:
         audio_duration = float(voice.get_audio_duration(audio_file) or 0)
+    outro_image_file = str(
+        getattr(params, "outro_image_file", "") or ""
+    ).strip()
+    try:
+        outro_duration = float(getattr(params, "outro_duration", 0) or 0)
+    except (TypeError, ValueError):
+        outro_duration = 0.0
+    if not outro_image_file or not math.isfinite(outro_duration) or outro_duration <= 0:
+        outro_duration = 0.0
+    expected_video_duration = audio_duration + outro_duration
     render_aspects = _render_aspects(params)
     use_aspect_filenames = bool(params.video_aspects)
     render_count = params.video_count * len(render_aspects)
@@ -1310,6 +1344,8 @@ def generate_final_videos(
                     threads=params.n_threads,
                     cue_end_times=cue_end_times,
                     clip_speed=getattr(params, "video_clip_speed", 1.0),
+                    outro_image_file=outro_image_file,
+                    outro_duration=outro_duration,
                 )
             except Exception:
                 logger.exception(
@@ -1345,7 +1381,7 @@ def generate_final_videos(
                     service.generate_bgm(
                         video_path=combined_video_path,
                         output_path=generated_bgm_path,
-                        video_duration=audio_duration,
+                        video_duration=expected_video_duration,
                         prompt=_get_video_music_prompt(params),
                     )
                     bgm_file_override = generated_bgm_path
@@ -1416,7 +1452,7 @@ def generate_final_videos(
                 try:
                     quality_kwargs = {
                         "expected_aspect": video_aspect,
-                        "expected_duration": audio_duration,
+                        "expected_duration": expected_video_duration,
                         "expected_encoding": video.get_video_encoding_contract(),
                     }
                     if (

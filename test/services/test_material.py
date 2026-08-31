@@ -345,6 +345,65 @@ class TestMaterialTlsVerification(unittest.TestCase):
             self.assertEqual(os.listdir(temp_dir), [])
             self.assertTrue(get.call_args.kwargs["stream"])
 
+    def test_save_video_rejects_declared_content_length_above_limit(self):
+        close = Mock()
+
+        def unexpected_stream(*, chunk_size):
+            raise AssertionError("oversized response body must not be read")
+
+        fake_response = SimpleNamespace(
+            headers={"Content-Length": "6", "Content-Type": "video/mp4"},
+            iter_content=unexpected_stream,
+            close=close,
+        )
+
+        with (
+            tempfile.TemporaryDirectory() as temp_dir,
+            patch.object(material.requests, "get", return_value=fake_response),
+            patch.object(material, "_MAX_VIDEO_DOWNLOAD_BYTES", 5, create=True),
+        ):
+            video_path = material.save_video(
+                "https://example.com/oversized.mp4", save_dir=temp_dir
+            )
+
+            self.assertEqual(video_path, "")
+            self.assertEqual(os.listdir(temp_dir), [])
+
+        close.assert_called_once_with()
+
+    def test_save_video_stops_stream_when_received_bytes_exceed_limit(self):
+        close = Mock()
+        fake_response = SimpleNamespace(
+            headers={"Content-Type": "video/mp4"},
+            iter_content=lambda chunk_size: iter((b"abc", b"def")),
+            close=close,
+        )
+
+        class FakeVideoFileClip:
+            duration = 1
+            fps = 24
+
+            def __init__(self, path):
+                self.path = path
+
+            def close(self):
+                return None
+
+        with (
+            tempfile.TemporaryDirectory() as temp_dir,
+            patch.object(material.requests, "get", return_value=fake_response),
+            patch.object(material, "VideoFileClip", FakeVideoFileClip),
+            patch.object(material, "_MAX_VIDEO_DOWNLOAD_BYTES", 5, create=True),
+        ):
+            video_path = material.save_video(
+                "https://example.com/streamed-oversized.mp4", save_dir=temp_dir
+            )
+
+            self.assertEqual(video_path, "")
+            self.assertEqual(os.listdir(temp_dir), [])
+
+        close.assert_called_once_with()
+
     def test_save_video_closes_a_stream_when_writing_fails(self):
         close = Mock()
         fake_response = SimpleNamespace(content=b"fake-video", close=close)
@@ -2370,6 +2429,37 @@ class TestMaterialSearchRandomization(unittest.TestCase):
         self.assertEqual(results[0].width, 2160)
         self.assertEqual(results[0].height, 3840)
 
+    def test_pexels_provider_skips_malformed_item_and_keeps_valid_results(self):
+        config.app["pexels_api_keys"] = ["pexels-key"]
+        fake_response = SimpleNamespace(
+            json=lambda: {
+                "videos": [
+                    {},
+                    {
+                        "duration": 8,
+                        "video_files": [
+                            {
+                                "width": 1080,
+                                "height": 1920,
+                                "link": "https://example.com/valid.mp4",
+                            }
+                        ],
+                    },
+                ]
+            }
+        )
+
+        with patch(
+            "app.services.providers.pexels.requests.get",
+            return_value=fake_response,
+        ):
+            results = PexelsProvider().search("cat", minimum_duration=1)
+
+        self.assertEqual(
+            [item.url for item in results],
+            ["https://example.com/valid.mp4"],
+        )
+
     def test_pexels_provider_prefers_native_aspect_before_resolution(self):
         config.app["pexels_api_keys"] = ["pexels-key"]
         config.proxy.clear()
@@ -2530,6 +2620,37 @@ class TestMaterialSearchRandomization(unittest.TestCase):
         self.assertEqual(results[0].url, "https://example.com/portrait.mp4")
         self.assertEqual(results[0].width, 1080)
         self.assertEqual(results[0].height, 1920)
+
+    def test_pixabay_provider_skips_malformed_item_and_keeps_valid_results(self):
+        config.app["pixabay_api_keys"] = ["pixabay-key"]
+        fake_response = SimpleNamespace(
+            json=lambda: {
+                "hits": [
+                    {},
+                    {
+                        "duration": 8,
+                        "videos": {
+                            "large": {
+                                "width": 1080,
+                                "height": 1920,
+                                "url": "https://example.com/valid.mp4",
+                            }
+                        },
+                    },
+                ]
+            }
+        )
+
+        with patch(
+            "app.services.providers.pixabay.requests.get",
+            return_value=fake_response,
+        ):
+            results = PixabayProvider().search("cat", minimum_duration=1)
+
+        self.assertEqual(
+            [item.url for item in results],
+            ["https://example.com/valid.mp4"],
+        )
 
     def test_pixabay_provider_uses_best_matching_video_variant(self):
         config.app["pixabay_api_keys"] = ["pixabay-key"]
@@ -2814,6 +2935,86 @@ class TestMaterialSearchRandomization(unittest.TestCase):
         self.assertEqual(
             results[0].attribution,
             "File:City skyline.webm - City Camera Crew - CC BY-SA 4.0",
+        )
+
+    def test_wikimedia_provider_skips_search_results_without_titles(self):
+        config.proxy.clear()
+        search_response = SimpleNamespace(
+            json=lambda: {
+                "query": {
+                    "search": [{}, {"title": "File:City.webm"}],
+                }
+            }
+        )
+        info_response = SimpleNamespace(
+            json=lambda: {
+                "query": {
+                    "pages": {
+                        "1": {
+                            "title": "File:City.webm",
+                            "videoinfo": [
+                                {
+                                    "mediatype": "VIDEO",
+                                    "duration": 8,
+                                    "mime": "video/webm",
+                                    "url": "https://example.com/city.webm",
+                                }
+                            ],
+                        }
+                    }
+                }
+            }
+        )
+
+        with patch(
+            "app.services.providers.wikimedia.requests.get",
+            side_effect=[search_response, info_response],
+        ):
+            results = WikimediaProvider().search("city", minimum_duration=1)
+
+        self.assertEqual(
+            [item.url for item in results],
+            ["https://example.com/city.webm"],
+        )
+
+    def test_wikimedia_provider_skips_malformed_videoinfo_pages(self):
+        config.proxy.clear()
+        search_response = SimpleNamespace(
+            json=lambda: {
+                "query": {"search": [{"title": "File:City.webm"}]}
+            }
+        )
+        info_response = SimpleNamespace(
+            json=lambda: {
+                "query": {
+                    "pages": {
+                        "1": "bad-page",
+                        "2": {"videoinfo": ["bad-video-info"]},
+                        "3": {
+                            "title": "File:City.webm",
+                            "videoinfo": [
+                                {
+                                    "mediatype": "VIDEO",
+                                    "duration": 8,
+                                    "mime": "video/webm",
+                                    "url": "https://example.com/city.webm",
+                                }
+                            ],
+                        },
+                    }
+                }
+            }
+        )
+
+        with patch(
+            "app.services.providers.wikimedia.requests.get",
+            side_effect=[search_response, info_response],
+        ):
+            results = WikimediaProvider().search("city", minimum_duration=1)
+
+        self.assertEqual(
+            [item.url for item in results],
+            ["https://example.com/city.webm"],
         )
 
     def test_wikimedia_provider_prefers_selected_derivative_dimensions(self):

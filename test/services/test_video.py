@@ -94,6 +94,44 @@ class TestVideoService(unittest.TestCase):
         )
         warning.assert_not_called()
 
+    def test_append_outro_card_places_rendered_card_after_content(self):
+        """The branded card must be the final clip, not a shuffled material."""
+        with tempfile.TemporaryDirectory(dir=utils.root_dir()) as temp_dir:
+            content_file = os.path.join(temp_dir, "combined.mp4")
+            image_file = os.path.join(temp_dir, "outro.jpeg")
+            Path(content_file).write_bytes(b"content")
+            Path(image_file).write_bytes(b"image")
+
+            with (
+                patch.object(
+                    vd,
+                    "_fast_render_image_with_ffmpeg",
+                    return_value=True,
+                ) as render_image,
+                patch.object(vd, "concat_video_clips_with_ffmpeg") as concat,
+                patch.object(vd.os, "replace") as replace,
+            ):
+                result = vd.append_outro_card(
+                    video_file=content_file,
+                    image_file=image_file,
+                    duration=2.0,
+                    video_aspect=vd.VideoAspect.portrait,
+                    threads=3,
+                )
+
+        outro_clip = os.path.join(temp_dir, "combined.outro-card.mp4")
+        merged_file = os.path.join(temp_dir, "combined.with-outro.mp4")
+        self.assertEqual(result, content_file)
+        self.assertEqual(
+            concat.call_args.kwargs["clip_files"],
+            [content_file, outro_clip],
+        )
+        self.assertEqual(concat.call_args.kwargs["output_file"], merged_file)
+        self.assertEqual(render_image.call_args.kwargs["duration"], 2.0)
+        self.assertEqual(render_image.call_args.kwargs["target_width"], 1080)
+        self.assertEqual(render_image.call_args.kwargs["target_height"], 1920)
+        replace.assert_called_once_with(merged_file, content_file)
+
     def test_delete_files_logs_actionable_os_errors(self):
         """权限等真实清理失败必须保留路径和系统错误，方便定位残留文件。"""
         with (

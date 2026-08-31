@@ -6,6 +6,8 @@ import re
 import subprocess
 from typing import Any, Callable
 
+from app.utils import utils
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
@@ -38,10 +40,13 @@ def is_openmontage_output_path(value: object) -> bool:
 
 
 def _probe_openmontage_video(path: Path) -> dict[str, Any] | None:
+    ffprobe_binary = utils.get_ffprobe_binary()
+    if not ffprobe_binary:
+        return None
     try:
         result = subprocess.run(
             [
-                "ffprobe",
+                ffprobe_binary,
                 "-v",
                 "error",
                 "-select_streams",

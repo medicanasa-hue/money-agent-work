@@ -566,3 +566,5 @@ hide_log = false
 # subtitle_background_enabled = false
 # subtitle_background_color = "#000000"
 # rounded_subtitle_background = false
+# outro_image_file = "resource/branding/cebin_bilimi_outro.jpeg"
+# outro_duration = 2.0

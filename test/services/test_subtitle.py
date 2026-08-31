@@ -6,7 +6,6 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
 
 # 测试文件直接运行时，也能从仓库根目录导入 app 包。
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))

@@ -92,6 +92,8 @@ class VideoParams(BaseModel):
     video_transition_mode: Optional[VideoTransitionMode] = VideoTransitionMode.crossfade
     video_clip_duration: Optional[int] = 5
     video_clip_speed: Optional[float] = 1.0
+    outro_image_file: Optional[str] = ""
+    outro_duration: float = Field(default=2.0, ge=0, le=10)
     match_materials_to_script: bool = False
     smart_scene_queries: bool = False
     video_count: Optional[int] = 1

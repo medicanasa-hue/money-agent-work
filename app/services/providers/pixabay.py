@@ -66,7 +66,12 @@ class PixabayProvider(VideoProvider):
                 return video_items
 
             for v in response["hits"]:
-                duration = v["duration"]
+                if not isinstance(v, dict):
+                    continue
+                try:
+                    duration = float(v.get("duration"))
+                except (TypeError, ValueError):
+                    continue
                 if duration < minimum_duration:
                     continue
                 videos = v.get("videos")
@@ -77,9 +82,12 @@ class PixabayProvider(VideoProvider):
                 )
                 if best_video:
                     video, w, h = best_video
+                    video_url = video.get("url")
+                    if not isinstance(video_url, str) or not video_url.strip():
+                        continue
                     item = MaterialInfo()
                     item.provider = "pixabay"
-                    item.url = video["url"]
+                    item.url = video_url
                     item.preview_url = str(video.get("thumbnail") or "").strip()
                     item.duration = duration
                     item.width = w

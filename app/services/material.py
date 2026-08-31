@@ -68,6 +68,7 @@ _api_key_lock = threading.Lock()
 _VIDEO_DOWNLOAD_TIMEOUT = (30, 90)
 _VIDEO_DOWNLOAD_TOTAL_TIMEOUT_SECONDS = 120
 _VIDEO_DOWNLOAD_CHUNK_SIZE = 1024 * 1024
+_MAX_VIDEO_DOWNLOAD_BYTES = 512 * 1024 * 1024
 
 
 def _read_video_response_content(response) -> bytes | None:
@@ -75,7 +76,12 @@ def _read_video_response_content(response) -> bytes | None:
     iter_content = getattr(response, "iter_content", None)
     if not callable(iter_content):
         content = getattr(response, "content", b"")
-        return content if isinstance(content, bytes) else None
+        if not isinstance(content, bytes):
+            return None
+        if len(content) > _MAX_VIDEO_DOWNLOAD_BYTES:
+            logger.warning("video download exceeded its size limit")
+            return None
+        return content
 
     deadline = time.monotonic() + _VIDEO_DOWNLOAD_TOTAL_TIMEOUT_SECONDS
     content = bytearray()
@@ -85,6 +91,9 @@ def _read_video_response_content(response) -> bytes | None:
                 logger.warning("video download exceeded its total time budget")
                 return None
             if isinstance(chunk, bytes) and chunk:
+                if len(content) + len(chunk) > _MAX_VIDEO_DOWNLOAD_BYTES:
+                    logger.warning("video download exceeded its size limit")
+                    return None
                 content.extend(chunk)
     except requests.RequestException as error:
         logger.warning(f"video download stream failed: {safe_error_details(error)}")
@@ -1076,22 +1085,30 @@ def save_video(
         _close_response(resp)
         return ""
 
+    declared_length_value = resp_headers.get("Content-Length")
+    declared_length = None
+    if declared_length_value is not None:
+        try:
+            declared_length = int(declared_length_value)
+        except (TypeError, ValueError):
+            pass
+        if declared_length is not None and declared_length > _MAX_VIDEO_DOWNLOAD_BYTES:
+            logger.warning("video download exceeded its size limit")
+            _close_response(resp)
+            return ""
+
     content = _read_video_response_content(resp)
     if content is None:
         _close_response(resp)
         return ""
-    declared_length = resp_headers.get("Content-Length")
     if declared_length is not None:
-        try:
-            if int(declared_length) > len(content):
-                logger.warning(
-                    f"video download truncated: expected {declared_length} bytes, "
-                    f"got {len(content)}"
-                )
-                _close_response(resp)
-                return ""
-        except ValueError:
-            pass
+        if declared_length > len(content):
+            logger.warning(
+                f"video download truncated: expected {declared_length} bytes, "
+                f"got {len(content)}"
+            )
+            _close_response(resp)
+            return ""
 
     try:
         with open(video_path, "wb") as f:
