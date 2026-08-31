@@ -4727,14 +4727,26 @@ def _load_subtitle_suspicion_report(job):
             }
         )
 
-    if not items:
+    timing_source = report.get("timing_source")
+    if timing_source not in ("script_estimate", "whisper"):
+        timing_source = ""
+    if not items and timing_source != "script_estimate":
         return None
-    return {"suspicious_count": len(items), "items": items}
+    return {
+        "suspicious_count": len(items),
+        "items": items,
+        "timing_source": timing_source,
+    }
 
 
 def _render_subtitle_suspicion_report(job):
     report = _load_subtitle_suspicion_report(job)
     if not report:
+        return
+
+    if report.get("timing_source") == "script_estimate":
+        st.warning(tr("Subtitle Timing Approximate"))
+    if not report["items"]:
         return
 
     st.warning(
@@ -8996,6 +9008,7 @@ def _render_partial_success_warning(result):
 def _render_generation_completion_status(result):
     if not _render_partial_success_warning(result):
         st.success(tr("Video Generation Completed"))
+    _render_subtitle_suspicion_report(result)
 
 
 def _render_failed_generation_warning(result):
@@ -10068,6 +10081,7 @@ if start_button or batch_button:
                     "subject": subject,
                     "task_id": task_id,
                     "videos": result.get("videos", []),
+                    "subtitle_path": result.get("subtitle_path"),
                     "material_attributions": result.get("material_attributions"),
                     "metadata": metadata,
                     "viral_analysis": viral_analysis,
@@ -10108,6 +10122,7 @@ if start_button or batch_button:
         for item in batch_results:
             with st.expander(item["subject"], expanded=False):
                 _render_partial_success_warning(item)
+                _render_subtitle_suspicion_report(item)
                 for url in item["videos"]:
                     st.video(url)
                 _render_material_sources(item)

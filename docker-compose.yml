@@ -1,8 +1,18 @@
 x-common-volumes: &common-volumes
-  - ./:/MoneyPrinterTurbo
+  # Run the code baked into the image. Rebuild after source changes.
+  # Prepare config.toml from config.example.toml before starting Compose.
+  - type: bind
+    source: ./config.toml
+    target: /MoneyPrinterTurbo/config.toml
+    bind:
+      create_host_path: false
+  - type: bind
+    source: ./storage
+    target: /MoneyPrinterTurbo/storage
 
 services:
   webui:
+    platform: linux/amd64
     build:
       context: .
       dockerfile: Dockerfile
@@ -13,6 +23,7 @@ services:
     volumes: *common-volumes
     restart: always
   api:
+    platform: linux/amd64
     build:
       context: .
       dockerfile: Dockerfile

@@ -20,3 +20,7 @@ socksio==1.0.0
 pydub==0.25.1
 audioop-lts==0.2.2; python_version >= "3.13"
 litellm==1.86.2
+# Security pins for shared transitive runtime dependencies.
+aiohttp==3.14.3
+cryptography==50.0.1
+gitpython==3.1.58

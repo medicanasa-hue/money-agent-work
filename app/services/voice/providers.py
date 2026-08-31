@@ -159,44 +159,14 @@ def siliconflow_tts(
                 try:
                     # 尝试使用moviepy获取音频长度
                     audio_clip = voice_module.AudioFileClip(voice_file)
-                    audio_duration = audio_clip.duration
-                    audio_clip.close()
-
-                    # 将音频长度转换为100纳秒单位（与edge_tts兼容）
+                    try:
+                        audio_duration = audio_clip.duration
+                    finally:
+                        audio_clip.close()
                     audio_duration_100ns = int(audio_duration * 10000000)
-
-                    # 使用文本分割来创建更准确的字幕
-                    # 将文本按标点符号分割成句子
-                    sentences = utils.split_string_by_punctuations(text)
-
-                    if sentences:
-                        # 计算每个句子的大致时长（按字符数比例分配）
-                        total_chars = sum(len(s) for s in sentences)
-                        char_duration = (
-                            audio_duration_100ns / total_chars if total_chars > 0 else 0
-                        )
-
-                        current_offset = 0
-                        for sentence in sentences:
-                            if not sentence.strip():
-                                continue
-
-                            # 计算当前句子的时长
-                            sentence_chars = len(sentence)
-                            sentence_duration = int(sentence_chars * char_duration)
-
-                            # 添加到SubMaker
-                            sub_maker.subs.append(sentence)
-                            sub_maker.offset.append(
-                                (current_offset, current_offset + sentence_duration)
-                            )
-
-                            # 更新偏移量
-                            current_offset += sentence_duration
-                    else:
-                        # 如果无法分割，则使用整个文本作为一个字幕
-                        sub_maker.subs = [text]
-                        sub_maker.offset = [(0, audio_duration_100ns)]
+                    sub_maker = populate_legacy_submaker_with_full_text(
+                        sub_maker, text, audio_duration
+                    )
 
                 except Exception as e:
                     logger.warning(f"Failed to create accurate subtitles: {str(e)}")
@@ -660,8 +630,10 @@ def elevenlabs_tts(
                 f.write(response.content)
 
             audio_clip = voice_module.AudioFileClip(voice_file)
-            audio_duration = audio_clip.duration
-            audio_clip.close()
+            try:
+                audio_duration = audio_clip.duration
+            finally:
+                audio_clip.close()
 
             sub_maker = ensure_legacy_submaker_fields(SubMaker())
             logger.success(f"elevenlabs tts succeeded: {voice_file}")
@@ -747,8 +719,10 @@ def chatterbox_tts(
                 f.write(response.content)
 
             audio_clip = voice_module.AudioFileClip(voice_file)
-            audio_duration = audio_clip.duration
-            audio_clip.close()
+            try:
+                audio_duration = audio_clip.duration
+            finally:
+                audio_clip.close()
 
             sub_maker = ensure_legacy_submaker_fields(SubMaker())
             logger.success(f"chatterbox tts succeeded: {voice_file}")

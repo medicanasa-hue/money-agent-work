@@ -1,7 +1,9 @@
 import os
 import sys
 import unittest
+from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
@@ -14,6 +16,30 @@ RUN_INTEGRATION_TESTS = os.environ.get("MPT_RUN_INTEGRATION_TESTS", "").lower() 
     "true",
     "yes",
 }
+
+
+@dataclass(kw_only=True, slots=True)
+class _TextInputRequest:
+    input_text: str
+
+
+@dataclass(kw_only=True, slots=True)
+class _MediaSource:
+    url: str
+
+
+@dataclass(kw_only=True, slots=True)
+class _VideoInputRequest:
+    media_source: _MediaSource
+    embedding_option: list[str]
+    embedding_scope: list[str]
+
+
+_SDK_INPUTS = SimpleNamespace(
+    TextInputRequest=_TextInputRequest,
+    MediaSource=_MediaSource,
+    VideoInputRequest=_VideoInputRequest,
+)
 
 
 class TestTwelveLabsService(unittest.TestCase):
@@ -235,7 +261,10 @@ class TestTwelveLabsService(unittest.TestCase):
         client = MagicMock()
         client.embed.v_2.create.return_value = response
 
-        with patch.object(twelvelabs, "_client", return_value=client):
+        with (
+            patch.dict(sys.modules, {"twelvelabs": _SDK_INPUTS}),
+            patch.object(twelvelabs, "_client", return_value=client),
+        ):
             result = twelvelabs.embed_video_visual(
                 "https://example.com/groceries.mp4"
             )
@@ -248,6 +277,8 @@ class TestTwelveLabsService(unittest.TestCase):
             kwargs["video"].media_source.url,
             "https://example.com/groceries.mp4",
         )
+        self.assertEqual(kwargs["video"].embedding_option, ["visual"])
+        self.assertEqual(kwargs["video"].embedding_scope, ["asset"])
 
     def test_embed_multimodal_text_uses_v2_text_embedding(self):
         config.app["twelvelabs_api_keys"] = ["tlk_test"]
@@ -258,7 +289,10 @@ class TestTwelveLabsService(unittest.TestCase):
         client = MagicMock()
         client.embed.v_2.create.return_value = response
 
-        with patch.object(twelvelabs, "_client", return_value=client):
+        with (
+            patch.dict(sys.modules, {"twelvelabs": _SDK_INPUTS}),
+            patch.object(twelvelabs, "_client", return_value=client),
+        ):
             result = twelvelabs.embed_multimodal_text("lower household costs")
 
         self.assertEqual(result, [1.0, 0.0])

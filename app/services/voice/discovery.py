@@ -39,36 +39,24 @@ def get_siliconflow_voices() -> list[str]:
 
 
 def get_gemini_voices() -> list[str]:
-    """
-    获取Gemini TTS的声音列表
+    """Return Google's preset voices with style labels, not inferred genders.
 
-    Returns:
-        声音列表，格式为 ["gemini:Zephyr-Female", "gemini:Puck-Male", ...]
+    https://ai.google.dev/gemini-api/docs/speech-generation#voice-options
+    Legacy saved gender labels remain accepted by the dispatch layer.
     """
-    # Gemini TTS支持的语音列表
-    voices_with_gender = [
-        ("Zephyr", "Female"),
-        ("Puck", "Male"),
-        ("Charon", "Male"),
-        ("Kore", "Female"),
-        ("Fenrir", "Male"),
-        ("Aoede", "Female"),
-        ("Thalia", "Female"),
-        ("Sage", "Male"),
-        ("Echo", "Female"),
-        ("Harmony", "Female"),
-        ("Lux", "Female"),
-        ("Nova", "Female"),
-        ("Vale", "Male"),
-        ("Orion", "Male"),
-        ("Atlas", "Male"),
-    ]
-
-    # 添加gemini:前缀，并格式化为显示名称
-    return [
-        f"gemini:{voice}-{gender}"
-        for voice, gender in voices_with_gender
-    ]
+    voices_with_style = (
+        ("Zephyr", "Bright"), ("Puck", "Upbeat"), ("Charon", "Informative"),
+        ("Kore", "Firm"), ("Fenrir", "Excitable"), ("Leda", "Youthful"),
+        ("Orus", "Firm"), ("Aoede", "Breezy"), ("Callirrhoe", "Easy-going"),
+        ("Autonoe", "Bright"), ("Enceladus", "Breathy"), ("Iapetus", "Clear"),
+        ("Umbriel", "Easy-going"), ("Algieba", "Smooth"), ("Despina", "Smooth"),
+        ("Erinome", "Clear"), ("Algenib", "Gravelly"), ("Rasalgethi", "Informative"),
+        ("Laomedeia", "Upbeat"), ("Achernar", "Soft"), ("Alnilam", "Firm"),
+        ("Schedar", "Even"), ("Gacrux", "Mature"), ("Pulcherrima", "Forward"),
+        ("Achird", "Friendly"), ("Zubenelgenubi", "Casual"), ("Vindemiatrix", "Gentle"),
+        ("Sadachbia", "Lively"), ("Sadaltager", "Knowledgeable"), ("Sulafat", "Warm"),
+    )
+    return [f"gemini:{name}-{style}" for name, style in voices_with_style]
 
 
 def get_mimo_voices() -> list[str]:

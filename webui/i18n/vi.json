@@ -821,6 +821,7 @@
         "Subtitles": "Subtitles",
         "Download Subtitles": "Download subtitles",
         "Subtitle Review Needed": "{count} subtitle line(s) may need review.",
+        "Subtitle Timing Approximate": "Thời gian phụ đề chỉ là ước tính vì tính năng nhận dạng giọng nói không khả dụng. Hãy kiểm tra thời gian trước khi xuất bản.",
         "Subtitle Layout Ready": "Subtitle layout is ready for {cue_count} cue(s).",
         "Subtitle Layout Needs Review": "Subtitle layout needs review: {issue_count} potential issue(s) across {cue_count} cue(s).",
         "Subtitle Time": "Time",

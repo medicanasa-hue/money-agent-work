@@ -1,10 +1,17 @@
+# Set MPT_IMAGE explicitly to an image built from this repository. Prefer the
+# publication digest: ghcr.io/<owner>/<repo>@sha256:<digest>.
 x-common-volumes: &common-volumes
-  - ./config.toml:/MoneyPrinterTurbo/config.toml
+  - type: bind
+    source: ./config.toml
+    target: /MoneyPrinterTurbo/config.toml
+    bind:
+      create_host_path: false
   - ./storage:/MoneyPrinterTurbo/storage
 
 services:
   webui:
-    image: ghcr.io/harry0703/moneyprinterturbo:latest
+    platform: linux/amd64
+    image: "${MPT_IMAGE:?Set MPT_IMAGE to your published image digest or full commit tag}"
     container_name: "moneyprinterturbo-webui"
     ports:
       - "127.0.0.1:8501:8501"
@@ -12,7 +19,8 @@ services:
     volumes: *common-volumes
     restart: always
   api:
-    image: ghcr.io/harry0703/moneyprinterturbo:latest
+    platform: linux/amd64
+    image: "${MPT_IMAGE:?Set MPT_IMAGE to your published image digest or full commit tag}"
     container_name: "moneyprinterturbo-api"
     ports:
       - "127.0.0.1:8080:8080"

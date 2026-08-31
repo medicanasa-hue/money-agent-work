@@ -2381,5 +2381,18 @@ def run_cli(argv: Sequence[str] | None = None) -> int:
     return 0
 
 
+def _force_utf8_console() -> None:
+    """Keep Unicode results printable on Windows legacy console code pages."""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if not callable(reconfigure):
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+        except (ValueError, OSError):
+            continue
+
+
 if __name__ == "__main__":
+    _force_utf8_console()
     raise SystemExit(run_cli())

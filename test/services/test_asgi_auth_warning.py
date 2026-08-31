@@ -50,10 +50,17 @@ class TestAsgiAuthWarning(unittest.TestCase):
         self.assertEqual(wildcard_origins, ["*"])
         self.assertFalse(wildcard_credentials)
 
-    def test_task_files_are_only_protected_for_authenticated_network_hosts(self):
+    def test_task_files_are_protected_on_all_hosts_when_a_key_is_configured(self):
         self.assertFalse(should_protect_task_outputs("", "0.0.0.0"))
-        self.assertFalse(should_protect_task_outputs("secret", "127.0.0.1"))
+        self.assertFalse(should_protect_task_outputs("   ", "127.0.0.1"))
+        self.assertTrue(should_protect_task_outputs("secret", "127.0.0.1"))
         self.assertTrue(should_protect_task_outputs("secret", "0.0.0.0"))
+        self.assertTrue(should_protect_task_outputs("secret", "::1"))
+
+    def test_invalid_key_configuration_never_disables_task_protection(self):
+        for invalid_key in (False, 0, [], {}):
+            with self.subTest(invalid_key=invalid_key):
+                self.assertTrue(should_protect_task_outputs(invalid_key, "127.0.0.1"))
 
 
 class TestTaskOutputStaticFiles(unittest.IsolatedAsyncioTestCase):

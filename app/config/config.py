@@ -1,3 +1,4 @@
+import errno
 import os
 import shutil
 import socket
@@ -233,10 +234,16 @@ def load_config():
 
     try:
         _config_ = toml.load(config_file)
-    except Exception as e:
-        logger.warning(f"load config failed: {str(e)}, try to load as utf-8-sig")
+    except (toml.TomlDecodeError, UnicodeDecodeError) as exc:
+        # Parser messages may contain configuration values, including API keys.
+        logger.warning(
+            "load config failed, retry with UTF-8 BOM compatibility: "
+            f"error={type(exc).__name__}"
+        )
         with open(config_file, mode="r", encoding="utf-8-sig") as fp:
-            _cfg_content = fp.read()
+            # utf-8-sig removes only one BOM; some Windows editors add more.
+            # Normalize in memory only so loading never rewrites user settings.
+            _cfg_content = fp.read().lstrip("\ufeff")
             _config_ = toml.loads(_cfg_content)
     return _config_
 
@@ -248,6 +255,9 @@ def save_config():
     Streamlit 的不同会话可能在相近时间触发配置保存。直接覆盖 config.toml 时，
     另一个线程可能读取到只写了一部分的 TOML 内容。这里使用进程内可重入锁串行化
     保存，并先写入同目录临时文件，再通过 os.replace 原子替换目标文件。
+
+    单文件 bind mount 无法被原子替换（EBUSY），只能在锁内原地保存并 fsync。
+    其它文件系统错误仍然抛出，避免覆盖原文件或掩盖权限和磁盘错误。
 
     这仍然保留项目现有的单用户全局配置语义，不额外引入复杂的多用户配置系统；
     主要用于避免多标签页或快速 rerun 时损坏配置文件。
@@ -284,7 +294,19 @@ def save_config():
                 f.write(serialized_config)
                 f.flush()
                 os.fsync(f.fileno())
-            os.replace(temp_path, config_file)
+            try:
+                os.replace(temp_path, config_file)
+            except OSError as exc:
+                if exc.errno != errno.EBUSY:
+                    raise
+                logger.warning(
+                    "atomic config replacement is unavailable for the mounted "
+                    "file; saving in place"
+                )
+                with open(config_file, mode="w", encoding="utf-8") as f:
+                    f.write(serialized_config)
+                    f.flush()
+                    os.fsync(f.fileno())
             _cfg.clear()
             _cfg.update(config_to_save)
         finally:

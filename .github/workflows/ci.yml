@@ -5,6 +5,13 @@ on:
   push:
     branches:
       - main
+      # The fork currently uses this as its default branch.
+      - codex/upgrade-v1.3.1
+
+env:
+  MPT_RUN_INTEGRATION_TESTS: "0"
+  HF_HUB_OFFLINE: "1"
+  TRANSFORMERS_OFFLINE: "1"
 
 jobs:
   tests:
@@ -107,6 +114,6 @@ jobs:
         run: uv run --no-sync ruff check --select F,E9 .
 
       - name: Run deterministic unit tests
-        run: >
-          uv run --no-sync python -X utf8 -m unittest discover
-          -s test -t . -p "test_*.py"
+        # Collect both pytest functions and unittest cases, including Windows
+        # Unicode regressions and the synthetic render smoke test.
+        run: uv run --no-sync python -X utf8 -m pytest -q test

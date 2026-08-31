@@ -490,6 +490,8 @@ fallback_model_size = "large-v3-turbo"
 # if you want to use GPU, set device="cuda"
 device = "cpu"
 compute_type = "int8"
+# Optional vocabulary hint for transcription, e.g. "MoneyPrinterTurbo, İstanbul".
+initial_prompt = ""
 
 # =============================================================================
 # Material Request Proxy / 素材请求代理

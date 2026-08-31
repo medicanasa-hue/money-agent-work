@@ -241,23 +241,51 @@ git clone https://github.com/harry0703/MoneyPrinterTurbo.git
 
 ### Docker 部署 🐳
 
-#### ① 启动 Docker
+#### ① 准备配置并在本地构建
 
-如果未安装 Docker，请先安装 https://www.docker.com/products/docker-desktop/
+如果尚未安装，请先安装 [Docker Desktop](https://www.docker.com/products/docker-desktop/)。Windows 用户也可以参考微软的 [WSL 安装文档](https://learn.microsoft.com/zh-cn/windows/wsl/install) 和 [WSL 容器文档](https://learn.microsoft.com/zh-cn/windows/wsl/tutorials/wsl-containers)。
 
-Windows 用户可以参考微软的文档：
+此分支默认使用本地代码构建镜像。启动 Compose 前，必须准备好 `config.toml` 文件和 `storage` 目录。仅在 `config.toml` 不存在时复制示例配置，**不要覆盖已有配置**。与直接启动应用不同，Compose 会拒绝挂载不存在的配置文件。
 
-1. https://learn.microsoft.com/zh-cn/windows/wsl/install
-2. https://learn.microsoft.com/zh-cn/windows/wsl/tutorials/wsl-containers
+macOS / Linux：
 
 ```shell
 cd MoneyPrinterTurbo
-docker compose -f docker-compose.release.yml up
+if [ ! -e config.toml ]; then cp -n config.example.toml config.toml; fi
+mkdir -p storage
+docker compose up --build
 ```
 
-> 默认推荐使用 `docker-compose.release.yml`，它会直接拉取 GitHub Container Registry 上的预构建镜像：`ghcr.io/harry0703/moneyprinterturbo:latest`。
-> 如果你需要本地重新构建镜像，可以继续使用 `docker compose up`。
-> 首次启动前，请将 `config.example.toml` 复制为 `config.toml`，供容器挂载使用。
+Windows PowerShell：
+
+```powershell
+cd MoneyPrinterTurbo
+if (-not (Test-Path -LiteralPath config.toml)) { Copy-Item -LiteralPath config.example.toml -Destination config.toml }
+if (-not (Test-Path -LiteralPath storage)) { New-Item -ItemType Directory -Path storage | Out-Null }
+docker compose up --build
+```
+
+镜像通过 `uv sync --locked --no-dev --no-install-project`，按 `uv.lock` 将运行依赖安装到 `/opt/venv`。主机只挂载 `config.toml` 和 `storage`，应用代码来自镜像。修改源码或依赖后，需要再次执行 `docker compose up --build`。
+
+当前容器目标为使用 CPU 镜像的 `linux/amd64`；Compose 会显式固定该平台，ARM 主机需要 amd64 模拟。GPU 部署是可选项，尚未在 GPU 硬件上完成验证。
+
+生产部署应先从自己的仓库发布镜像，再使用 `docker-compose.release.yml`；此分支不假定已有可用的预构建镜像。将 `MPT_IMAGE` 设置为实际发布的镜像引用，优先使用不可变的 digest，也可以使用已发布的 `:sha-<full-commit-sha>` 完整提交标签。请替换下方所有占位符。
+
+macOS / Linux：
+
+```shell
+export MPT_IMAGE='ghcr.io/<owner>/<repository>@sha256:<digest>'
+docker compose -f docker-compose.release.yml up -d
+```
+
+Windows PowerShell：
+
+```powershell
+$env:MPT_IMAGE = 'ghcr.io/<owner>/<repository>@sha256:<digest>'
+docker compose -f docker-compose.release.yml up -d
+```
+
+[容器工作流](.github/workflows/docker-ghcr.yml) 默认仅构建并测试。发布镜像需要在仓库默认分支手动运行，并启用 `publish`。Release Compose 必须显式设置 `MPT_IMAGE`，配置与存储挂载以及 localhost 端口绑定与本地构建方式相同。
 
 #### ② 访问 WebUI
 
@@ -285,7 +313,7 @@ uv python install 3.11
 uv sync --frozen
 ```
 
-如果你暂时不使用 `uv`，也可以继续使用 `venv + pip`
+如果你暂时不使用 `uv`，也可以继续使用 `venv + pip`。该兼容路径会独立解析传递依赖；需要严格复现锁定环境时，请使用上面的 uv 方式。
 
 ```shell
 python3.11 -m venv .venv

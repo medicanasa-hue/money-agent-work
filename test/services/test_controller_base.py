@@ -1,5 +1,7 @@
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
+from uuid import UUID
 
 from app.config import config
 from app.controllers import base
@@ -10,10 +12,12 @@ from app.models.exception import HttpException
 class TestControllerAuthentication(unittest.TestCase):
     def setUp(self):
         self.original_app_config = dict(config.app)
+        base.reset_auth_rate_limits()
 
     def tearDown(self):
         config.app.clear()
         config.app.update(self.original_app_config)
+        base.reset_auth_rate_limits()
 
     @staticmethod
     def _request(headers=None):
@@ -35,6 +39,46 @@ class TestControllerAuthentication(unittest.TestCase):
         generated = base.get_task_id(self._request())
         self.assertEqual(len(generated), 36)
         self.assertEqual(generated.count("-"), 4)
+
+    def test_get_task_id_preserves_printable_trace_ids(self):
+        for task_id in ("trace/123_abc.def:456", "istek-çığ-İstanbul", "x" * 128):
+            with self.subTest(task_id=task_id):
+                self.assertEqual(
+                    base.get_task_id(self._request({"x-task-id": task_id})), task_id
+                )
+
+    def test_get_task_id_replaces_malformed_or_unsafe_values_with_uuid(self):
+        generated_id = UUID("00000000-0000-4000-8000-000000000001")
+        invalid_values = (
+            None, "", 123, b"request-123", object(), "line\nforged",
+            "line\rforged", "column\tforged", "ansi\x1b[31m",
+            "unicode\u2028separator", "x" * 129,
+        )
+
+        with patch.object(base, "uuid4", return_value=generated_id):
+            for value in invalid_values:
+                with self.subTest(value=value):
+                    self.assertEqual(
+                        base.get_task_id(self._request({"x-task-id": value})),
+                        str(generated_id),
+                    )
+
+    def test_verify_token_does_not_log_unsafe_request_id(self):
+        config.app["api_key"] = "secret"
+        generated_id = UUID("00000000-0000-4000-8000-000000000001")
+        with (
+            patch.object(base, "uuid4", return_value=generated_id),
+            patch("app.models.exception.logger.error") as log_error,
+        ):
+            with self.assertRaises(HttpException):
+                base.verify_token(
+                    self._request({"x-task-id": "attacker\nforged-log-entry"})
+                )
+
+        logged_error = log_error.call_args.args[0]
+        self.assertIn(str(generated_id), logged_error)
+        self.assertNotIn("attacker", logged_error)
+        self.assertNotIn("forged-log-entry", logged_error)
 
     def test_verify_token_accepts_matching_key(self):
         """配置了 API Key 时，相同请求头必须正常通过鉴权。"""

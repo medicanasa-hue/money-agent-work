@@ -14,7 +14,7 @@ def sanitize_upload_filename(filename: object) -> str:
         or safe_name in {".", ".."}
         or len(safe_name) > 255
         or safe_name.endswith((" ", "."))
-        or any(ord(character) < 32 for character in safe_name)
+        or not safe_name.isprintable()
         or any(character in _WINDOWS_INVALID_FILENAME_CHARS for character in safe_name)
     ):
         raise ValueError("invalid upload filename")

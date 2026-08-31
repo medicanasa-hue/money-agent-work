@@ -5,6 +5,7 @@ import os.path
 import re
 import shutil
 import socket
+import tempfile
 import threading
 import time
 from concurrent.futures import CancelledError, Future, ThreadPoolExecutor
@@ -408,22 +409,55 @@ def _load_resume_checkpoint(task_id: str):
     return params, video_script, video_terms
 
 
+def _resume_audio_duration(audio_file: str) -> float | None:
+    try:
+        if not path.isfile(audio_file) or path.getsize(audio_file) <= 0:
+            return None
+        duration = float(voice.get_audio_duration(audio_file) or 0)
+        return duration if math.isfinite(duration) and duration > 0 else None
+    except (OSError, TypeError, ValueError, OverflowError):
+        return None
+
+
+def _load_custom_resume_audio(task_directory: str, params: VideoParams):
+    try:
+        task_id = path.basename(path.normpath(task_directory))
+        audio_file = resolve_custom_audio_file(task_id, params.custom_audio_file)
+        duration = _resume_audio_duration(audio_file)
+        if duration is None:
+            return "", None
+        if config.app.get("audio_loudness_normalization_enabled", False):
+            output_path = file_security.resolve_path_within_directory(
+                task_directory, "audio.normalized.wav", require_file=False
+            )
+            normalized_file = voice.normalize_narration_loudness(
+                audio_file, output_path=output_path
+            )
+            if path.realpath(normalized_file) not in {audio_file, output_path}:
+                return "", None
+            audio_file = normalized_file
+            duration = _resume_audio_duration(audio_file)
+        return (audio_file, duration) if duration is not None else ("", None)
+    except (OSError, TypeError, ValueError, OverflowError):
+        return "", None
+
+
 def _load_resume_media(task_directory: str, params: VideoParams):
-    """Return existing local narration/subtitles only when they are usable."""
+    """Reuse the selected narration and keep corrected subtitles intact."""
     audio_file = ""
     audio_duration = None
-    for filename in ("audio.normalized.wav", "audio.mp3"):
-        candidate = path.join(task_directory, filename)
-        try:
-            if not path.isfile(candidate) or path.getsize(candidate) <= 0:
-                continue
-            duration = math.ceil(float(voice.get_audio_duration(candidate) or 0))
-        except (OSError, TypeError, ValueError, OverflowError):
-            continue
-        if duration > 0:
-            audio_file = candidate
-            audio_duration = duration
-            break
+    if str(getattr(params, "custom_audio_file", None) or "").strip():
+        # Never substitute products from an older TTS/normalization attempt for
+        # the user's selected narration. Re-normalize that source only if opted in.
+        audio_file, audio_duration = _load_custom_resume_audio(task_directory, params)
+    else:
+        for filename in ("audio.normalized.wav", "audio.mp3"):
+            candidate = path.join(task_directory, filename)
+            duration = _resume_audio_duration(candidate)
+            if duration is not None:
+                audio_file = candidate
+                audio_duration = math.ceil(duration)
+                break
 
     if not audio_file or not getattr(params, "subtitle_enabled", True):
         return audio_file, audio_duration, ""
@@ -472,6 +506,9 @@ def resume_interrupted_task(task_id: str):
     resume_audio_file, resume_audio_duration, resume_subtitle_path = (
         _load_resume_media(task_directory, params)
     )
+    if str(getattr(params, "custom_audio_file", None) or "").strip() and not resume_audio_file:
+        logger.warning("selected custom audio is unavailable; interrupted task was not resumed")
+        return None
     logger.info("resuming interrupted task from its saved script checkpoint")
     return start(
         task_id=task_id,
@@ -547,7 +584,7 @@ def preflight_custom_audio(task_id: str, params) -> dict:
         }
 
     try:
-        duration = voice.get_audio_duration(audio_file)
+        duration = float(voice.get_audio_duration(audio_file) or 0)
     except Exception:
         return {
             "selected": True,
@@ -556,7 +593,7 @@ def preflight_custom_audio(task_id: str, params) -> dict:
             "reason": "unreadable_duration",
         }
 
-    if not duration or duration <= 0:
+    if not math.isfinite(duration) or duration <= 0:
         return {
             "selected": True,
             "ready": False,
@@ -674,7 +711,6 @@ def generate_audio(task_id, params, video_script, voice_preview=None):
 
         logger.info("no custom audio file provided, using TTS to generate audio.")
         audio_file = path.join(utils.task_dir(task_id), "audio.mp3")
-        tts_audio_file = audio_file
         voice_name = voice.parse_voice_name(params.voice_name)
         sub_maker = voice.tts(
             text=video_script,
@@ -704,10 +740,10 @@ def generate_audio(task_id, params, video_script, voice_preview=None):
                 audio_file,
                 output_path=path.join(utils.task_dir(task_id), "audio.normalized.wav"),
             )
-        audio_duration_source = (
-            audio_file if audio_file != tts_audio_file else sub_maker
+        file_duration = voice.get_audio_duration(audio_file)
+        audio_duration = math.ceil(
+            file_duration if file_duration > 0 else voice.get_audio_duration(sub_maker)
         )
-        audio_duration = math.ceil(voice.get_audio_duration(audio_duration_source))
         if audio_duration == 0:
             _mark_task_failed(task_id, "audio", "generated audio duration is zero")
             logger.error("failed to get audio duration.")
@@ -721,21 +757,37 @@ def generate_audio(task_id, params, video_script, voice_preview=None):
                 audio_file,
                 output_path=path.join(utils.task_dir(task_id), "audio.normalized.wav"),
             )
-        audio_duration = voice.get_audio_duration(audio_file)
-        if audio_duration == 0:
-            _mark_task_failed(task_id, "audio", "custom audio duration is zero")
+        try:
+            audio_duration = float(voice.get_audio_duration(audio_file) or 0)
+        except (OSError, TypeError, ValueError, OverflowError):
+            audio_duration = 0
+        if not math.isfinite(audio_duration) or audio_duration <= 0:
+            _mark_task_failed(
+                task_id, "audio",
+                "Custom audio duration is unavailable or invalid. Upload a playable MP3 or WAV file.",
+            )
             logger.error("failed to get audio duration from custom audio file.")
             return None, None, None
         return audio_file, audio_duration, None
 
-def _write_subtitle_suspicion_report(task_id, params, subtitle_path, video_script):
+def _write_subtitle_suspicion_report(
+    task_id, params, subtitle_path, video_script, *, timing_source=None
+):
     report = subtitle.build_subtitle_suspicion_report(
         subtitle_file=subtitle_path,
         video_script=video_script,
         language=getattr(params, "video_language", None),
     )
-    if not report or not report["subtitle_count"]:
+    if not report:
+        report = {
+            "subtitle_count": len(subtitle.file_to_subtitles(subtitle_path)),
+            "suspicious_count": 0,
+            "items": [],
+        }
+    if not report["subtitle_count"]:
         return False
+    if timing_source:
+        report = {**report, "timing_source": timing_source}
 
     report_path = path.join(utils.task_dir(task_id), "subtitle.review.json")
     if subtitle.write_subtitle_suspicion_report(report, report_path):
@@ -753,7 +805,7 @@ def _create_script_timed_subtitle_for_custom_audio(
     except (OSError, TypeError, ValueError):
         audio_duration = 0
 
-    if audio_duration <= 0:
+    if not math.isfinite(audio_duration) or audio_duration <= 0:
         logger.warning(
             "custom-audio subtitle fallback skipped because audio duration is unavailable"
         )
@@ -790,6 +842,28 @@ def _karaoke_ass_style_options(params) -> dict:
         "subtitle_position": getattr(params, "subtitle_position", None),
         "custom_position": getattr(params, "custom_position", None),
     }
+
+
+def _refresh_whisper_subtitle(whisper_kwargs) -> bool:
+    """Validate a new transcript before replacing captions from an earlier attempt."""
+    target = whisper_kwargs["subtitle_file"]
+    word_target = whisper_kwargs.get("word_timing_file")
+    with tempfile.TemporaryDirectory(prefix=".whisper-", dir=path.dirname(target)) as staging:
+        staged_subtitle = path.join(staging, "subtitle.srt")
+        staged_kwargs = {**whisper_kwargs, "subtitle_file": staged_subtitle}
+        if word_target:
+            staged_kwargs = {**staged_kwargs, "word_timing_file": path.join(staging, "words.json")}
+        subtitle.create(**staged_kwargs)
+        if not subtitle.file_to_subtitles(staged_subtitle):
+            return False
+        if word_target:
+            staged_words = staged_kwargs["word_timing_file"]
+            if path.isfile(staged_words):
+                os.replace(staged_words, word_target)
+            elif path.isfile(word_target):
+                os.remove(word_target)
+        os.replace(staged_subtitle, target)
+    return True
 
 
 def generate_subtitle(task_id, params, video_script, sub_maker, audio_file):
@@ -884,7 +958,15 @@ def generate_subtitle(task_id, params, video_script, sub_maker, audio_file):
         language = getattr(params, "video_language", None)
         if language:
             whisper_create_kwargs["language"] = language
-        subtitle.create(**whisper_create_kwargs)
+        if subtitle.file_to_subtitles(subtitle_path):
+            if not _refresh_whisper_subtitle(whisper_create_kwargs):
+                logger.warning("Whisper produced no new transcript; keeping existing captions and review report")
+                existing_ass = path.join(task_directory, "subtitle.ass")
+                if subtitle_style == "karaoke" and path.isfile(existing_ass):
+                    return existing_ass
+                return subtitle_path
+        else:
+            subtitle.create(**whisper_create_kwargs)
         if sub_maker is None and not subtitle.file_to_subtitles(subtitle_path):
             used_script_timed_fallback = _create_script_timed_subtitle_for_custom_audio(
                 audio_file=audio_file,
@@ -901,6 +983,7 @@ def generate_subtitle(task_id, params, video_script, sub_maker, audio_file):
             params,
             subtitle_path,
             video_script,
+            timing_source="script_estimate" if used_script_timed_fallback else "whisper",
         )
         if not used_script_timed_fallback:
             logger.info("\n\n## correcting subtitle")
@@ -912,6 +995,7 @@ def generate_subtitle(task_id, params, video_script, sub_maker, audio_file):
             params,
             subtitle_path,
             video_script,
+            timing_source="script_estimate" if used_script_timed_fallback else None,
         )
 
     subtitle.save_subtitle_generated_baseline(subtitle_path, subtitle_baseline_path)
@@ -930,7 +1014,7 @@ def generate_subtitle(task_id, params, video_script, sub_maker, audio_file):
         return ""
 
     word_timings = []
-    if subtitle_style == "karaoke" and (
+    if not used_script_timed_fallback and subtitle_style == "karaoke" and (
         subtitle_provider == "whisper" or subtitle_fallback
     ):
         word_timings = subtitle.read_word_timings(word_timing_file)
@@ -1916,6 +2000,13 @@ def _start(
     logger.info(f"start task: {task_id}, stop_at: {stop_at}")
     sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=5)
 
+    if stop_at not in {"script", "terms"} and not utils.check_ffmpeg_ready():
+        return _mark_task_failed(
+            task_id,
+            "preflight",
+            "FFmpeg is unavailable; install it or set app.ffmpeg_path in config.toml",
+        )
+
     video_music_provider = _VIDEO_MUSIC_PROVIDERS.get(params.bgm_type)
     video_music_enabled = (
         stop_at == "video"
@@ -1961,7 +2052,11 @@ def _start(
             return _mark_task_failed(
                 task_id,
                 "audio",
-                "invalid custom audio file",
+                (
+                    "Custom audio file is missing or cannot be opened. Upload it again."
+                    if custom_audio_preflight["reason"] == "invalid_file"
+                    else "Custom audio duration is unavailable or invalid. Upload a playable MP3 or WAV file."
+                ),
             )
 
     # 1. Generate script

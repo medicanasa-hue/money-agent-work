@@ -821,6 +821,7 @@
         "Subtitles": "Subtitles",
         "Download Subtitles": "Download subtitles",
         "Subtitle Review Needed": "{count} subtitle line(s) may need review.",
+        "Subtitle Timing Approximate": "Время показа субтитров рассчитано приблизительно, поскольку распознавание речи было недоступно. Проверьте синхронизацию перед публикацией.",
         "Subtitle Layout Ready": "Subtitle layout is ready for {cue_count} cue(s).",
         "Subtitle Layout Needs Review": "Subtitle layout needs review: {issue_count} potential issue(s) across {cue_count} cue(s).",
         "Subtitle Time": "Time",

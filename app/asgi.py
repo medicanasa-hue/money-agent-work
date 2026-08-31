@@ -1,6 +1,5 @@
 """Application implementation - ASGI."""
 
-import hmac
 import ipaddress
 import os
 from contextlib import asynccontextmanager
@@ -11,9 +10,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from loguru import logger
-from starlette.datastructures import Headers
 
 from app.config import config
+from app.controllers import base
 from app.models.exception import HttpException
 from app.router import root_api_router
 from app.utils import utils
@@ -92,22 +91,21 @@ def cors_configuration(
 
 
 def should_protect_task_outputs(api_key: str | None, listen_host: str | None) -> bool:
-    """Keep browser-friendly task output access for local-only installations."""
-    return bool(str(api_key or "").strip()) and not _is_loopback_host(listen_host)
+    """A configured key applies even behind a loopback reverse proxy."""
+    return api_key is not None and (
+        not isinstance(api_key, str) or bool(api_key.strip())
+    )
 
 
 class TaskOutputStaticFiles(StaticFiles):
-    """Require the API key for generated media only on network-bound installs."""
+    """Use the same authentication and rate limit as the API for generated media."""
 
     async def get_response(self, path: str, scope):
-        expected_token = str(config.app.get("api_key", "") or "").strip()
-        if should_protect_task_outputs(expected_token, config.listen_host):
-            token = Headers(scope=scope).get("x-api-key", "").strip()
-            if not hmac.compare_digest(token, expected_token):
-                return JSONResponse(
-                    status_code=401,
-                    content={"detail": "task output authentication required"},
-                )
+        request = Request(scope)
+        try:
+            base.verify_token(request)
+        except HttpException as exc:
+            return exception_handler(request, exc)
         return await super().get_response(path, scope)
 
 
@@ -155,7 +153,7 @@ app.add_middleware(
 
 task_dir = utils.task_dir()
 app.mount(
-    "/tasks", TaskOutputStaticFiles(directory=task_dir, html=True, follow_symlink=True), name=""
+    "/tasks", TaskOutputStaticFiles(directory=task_dir, html=True), name=""
 )
 
 public_dir = utils.public_dir()

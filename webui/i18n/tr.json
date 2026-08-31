@@ -300,6 +300,7 @@
         "Subtitles": "Altyazılar",
         "Download Subtitles": "Altyazıları indir",
         "Subtitle Review Needed": "{count} altyazı satırı gözden geçirilmeli.",
+        "Subtitle Timing Approximate": "Konuşma tanıma kullanılamadığı için altyazı zamanlaması yaklaşıktır. Yayımlamadan önce zamanlamayı kontrol edin.",
         "Subtitle Layout Ready": "Altyazı yerleşimi hazır: {cue_count} bölüm ekrana uygun.",
         "Subtitle Layout Needs Review": "Altyazı yerleşimi gözden geçirilmeli: {cue_count} bölümde {issue_count} olası sorun var.",
         "Subtitle Time": "Zaman",

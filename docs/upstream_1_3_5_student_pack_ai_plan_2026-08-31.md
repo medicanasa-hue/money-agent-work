@@ -2,6 +2,51 @@
 
 Araştırma tarihi: **31 Ağustos 2026**. Kapsam: yerel depo incelemesi, resmi upstream Git geçmişi, GitHub Student Developer Pack ve Google/GitHub ürün belgeleri. Bu belge uygulama veya dağıtım değildir.
 
+Uygulama daha sonra ayrı worktree'de başladı. Bu belgedeki başlangıç gözlemleri
+araştırma anına aittir; güncel test sonuçları ve tamamlanan işler
+[uygulama kaydında](upstream_1_3_5_implementation_log_2026-08-31.md) tutulur.
+Copilot hesabı bağlandı ve ilk test üretiminde kullanıldı; GitHub güvenlik
+ayarları onayla açıldı. Entegrasyon dalı henüz GitHub'a gönderilmedi.
+
+**Kullanıcı tercihi — 31 Ağustos:** Kullanıcı ElevenLabs'ı ücretli API olarak
+kullanmıyor; genellikle ücretsiz kredilerle dışarıda ses üretip dosyayı MPT'ye
+ekliyor. Ana anlatım akışı **harici ses dosyası → MPT'de altyazı/sahne/video**.
+ElevenLabs API anahtarı, sağlayıcı UI kalıcılığı veya abonelik kurulumu bu
+akışın gereksinimi değil; sağlayıcıya özel B5b işi ertelendi. Mevcut TTS
+seçenekleri kaldırılmayacak ve kullanıcı ayarları kendiliğinden değiştirilmeyecek.
+Öncelik, zaten bulunan özel ses akışında TTS'nin atlanması, dosyanın gerçek
+süresinin kullanılması ve Türkçe altyazı senkronunun doğrulanmasıdır.
+Ses üretilirken kullanılan özgün metin MPT'nin senaryo alanına da verilmeli;
+mevcut uygulama boş senaryoyu yüklenen sesten otomatik çıkarmak yerine konu
+üzerinden yeni LLM senaryosu üretebiliyor. Checkpoint kurtarmasında özel
+sesin kesirli süresinin ve altyazısının korunması ayrıca doğrulanacak.
+
+Lisans koşulu teknik yükleme desteğinden ayrıdır: ses gerçekten **Free plan**
+altında üretilmişse ElevenLabs ticari kullanım lisansı vermiyor; ticari olmayan
+paylaşımda da atıf istiyor. Promosyon kredisi farklı bir plan altındaysa o
+planın koşulları ayrıca doğrulanmalı; kullanıcının hesap lisansı incelenmedi.
+API kullanmamak bu koşulu değiştirmez. [Resmi yayın koşulları](https://elevenlabs.io/docs/help-center/legal/can-i-publish-the-content-i-generate-on-the-platform).
+
+**B1c uygulama sonucu — 31 Ağustos:** Harici ses doğrulaması, kesinti sonrası
+seçili dosya/altyazı korunması ve görünür yaklaşık zamanlama uyarısı ayrı
+entegrasyon worktree'sinde tamamlandı. Dört modülde 68 yeni test eklendi;
+tam paket 1.508 geçti / 13 atlandı, branch dahil coverage %71,6187 oldu.
+Önbellekteki Whisper base ve sentetik Türkçe konuşmayla gerçek yerel ASR/render
+kontrolü de geçti; ücretli API veya model indirme yok. Bu kısa örnek bütün
+seslerde kusursuz senkron garantisi değildir. Genel %80 hedefi ve Linux CI
+henüz tamamlanmış sayılmaz. Sonraki yerel dilim Docker/uv tutarlılığıdır;
+ana çalışma klasörüne aktarım, push ve yayın yapılmadı. Ayrıntılar:
+[uygulama kaydı](upstream_1_3_5_implementation_log_2026-08-31.md).
+
+**Docker/uv sonucu — 1 Eylül:** B6'nın yerel CPU imajı ve C5'in yayın güvenliği
+hazırlığı tamamlandı. İmaj `uv.lock` ile, dev bağımlılıkları olmadan oluşturuldu;
+gerçek API/WebUI/Türkçe video kabul kontrolleri geçti. Compose artık yerel kodu
+upstream `latest` ile değiştirmiyor; GHCR workflow varsayılan olarak yalnız
+build/test yapıyor ve yayın için açık seçim + varsayılan dal istiyor. Uzak push,
+CI/CodeQL/GHCR çalıştırması yapılmadı. GPU yapılandırması cuDNN 9'a düzeltildi,
+ancak makinede NVIDIA GPU olmadığı için runtime doğrulaması açık kaldı. Son tam
+paket 1.513 geçti / 13 atlandı; branch dahil coverage %71,6281.
+
 ## Karar önerisi
 
 Mevcut yerel geliştirmeleri koruyarak **v1.3.5 değişikliklerini konu bazında taşıyalım**; ardından main dalındaki seçilmiş hata düzeltmelerini değerlendirelim. Tam merge, dosyaların üzerine kopyalama veya upstream hazır Docker imajına geçme bu depo için iyi başlangıçlar değil.
@@ -55,7 +100,7 @@ Codebase-memory graph araçları bu oturumda bulunmadığından dosya araması k
 | P0 | Özel ses yolu: `4a82f8c`; upload doğrulama: `7003aba`; request ID: `5754ff9` | Yerel `file_security.py` ve OpenMontage izinleriyle birlikte sınır testleri yaz. Korunması gereken izinli yerel kullanım yolları var. |
 | P0 | Docker bağımlılık hatasında durma: `fec2721`; FFmpeg yoksa erken hata: `9faef69` | Hatalı/eksik imajla başarılı dağıtım izlenimini önle. |
 | P1 | Altyazı son satırının kesilmesi: `8cf6726` | Yerel altyazı zamanlaması ve render düzeltmelerini koruyarak port et. Türkçe karakterlerle doğrula. |
-| P1 | Bind-mounted config: `e5bb283`; tekrarlı BOM: `1339ee8`; ElevenLabs anahtar kalıcılığı: `01def3b` | Özel config'i kopyalama; şema/okuma-yazma davranışını örneklerle test et. |
+| P1 / sağlayıcı kısmı ertelendi | Bind-mounted config: `e5bb283`; tekrarlı BOM: `1339ee8`; ElevenLabs anahtar kalıcılığı: `01def3b` | Genel config düzeltmeleri korunur. ElevenLabs'a özel anahtar/UI kalıcılığı kullanıcının harici ses akışı için gerekli değil. Özel config'i kopyalama. |
 | P1 | Kuyruğa verme başarısızlığında durum geri alma: `17b7b3f`; eski queue parametreleri: `254cd02`; pozitif limitler: `93c0365` | Yerel task manager ve testlerle davranış eşdeğerliğini kontrol et; aynı korumayı iki kez ekleme. |
 | P1 | ElevenLabs müzikte sınırlı yanıt okuma/kaynak yönetimi: `3a96206` | Yerel limitler kısmen mevcut; hata gövdesinin sınırsız okunması ve stream kapanması ayrı testle tamamlanmalı. |
 | P1 | Arama sonucu cache'i: `95dd03e`; kaynak manifesti: `7ddb11d`; Whisper prompt: `2588821` | Yerel indirilmiş dosya cache'i arama cache'iyle aynı değil. Yeni modülleri mevcut lisans/atıf alanlarıyla birleştir. |
@@ -164,6 +209,123 @@ Travis'i mevcut Actions'ın yanına eklemek, React'e sırf bir tasarım aracı �
 Azure nüansı: Ayrıntılı teklifteki eğitim/non-commercial kısıtlarının bir bölümü özellikle **Software Download Benefits** altında. Buradan bütün Azure compute için kesin ticari yasak sonucu çıkarılmadı. Bu planda Azure dev/test için öneriliyor; ticari hizmette kullanılacak her ürünün sözleşmesi ayrıca incelenmeli. [Azure teklif koşulları](https://azure.microsoft.com/en-us/pricing/offers/ms-azr-0170p/)
 
 ## 5. Copilot ve Google AI Pro'yu birlikte kullanmak
+
+### Geliştirme sırasında devreye alma — 31 Ağustos ek kararı
+
+Bu araçlar C aşamasının bitmesini beklememeli. Copilot ile kod/test yazma,
+GitHub Actions ile doğrulama ve CodeQL ile güvenlik incelemesi **entegrasyonla
+aynı anda** kullanılacak geliştirme iş akışıdır. Sentry, Doppler ve bulut
+hosting ayrı uygulama/hesap bağlantısı işleridir; onların sonraya kalması
+geliştirme araçlarının da erteleneceği anlamına gelmez.
+
+GitHub API kontrolü: `medicanasa-hue/money-agent-work` public; varsayılan dal
+`codex/upgrade-v1.3.1`. İlk kontrolde kapalı olan Secret scanning, depo push
+protection, Dependabot alerts ve security updates **kullanıcının açık onayıyla
+etkinleştirildi**. Alerts endpointi dependency graph'ı da açtı. Son GET
+kontrolünde alerts HTTP 204, security updates `enabled: true, paused: false`
+ve iki secret protection ayarı `enabled`. Otomatik merge kapalı kaldı.
+CodeQL default setup hâlâ `not-configured`; hazırlanan advanced workflow
+henüz gönderilmedi. Sürüm güncelleme YAML'ı ile hesap özelliğinin gerçekten
+etkinleşmesi ayrı ayrı doğrulandı.
+
+| Araç | Bu entegrasyondaki somut iş | Hazırlık / gerçek kullanım durumu |
+|---|---|---|
+| Copilot Student | Python tamamlama; tek davranışa yönelik regresyon testi; küçük diff incelemesi | CLI 1.0.82, ayrı hesap `yusufyigitozdamar`. İlk gerçek iş: FFmpeg kalite ölçümü test taslağı; inceleme ve eklemeler sonrası 44 test geçti. Tek istek 1,360044 AI kredi raporladı. GitHub CLI depo hesabı `medicanasa-hue` ayrı kaldı. Repo talimatları hazır; VS Code 1.128.1 içindeki Chat 0.56.0 için editör oturumu hâlâ doğrulanmadı. |
+| GitHub Actions | Linux 3.11/3.13 ve Windows testleri, Ruff, coverage, sentetik render | Mevcut CI hazır; push filtresine gerçek varsayılan dal eklendi. Yeni değişiklikler gönderilmediği için bu paketin GitHub sonucu yok. |
+| CodeQL | Python'da güvensiz veri akışı ve dosya/komut sınırı incelemesine ek kontrol | SHA sabitli `.github/workflows/codeql.yml` hazır. Standart Ubuntu runner, PR/default branch/haftalık tetikleme, sınırlı token izinleri. Henüz analiz çalışmadı. |
+| Dependabot | uv, Actions ve Docker sürüm önerileri; testlerden sonra insan incelemesi | Alerts, dependency graph ve security updates açık; güncelleme hizmeti duraklatılmamış. Mevcut haftalık config korunuyor. Güvenlik PR'ları oluşabilir; otomatik merge kapalı. |
+| Secret scanning / push protection | Depo secret uyarıları ve desteklenen sırları içeren push'ların kontrolü | Kullanıcı onayıyla iki depo ayarı etkinleştirildi, GET ile doğrulandı. Tarama sonuçlarının tamamlandığı veya hiç açık bulunmadığı iddia edilmiyor. |
+| GitLens / CodeScene | Önce upstream commit geçmişi; gerekirse sık değişen karmaşık dosyaların önceliklendirilmesi | GitLens öğrenci süresi kontrol edilecek. CodeScene hesabı/depo bağlantısı yapılmadı; ihtiyaç halinde ayrı değerlendirme. |
+| Codespaces | Yerelde açıklanamayan Linux kurulum veya platform farkını tekrar üretme | CI yetmezse kota kontrollü ortam; şu anda Codespace oluşturulmadı. |
+
+Public depoda **standart** GitHub-hosted runner kullanımı ücretsizdir; larger
+runner, özel depo ve başka ürünlerin ücretleri aynı varsayımla değerlendirilmez.
+Code scanning public depolar için kullanılabilir. Bu iki avantaj yalnızca
+Student Pack'e bağlı değildir.
+[Actions ücretlendirmesi](https://docs.github.com/en/billing/concepts/product-billing/github-actions),
+[Code scanning uygunluğu](https://docs.github.com/en/code-security/concepts/code-scanning/code-scanning).
+
+Yerel kurulum ve öğrenci hesabına ayrı giriş:
+
+**CLI kurulumu ve ayrı hesap bağlantısı tamamlandı.** İlk kontrolün
+`medicanasa-hue (via gh)` ve 0/200 AIC sonucu öğrenci olmayan depo hesabına
+aitti; kredi sayısı tek başına Student hakkını kanıtlamaz. Kullanıcı,
+tarayıcıdaki Student hesabının farklı olduğunu açıkladı.
+
+Ardından `copilot login --web-flow` ile kullanıcı tarayıcı onayını tamamladı:
+`Signed in successfully as yusufyigitozdamar.` Boş geçici klasörde, model
+araçları/MCP/uzak paylaşım kapalı ikinci kontrolde `/user` artık
+`yusufyigitozdamar` gösterdi; `/usage` sıfır mesaj ve 0/200 AIC bildirdi.
+`gh api user` ise depo hesabının hâlâ `medicanasa-hue` olduğunu doğruladı.
+Kullanıcı gerekirse bu depo hesabının da değişmesine izin verdi; şu anda
+Copilot ayrı giriş kullandığı için buna gerek kalmadı. Bu oturum doğrulamasında
+kredi harcanmadı; daha sonraki ilk kodlama isteği aşağıda ayrı kaydedildi.
+
+Aşağıdaki ilk iki adım tamamlandı; yalnız yeni kurulum veya oturum sorunu
+olursa tekrarlanmalı. VS Code girişi ise editörde kullanmak isteyen kullanıcı
+için ayrı ve isteğe bağlıdır:
+
+1. [Education benefits](https://github.com/settings/education/benefits) üzerinden
+   öğrenci hakkının bağlı olduğu hesapta Copilot Student etkinliğini kontrol et.
+   Yalnız ücretli seçenek varsa satın alma yapma; Education onayı ile Copilot
+   etkinleşmesi ayrı adımlar olabilir.
+   [Resmi öğrenci rehberi](https://docs.github.com/en/copilot/how-tos/copilot-on-github/set-up-copilot/enable-copilot/set-up-for-students).
+2. Açılmış Copilot OAuth akışında öğrenci hakkının bulunduğu tarayıcı hesabını
+   seçip girişi kendin tamamla. Akışı yeniden başlatmak gerekirse yeni bir
+   terminalde `copilot login --web-flow` kullan. Parola, token veya tek
+   kullanımlık kodu sohbetle paylaşma; ayrı Copilot OAuth girişi için gh repo
+   hesabını değiştirmek gerekmiyor.
+   CLI 1.0.82 yardımında yerel masaüstü için varsayılan tarayıcı OAuth akışı
+   doğrulandı; `--device-code` ayrı seçenektir. Mevcut gh oturumu kullanılabilse
+   de bu, Student hakkının doğrulandığı anlamına gelmez.
+3. Editörde kullanmak istersen VS Code'da Copilot simgesinden **Use AI Features**
+   veya **Sign in to use Copilot** ile öğrenci hesabında oturum aç. Yerleşik Chat
+   mevcut olduğundan eski `GitHub.copilot` paketini zorla kurma/downgrade etme.
+   [VS Code kurulumu](https://code.visualstudio.com/docs/setup/copilot).
+
+Actions, CodeQL ve Dependabot için ayrı masaüstü programı gerekmez. Secret
+protection ve Dependabot özellikleri ayrı kullanıcı onayıyla açıldı; bu
+ayar değişikliği hazırlanan dalı göndermedi veya CodeQL çalıştırmadı.
+
+Copilot'ta ilk iş tamamlandı: yalnız `app/utils/video_quality.py` kaynağı ve
+sınırları yazılı test görevi boş geçici klasörden gönderildi. Araçlar, MCP,
+custom instructions ve uzak paylaşım kapalıydı; Copilot diskte dosya
+değiştirmedi. Dönen taslak gözden geçirilip düzeltildi, test dosyasına alındı.
+Bu koşu `.github/copilot-instructions.md` dosyasının otomatik yüklendiğine
+dair bir doğrulama değildir; ilgili kısıtlar prompt içinde açıkça verildi.
+
+Kullanım raporu `totalNanoAiu=1360044000`: **1,360044 AI kredi**,
+görüntülenen 200 kredilik hakkın yaklaşık %0,68'i. Bu yalnız bu koşunun
+ölçümüdür; hesapta kalan kredinin veya faturanın yeni sorgusu değildir.
+`totalPremiumRequestCost=1` ayrı muhasebe alanıdır, 1 AI kredi diye okunmaz.
+Auto model seçti; sabit model veya reasoning effort zorlanmadı.
+[Resmi kullanım metrikleri](https://github.com/github/copilot-sdk/blob/main/docs/features/usage-and-billing.md#accumulated-ai-credit-and-token-totals).
+
+Sonraki dar repo görevi için kullanılabilecek şablon:
+
+> AGENTS.md ve .github/copilot-instructions.md kurallarını oku. Yalnızca sana
+> atanan modül ve ilgili test dosyasında çalış; başka ajanların değişikliklerine
+> dokunma. Mevcut coverage raporundan kullanıcı davranışını etkileyen bir eksik
+> hata yolunu seç. Var olan testleri tekrar etmeden regresyon testi ekle; bir
+> hata düzeltmesi gerekiyorsa önce RED, sonra en küçük GREEN değişikliği yap.
+> Üretim davranışını yalnızca coverage için değiştirme. Coverage eşiğini
+> düşürme, test atlama veya canlı API çağırma. Çalıştırılan komutları, sonucu ve
+> diff'i göster; commit/push yapma.
+
+Modül ve test dosyası görev başında somut olarak atanmalı; bu şablon bütün
+depoyu aynı anda düzenleme yetkisi değildir. İkinci kullanım salt okunur
+inceleme: "Yalnız verilen diff'teki auth, path sınırı ve kaynak kapatma
+regresyonlarını incele; dosya/satır ve tekrar üretme adımlarıyla raporla;
+dosya değiştirme." Copilot'ın talimatları kullandığı desteklenen istemcide
+yanıt referanslarından kontrol edilmeli.
+[Repo talimatları](https://docs.github.com/en/copilot/how-tos/copilot-on-github/customize-copilot/add-custom-instructions/add-repository-instructions).
+
+**Güvenli yayın sırası:** Entegrasyon dalının değişiklikleri önce yerelde
+incelenecek, ardından açık push/PR onayıyla GitHub kontrolleri çalıştırılacak.
+Mevcut `docker-ghcr.yml` hâlâ upstream `ghcr.io/harry0703/moneyprinterturbo`
+hedefine main/tag push ile yayın deniyor. Bu düzeltilmeden main/tag gönderimi
+veya Docker publish çalıştırması yapılmamalı. Yeni CI/CodeQL hazırlığı herhangi
+bir imajı yayımlamadı veya uzak hesap ayarını değiştirmedi.
 
 ### Copilot Student
 
@@ -279,12 +441,14 @@ Her satır bir küçük iş veya açıkça ayrılmış alt iş ailesidir. Hedef 
 | İş | Kabul ölçütü ve doğrulama | Bağımlılık / muhtemel dosyalar |
 |---|---|---|
 | B1: Gerçek ses süresi | Son kelime kesilmez; hata halinde dosya handle'ı kapanır. `test_task`, `test_voice`. | A2; `task.py`, `voice/providers.py`, iki test. |
+| B1c: Harici anlatım sesi — yerelde tamamlandı | 68 yeni test; WAV/MP3 ve normalizasyonla gerçek FFmpeg render; önbellekteki Whisper base ile kısa Türkçe ASR örneği geçti. Geçersiz ses erken reddediliyor; kesinti sonrası seçili ses ve düzeltilmiş altyazı korunuyor; tahmini zamanlama UI'de belirtiliyor. Uzun/gerçek kullanıcı kayıtları için kalite kontrolü ayrı. | A6/B1/B3; `task.py`, `Main.py`, 9 dil sözlüğü ve dört `test_custom_audio_*` modülü. Sonuçlar uygulama kaydında; ana klasöre aktarım/push yapılmadı. |
 | B1b: ElevenLabs kaynak sınırı | Büyük hata yanıtı sınırlı okunur, stream her durumda kapanır. `test_elevenlabs_music`. | A2; `elevenlabs_music.py`, `test_elevenlabs_music.py`. |
 | B2: Senaryo regex'i | Birden fazla parantezli bölüm arasında normal metin kaybolmaz. `test_llm` ile Türkçe fixture. | A2; `llm/scripts.py`, `test_llm.py`. |
 | B3: Altyazı geometri/timeline | Çok satır ve Türkçe harfler kesilmez; final cue ses sınırını aşmaz. `test_video`, `test_voice`, görsel fixture. | B1; `video.py` ve testleri; ses timeline ayrı B3b. |
 | B4: Windows Unicode / indirme | Başarılı CLI sonunda encoding hatası yok; indirme adları güvenli. `test_cli`, `test_controller_video`. | A4; `cli.py`, controller, iki test. |
-| B5: Config davranışı | BOM/bind mount/anahtar kalıcılığı örnek config ile doğrulanır. `test_config`. | A2; `config/config.py`, `test_config.py`; gerçek kullanıcı config'i değişmez. |
-| B6: FFmpeg/Docker fail-fast | Eksik FFmpeg veya tekrarlı paket hatası anlaşılır biçimde başarısız olur. Başlangıç mock testi + izole image build. | A2; `utils.py`, entrypoint, test; Docker düzeltmesi ayrı B6b. |
+| B5a: Genel config davranışı | BOM/bind mount ve genel ayar kalıcılığı örnek config ile doğrulanır. `test_config`; mevcut düzeltmeler korunur. | A2; `config/config.py`, `test_config.py`; gerçek kullanıcı config'i değişmez. |
+| B5b: ElevenLabs UI/anahtar kalıcılığı — ertelendi | Yalnız kullanıcı ileride API kullanımını isterse ele alınır; harici ses yüklemenin veya entegrasyonun ön koşulu değildir. | B5a; sağlayıcı UI ve testleri. Bu karar hesap/abonelik değişikliği yapmaz. |
+| B6: FFmpeg/Docker fail-fast — yerel CPU tamamlandı | Eksik FFmpeg erken duruyor; digest-pinned Python 3.11.16 imajı uv lock ile gerçek oluşturuldu. Ağsız Türkçe render/API/WebUI kontrolleri geçti. GPU runtime donanım olmadığı için açık. | `Dockerfile`, `Dockerfile.gpu`, `docker-compose*.yml`, container kabul testi ve uygulama kaydı. |
 | B7: Gemini ses kataloğu / Whisper prompt | Katalog seçimi geriye uyumlu; initial_prompt gerektiğinde iletilir. `test_voice`, `test_subtitle`. | B1/B3; discovery ve testi; subtitle/config işi ayrı B7b. |
 
 **Kontrol noktası B:** Aynı yerel medya üzerinde önce/sonra çıktı karşılaştırması tamam; ses ve altyazı regresyonları yok; tüm mevcut üretim girişleri çalışıyor.
@@ -295,9 +459,9 @@ Her satır bir küçük iş veya açıkça ayrılmış alt iş ailesidir. Hedef 
 |---|---|---|
 | C1: Arama cache'i | Aynı sorgu gereksiz tekrar çağrılmaz, kaynak/parametre/TTL ayrımı doğru. `test_material` + yeni cache testi. | B; yeni `material_cache.py`, `material.py`, iki test; provider bağlantıları ayrı küçük işler. |
 | C2: Kaynak manifesti | Yerel lisans/atıf bilgileri ve sanitize provenance tek şemada korunur. `test_material`, `test_task`. | C1; task artifacts yardımcı modülü, material/task bağlantısı ve testler ayrı dilimler. |
-| C3: Preset kalıcılığı | Eski preset açılır; varsayılan export secrets içermez. `test_presets` ve UI testleri. | B5; `presets.py`, `Main.py`, iki test. |
+| C3: Preset kalıcılığı | Eski preset açılır; varsayılan export secrets içermez. `test_presets` ve UI testleri. | B5a; `presets.py`, `Main.py`, iki test. Ertelenen ElevenLabs B5b işi engel değildir. |
 | C4: Sosyal açıklamalar | Platform metni üretilir ama inceleme/disclosure/attribution atlanmaz. `test_llm`, `test_upload_disclosure_review`. | C2; `llm/social.py`, task bağlantısı ve testler. |
-| C5: Kendi imajımız | GHCR namespace bize ait, immutable SHA/digest doğrulanır; upstream latest kullanılmaz. Yapılandırma incelemesi ve yerel build. | A/B; workflow, release compose, `.dockerignore`, gerekiyorsa Dockerfile. Push ayrıca yetkili uygulama adımı. |
+| C5: Kendi imajımız — yayın hazırlığı tamam, uzak çalışma bekliyor | Workflow repo adından tam SHA tag üretir, aynı imajı ağsız test eder; release Compose açık `MPT_IMAGE` SHA/digest ister ve upstream latest kullanmaz. Yerel CPU imajı geçti; gerçek GHCR digest ancak açık push/yayın onayı ve başarılı workflow sonrası vardır. | Workflow/Compose/actionlint/digest seçimi yerelde doğrulandı. Uzak çalıştırma yok; GPU runtime ve rollback sonraki kapı. |
 | C6: CI/rollback | Windows pytest koleksiyonu kapsamlı; dependency audit tutarlı; eski imaja dönüş denenmiş. CI ve staging kanıtı. | C5; `ci.yml`, audit workflow, `test/README.md`, gerektiğinde `pyproject.toml`. |
 
 **Kontrol noktası C:** İstenen upstream davranışlarının durum tablosu tamam. Taşınmayan özellikler açıkça listeli; sürüm “tüm main entegre” diye sunulmuyor. Yeni/değişen kritik modüller %80 coverage hedefini karşılıyor; bütün depo için %80 farkı ayrı işler halinde ölçülüyor.

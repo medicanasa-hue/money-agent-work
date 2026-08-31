@@ -13,7 +13,8 @@ from app.controllers.manager.base_manager import TaskQueueFullError
 from app.controllers.v1 import video as video_controller
 from app.models import const
 from app.models.exception import HttpException
-from app.models.schema import TaskListResponse, TaskQueryResponse
+from app.models.schema import TaskListResponse, TaskQueryResponse, TaskVideoRequest
+from app.services import material_upload
 from app.services import state as sm
 from app.utils import utils
 
@@ -172,6 +173,68 @@ class TestVideoControllerTasks(unittest.TestCase):
 
         self.assertEqual(raised.exception.status_code, 429)
         delete_task.assert_called_once_with("task-123")
+
+    def test_create_task_removes_state_when_scheduling_fails(self):
+        body = TaskVideoRequest(video_subject="Coffee")
+        with (
+            patch.object(video_controller.utils, "get_uuid", return_value="task-123"),
+            patch.object(video_controller.sm.state, "update_task"),
+            patch.object(video_controller.sm.state, "delete_task") as delete_task,
+            patch.object(
+                video_controller.task_manager, "add_task",
+                side_effect=RuntimeError("executor unavailable"),
+            ),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "executor unavailable"):
+                video_controller.create_task(self._request(), body, stop_at="video")
+        delete_task.assert_called_once_with("task-123")
+
+    def test_create_task_rejects_external_audio_without_disclosing_existence(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            task_dir = Path(temp_dir, "task-123")
+            task_dir.mkdir()
+            outside_audio = Path(temp_dir, "outside.mp3")
+            outside_audio.write_bytes(b"private audio")
+            errors = []
+            with (
+                patch.object(video_controller.utils, "get_uuid", return_value="task-123"),
+                patch.object(video_controller.utils, "task_dir", return_value=str(task_dir)),
+                patch.object(video_controller.sm.state, "update_task") as update_task,
+                patch.object(video_controller.task_manager, "add_task") as add_task,
+            ):
+                for candidate in (str(outside_audio), str(outside_audio) + ".missing"):
+                    with self.subTest(candidate=candidate):
+                        body = TaskVideoRequest(
+                            video_subject="Coffee", custom_audio_file=candidate
+                        )
+                        with self.assertRaises(HttpException) as raised:
+                            video_controller.create_task(self._request(), body, "video")
+                        self.assertEqual(raised.exception.status_code, 400)
+                        errors.append(raised.exception.message)
+                        self.assertNotIn(candidate, raised.exception.message)
+            self.assertEqual(errors[0], errors[1])
+            update_task.assert_not_called()
+            add_task.assert_not_called()
+
+    def test_create_task_reuses_audio_from_an_existing_task_with_a_new_uuid(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            audio_file = Path(temp_dir, "storage", "tasks", "earlier-task", "narration.mp3")
+            audio_file.parent.mkdir(parents=True)
+            audio_file.write_bytes(b"staged audio")
+            body = TaskVideoRequest(
+                video_subject="Coffee", custom_audio_file="earlier-task/narration.mp3"
+            )
+            with (
+                patch.object(video_controller.utils, "root_dir", return_value=temp_dir),
+                patch.object(video_controller.sm.state, "update_task"),
+                patch.object(video_controller.task_manager, "add_task") as add_task,
+            ):
+                response = video_controller.create_task(self._request(), body, "video")
+        self.assertEqual(response["status"], 200)
+        self.assertNotEqual(response["data"]["task_id"], "earlier-task")
+        self.assertEqual(body.custom_audio_file, "earlier-task/narration.mp3")
+        self.assertEqual(add_task.call_args.kwargs["params"].custom_audio_file,
+                         os.path.realpath(audio_file))
 
     def test_get_all_tasks_preserves_pagination(self):
         """任务列表响应必须包含状态层返回的总数和请求分页参数。"""
@@ -361,13 +424,14 @@ class TestVideoControllerFiles(unittest.TestCase):
                 video_controller.utils,
                 "storage_dir",
                 return_value=temp_dir,
-            ):
+            ), patch.object(material_upload, "_validate_video"):
                 response = video_controller.upload_video_material_file(
                     self._request(), upload
                 )
 
-            self.assertEqual(response["data"]["file"], "clip.MOV")
-            self.assertEqual(Path(temp_dir, "clip.MOV").read_bytes(), b"video")
+            stored_name = response["data"]["file"]
+            self.assertRegex(stored_name, r"^[0-9a-f]{32}\.mov$")
+            self.assertEqual(Path(temp_dir, stored_name).read_bytes(), b"video")
 
             invalid_upload = SimpleNamespace(
                 filename="photojpg",
@@ -378,6 +442,30 @@ class TestVideoControllerFiles(unittest.TestCase):
                     self._request(), invalid_upload
                 )
             self.assertEqual(raised.exception.status_code, 400)
+
+    def test_upload_video_material_maps_validation_and_storage_failures(self):
+        upload = SimpleNamespace(filename="clip.mp4", file=BytesIO(b"video"))
+        for error, status in (
+            (material_upload.MaterialUploadError("invalid video"), 400),
+            (material_upload.MaterialServiceError("sensitive storage path"), 500),
+        ):
+            with self.subTest(status=status):
+                with patch.object(material_upload, "save_material_upload", side_effect=error):
+                    with self.assertRaises(HttpException) as raised:
+                        video_controller.upload_video_material_file(self._request(), upload)
+                self.assertEqual(raised.exception.status_code, status)
+                self.assertNotIn("sensitive", raised.exception.message)
+
+    def test_video_material_list_excludes_staging_files_and_directories(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            Path(temp_dir, "clip.mp4").write_bytes(b"video")
+            Path(temp_dir, ".material-upload-stage.mp4").write_bytes(b"partial")
+            Path(temp_dir, "folder.mp4").mkdir()
+            with patch.object(video_controller.utils, "storage_dir", return_value=temp_dir):
+                response = video_controller.get_video_materials_list(self._request())
+        self.assertEqual(response["data"]["files"], [
+            {"name": "clip.mp4", "size": 5, "file": "clip.mp4"}
+        ])
 
     def test_stream_video_returns_requested_bytes(self):
         """Range 响应的正文和 Content-Range 必须与计算出的区间一致。"""
@@ -424,6 +512,20 @@ class TestVideoControllerFiles(unittest.TestCase):
         self.assertEqual(response.path, os.path.realpath(video_path))
         self.assertEqual(response.filename, "final-1.mp4")
         self.assertEqual(response.media_type, "video/mp4")
+
+    def test_download_video_quotes_spaces_and_encodes_unicode_filenames(self):
+        for filename, expected in (
+            ("final video.mp4", "attachment; filename*=utf-8''final%20video.mp4"),
+            ("Türkçe.mp4", "attachment; filename*=utf-8''T%C3%BCrk%C3%A7e.mp4"),
+        ):
+            with self.subTest(filename=filename):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    Path(temp_dir, filename).write_bytes(b"video")
+                    with patch.object(video_controller.utils, "task_dir", return_value=temp_dir):
+                        response = asyncio.run(
+                            video_controller.download_video(self._request(), filename)
+                        )
+                self.assertEqual(response.headers["content-disposition"], expected)
 
 
 if __name__ == "__main__":

@@ -145,6 +145,20 @@ class TestVideoAspect(unittest.TestCase):
 
 
 class TestVideoParams(unittest.TestCase):
+    def test_rejects_non_positive_generation_limits(self):
+        for field_name in ("video_clip_duration", "video_count"):
+            for value in (0, -1, None):
+                with self.subTest(field_name=field_name, value=value):
+                    with self.assertRaises(ValidationError):
+                        VideoParams(video_subject="Coffee", **{field_name: value})
+
+    def test_accepts_positive_generation_limits(self):
+        params = VideoParams(
+            video_subject="Coffee", video_clip_duration=1, video_count=1
+        )
+        self.assertEqual(params.video_clip_duration, 1)
+        self.assertEqual(params.video_count, 1)
+
     def test_video_aspects_accepts_multiple_selected_formats(self):
         params = VideoParams(
             video_subject="test",

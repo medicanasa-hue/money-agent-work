@@ -4,6 +4,7 @@ import math
 import os
 import re
 import shutil
+import subprocess
 from functools import lru_cache
 from pathlib import Path
 import threading
@@ -177,6 +178,26 @@ def get_ffmpeg_binary() -> str:
         logger.warning(f"failed to resolve bundled ffmpeg binary: {str(exc)}")
 
     return "ffmpeg"
+
+
+def check_ffmpeg_ready(timeout: int = 10) -> bool:
+    """Probe the configured renderer before starting costly generation work."""
+    hint = "Install FFmpeg or set app.ffmpeg_path in config.toml to a valid executable."
+    try:
+        completed = subprocess.run(
+            [get_ffmpeg_binary(), "-version"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=timeout,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        logger.warning("FFmpeg is unavailable ({}). {}", type(exc).__name__, hint)
+        return False
+    if completed.returncode != 0:
+        logger.warning("FFmpeg probe failed (exit {}). {}", completed.returncode, hint)
+        return False
+    return True
 
 
 def get_ffprobe_binary() -> str | None:

@@ -180,6 +180,9 @@ def create(
     language_hint = _whisper_language_hint(language)
     if language_hint:
         transcribe_kwargs["language"] = language_hint
+    initial_prompt = config.whisper.get("initial_prompt", "")
+    if isinstance(initial_prompt, str) and initial_prompt.strip():
+        transcribe_kwargs["initial_prompt"] = initial_prompt.strip()
 
     segments, info = model.transcribe(audio_file, **transcribe_kwargs)
 

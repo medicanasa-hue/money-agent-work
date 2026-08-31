@@ -1,4 +1,3 @@
-import glob
 import os
 import pathlib
 import shutil
@@ -10,6 +9,7 @@ from fastapi.responses import FileResponse, StreamingResponse
 from loguru import logger
 
 from app.config import config
+from app.services import material_upload
 from app.controllers import base
 from app.controllers.manager.base_manager import TaskQueueFullError
 from app.controllers.manager.memory_manager import InMemoryTaskManager
@@ -200,17 +200,36 @@ def create_task(
     task_id = utils.get_uuid()
     request_id = base.get_task_id(request)
     try:
+        queued_body = body
+        if isinstance(body, TaskVideoRequest) and (body.custom_audio_file or "").strip():
+            try:
+                audio_file = file_security.resolve_path_within_directory(
+                    utils.task_dir(), body.custom_audio_file.strip()
+                )
+            except ValueError as exc:
+                # Keep trusted CLI/WebUI file handling separate from the HTTP
+                # boundary. Do not disclose whether an external path exists.
+                raise ValueError(
+                    "custom audio file must be stored within the task artifacts directory"
+                ) from exc
+            queued_body = body.model_copy(update={"custom_audio_file": audio_file})
         task = {
             "task_id": task_id,
             "request_id": request_id,
             "params": body.model_dump(),
         }
         sm.state.update_task(task_id)
-        task_manager.add_task(tm.start, task_id=task_id, params=body, stop_at=stop_at)
+        try:
+            task_manager.add_task(
+                tm.start, task_id=task_id, params=queued_body, stop_at=stop_at
+            )
+        except Exception:
+            # Executor and broker failures must not leave an unqueued task behind.
+            sm.state.delete_task(task_id)
+            raise
         logger.success(f"Task created: {utils.to_json(task)}")
         return utils.get_response(200, task)
     except TaskQueueFullError as e:
-        sm.state.delete_task(task_id)
         logger.warning(
             f"reject task because queue is full, request_id: {request_id}, task_id: {task_id}"
         )
@@ -374,11 +393,17 @@ def upload_bgm_file(request: Request, file: UploadFile = File(...)):
     "/video_materials", response_model=VideoMaterialRetrieveResponse, summary="Retrieve local video materials"
 )
 def get_video_materials_list(request: Request):
-    allowed_suffixes = ("mp4", "mov", "avi", "flv", "mkv", "jpg", "jpeg", "png")
     local_videos_dir = utils.storage_dir("local_videos", create=True)
     files = []
-    for suffix in allowed_suffixes:
-        files.extend(glob.glob(os.path.join(local_videos_dir, f"*.{suffix}")))
+    for name in os.listdir(local_videos_dir):
+        if name.lower().startswith(".material-upload-"):
+            continue
+        if pathlib.Path(name).suffix.lower() not in material_upload.SUPPORTED_MATERIAL_EXTENSIONS:
+            continue
+        try:
+            files.append(file_security.resolve_path_within_directory(local_videos_dir, name))
+        except ValueError:
+            continue
     # 文件系统枚举顺序不稳定，直接返回会导致“顺序拼接”在不同机器或不同
     # 时刻表现不一致。这里统一按文件名排序，至少保证服务端返回顺序可预测。
     files.sort(key=lambda file_path: os.path.basename(file_path).lower())
@@ -405,26 +430,19 @@ def get_video_materials_list(request: Request):
 )
 def upload_video_material_file(request: Request, file: UploadFile = File(...)):
     request_id = base.get_task_id(request)
-    safe_filename = _sanitize_upload_filename(file.filename, request_id)
-    # check file ext
-    allowed_suffixes = ("mp4", "mov", "avi", "flv", "mkv", "jpg", "jpeg", "png")
-    suffix = pathlib.Path(safe_filename).suffix.lower().lstrip(".")
-    # 按完整扩展名校验，既兼容 .MOV 这类大写后缀，也避免 photojpg 这种没有
-    # 点号的文件名因为 endswith("jpg") 被误当成合法图片。
-    if suffix in allowed_suffixes:
-        local_videos_dir = utils.storage_dir("local_videos", create=True)
-        save_path = os.path.join(local_videos_dir, safe_filename)
-        # save file
-        with open(save_path, "wb+") as buffer:
-            # If the file already exists, it will be overwritten
-            file.file.seek(0)
-            buffer.write(file.file.read())
-        response = {"file": safe_filename}
-        return utils.get_response(200, response)
-
-    raise HttpException(
-        "", status_code=400, message=f"{request_id}: Only files with extensions {', '.join(allowed_suffixes)} can be uploaded"
-    )
+    try:
+        stored_name = material_upload.save_material_upload(file.filename, file.file)
+    except material_upload.MaterialUploadError as exc:
+        raise HttpException(
+            request_id, status_code=400, message=f"{request_id}: {exc}"
+        ) from exc
+    except material_upload.MaterialServiceError as exc:
+        logger.error("local material upload failed: request_id={}", request_id)
+        raise HttpException(
+            request_id, status_code=500,
+            message=f"{request_id}: local material validation is unavailable",
+        ) from exc
+    return utils.get_response(200, {"file": stored_name})
 
 @router.get("/stream/{file_path:path}")
 async def stream_video(request: Request, file_path: str):
@@ -471,12 +489,9 @@ async def download_video(request: Request, file_path: str):
     tasks_dir = utils.task_dir()
     video_path = _resolve_path_within_directory(tasks_dir, file_path, request_id)
     file_path = pathlib.Path(video_path)
-    filename = file_path.stem
     extension = file_path.suffix
-    headers = {"Content-Disposition": f"attachment; filename={filename}{extension}"}
     return FileResponse(
         path=video_path,
-        headers=headers,
-        filename=f"{filename}{extension}",
+        filename=file_path.name,
         media_type=f"video/{extension[1:]}",
     )

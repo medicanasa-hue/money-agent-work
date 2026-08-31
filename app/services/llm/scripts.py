@@ -181,9 +181,9 @@ def generate_script(
         response = response.replace("*", "")
         response = response.replace("#", "")
 
-        # Remove markdown syntax
-        response = re.sub(r"\[.*\]", "", response)
-        response = re.sub(r"\(.*\)", "", response)
+        # Remove each annotation separately without swallowing narration between them.
+        response = re.sub(r"\[.*?\]", "", response)
+        response = re.sub(r"\(.*?\)", "", response)
 
         # Split the script into paragraphs
         paragraphs = response.split("\n\n")

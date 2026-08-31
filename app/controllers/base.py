@@ -12,6 +12,7 @@ from app.models.exception import HttpException
 _DEFAULT_AUTH_MAX_FAILURES = 5
 _DEFAULT_AUTH_FAILURE_WINDOW_SECONDS = 60.0
 _MAX_AUTH_RATE_LIMIT_CLIENTS = 2048
+MAX_TASK_ID_LENGTH = 128
 _auth_failure_lock = threading.Lock()
 _auth_failure_attempts: dict[str, list[float]] = {}
 
@@ -104,11 +105,17 @@ def _clear_auth_rate_limit(request: Request):
         _auth_failure_attempts.pop(_auth_client_id(request), None)
 
 
-def get_task_id(request: Request):
+def get_task_id(request: Request) -> str:
+    """Keep printable trace IDs, replacing unsafe client input before logging."""
     task_id = request.headers.get("x-task-id")
-    if not task_id:
-        task_id = uuid4()
-    return str(task_id)
+    if (
+        not isinstance(task_id, str)
+        or not task_id
+        or len(task_id) > MAX_TASK_ID_LENGTH
+        or not task_id.isprintable()
+    ):
+        return str(uuid4())
+    return task_id
 
 
 def get_api_key(request: Request):
@@ -116,14 +123,39 @@ def get_api_key(request: Request):
     return api_key
 
 
+def get_api_key_values(request: Request) -> list[str]:
+    """Preserve duplicate headers instead of trusting a proxy's value ordering."""
+    get_list = getattr(request.headers, "getlist", None)
+    if callable(get_list):
+        return get_list("x-api-key")
+    api_key = get_api_key(request)
+    return [api_key] if isinstance(api_key, str) else []
+
+
 def verify_token(request: Request):
-    expected_token = str(config.app.get("api_key", "") or "").strip()
+    configured_token = config.app.get("api_key", "")
+    if configured_token is None:
+        return
+    if not isinstance(configured_token, str):
+        raise HttpException(
+            task_id=get_task_id(request),
+            status_code=500,
+            message="API authentication is misconfigured",
+        )
+
+    expected_token = configured_token.strip()
     if not expected_token:
         return
 
-    token = get_api_key(request)
-    token = str(token or "").strip()
-    if not hmac.compare_digest(token, expected_token):
+    token_values = get_api_key_values(request)
+    valid_token = (
+        len(token_values) == 1
+        and isinstance(token_values[0], str)
+        and hmac.compare_digest(
+            token_values[0].strip().encode("utf-8"), expected_token.encode("utf-8")
+        )
+    )
+    if not valid_token:
         request_id = get_task_id(request)
         if _is_auth_rate_limited(request):
             raise HttpException(

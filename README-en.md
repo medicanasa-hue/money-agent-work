@@ -242,22 +242,53 @@ On first launch, the project creates `config.toml` from `config.example.toml`. Y
 
 ### Docker Deployment 🐳
 
-#### ① Launch the Docker Container
+#### ① Prepare Configuration and Build Locally
 
-If you haven't installed Docker, please install it first https://www.docker.com/products/docker-desktop/
-If you are using a Windows system, please refer to Microsoft's documentation:
+Install [Docker Desktop](https://www.docker.com/products/docker-desktop/) first if needed. Windows users can also refer to Microsoft's [WSL installation](https://learn.microsoft.com/en-us/windows/wsl/install) and [WSL container](https://learn.microsoft.com/en-us/windows/wsl/tutorials/wsl-containers) guides.
 
-1. https://learn.microsoft.com/en-us/windows/wsl/install
-2. https://learn.microsoft.com/en-us/windows/wsl/tutorials/wsl-containers
+This fork defaults to building your local checkout. Before starting Compose, `config.toml` must exist as a file and `storage` as a directory. Copy the example only when `config.toml` is missing; **never overwrite an existing configuration**. Unlike direct application startup, Compose refuses a missing configuration bind.
+
+macOS / Linux:
 
 ```shell
 cd MoneyPrinterTurbo
-docker compose -f docker-compose.release.yml up
+if [ ! -e config.toml ]; then cp -n config.example.toml config.toml; fi
+mkdir -p storage
+docker compose up --build
 ```
 
-> The recommended default is `docker-compose.release.yml`, which pulls the prebuilt image from GitHub Container Registry: `ghcr.io/harry0703/moneyprinterturbo:latest`.
-> If you need to build the image locally, you can still run `docker compose up`.
-> Before the first start, copy `config.example.toml` to `config.toml` so it can be mounted into the containers.
+Windows PowerShell:
+
+```powershell
+cd MoneyPrinterTurbo
+if (-not (Test-Path -LiteralPath config.toml)) { Copy-Item -LiteralPath config.example.toml -Destination config.toml }
+if (-not (Test-Path -LiteralPath storage)) { New-Item -ItemType Directory -Path storage | Out-Null }
+docker compose up --build
+```
+
+The image installs the runtime from `uv.lock` with `uv sync --locked --no-dev --no-install-project` into `/opt/venv`. Only `config.toml` and `storage` are mounted from the host; application code comes from the image. Run `docker compose up --build` again after source or dependency changes.
+
+The initial container target is `linux/amd64` using the CPU image. Compose pins
+that platform explicitly; ARM hosts need amd64 emulation. GPU deployment is
+optional and has not yet been validated on GPU hardware.
+
+For production, use `docker-compose.release.yml` only after publishing an image from your own repository. This fork does not assume a prebuilt image exists. Set `MPT_IMAGE` to the actual reference from your publication, preferably its immutable digest; an explicitly published `:sha-<full-commit-sha>` tag also works. Replace all placeholders below.
+
+macOS / Linux:
+
+```shell
+export MPT_IMAGE='ghcr.io/<owner>/<repository>@sha256:<digest>'
+docker compose -f docker-compose.release.yml up -d
+```
+
+Windows PowerShell:
+
+```powershell
+$env:MPT_IMAGE = 'ghcr.io/<owner>/<repository>@sha256:<digest>'
+docker compose -f docker-compose.release.yml up -d
+```
+
+The [container workflow](.github/workflows/docker-ghcr.yml) builds and tests by default. Publishing requires a manual run on the repository's default branch with `publish` enabled. Release Compose requires `MPT_IMAGE` and uses the same configuration/storage mounts and localhost port bindings as the local build.
 
 #### ② Access the WebUI
 
@@ -280,7 +311,9 @@ uv python install 3.11
 uv sync --frozen
 ```
 
-If you are not using `uv` yet, you can still use `venv + pip`.
+If you are not using `uv` yet, you can still use `venv + pip`. This legacy path
+resolves transitive packages independently; use the uv path above when you need
+the exact locked environment.
 
 ```shell
 python3.11 -m venv .venv

@@ -34,6 +34,7 @@ debug/
 debug_*.py
 test_*.py
 !test/services/test_*.py
+!test/utils/test_video_quality.py
 !test/test_*.py
 streamlit.log
 .coverage

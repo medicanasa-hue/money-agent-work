@@ -2,10 +2,14 @@ import json
 import unittest
 from unittest.mock import MagicMock, patch
 
+from loguru import logger
+
 from app.controllers.manager.base_manager import TaskQueueFullError
 from app.controllers.manager.memory_manager import InMemoryTaskManager
 from app.controllers.manager.redis_manager import RedisTaskManager
+from app.models import const
 from app.models.schema import VideoParams
+from app.services import state as state_service
 from app.services import task as task_service
 
 
@@ -125,6 +129,10 @@ class TestInMemoryTaskManager(unittest.TestCase):
 class TestRedisTaskManager(unittest.TestCase):
     def setUp(self):
         self.redis_client = MagicMock()
+        self.state = state_service.MemoryState()
+        state_patcher = patch.object(state_service, "state", self.state)
+        self.addCleanup(state_patcher.stop)
+        state_patcher.start()
         patcher = patch(
             "app.controllers.manager.redis_manager.redis.Redis.from_url",
             return_value=self.redis_client,
@@ -189,6 +197,127 @@ class TestRedisTaskManager(unittest.TestCase):
         self.assertIsNone(self.manager.dequeue())
         self.assertTrue(self.manager.is_queue_empty())
         self.assertEqual(self.manager.queue_size(), 2)
+
+    def test_legacy_positional_task_can_be_requeued_after_restore(self):
+        payload = {
+            "func": "start",
+            "args": ["legacy-task", {"video_subject": "Coffee"}],
+            "kwargs": {"stop_at": "audio"},
+        }
+        self.redis_client.lpop.return_value = json.dumps(payload)
+        restored = self.manager.dequeue()
+        self.manager.enqueue(restored)
+        encoded = json.loads(self.redis_client.rpush.call_args.args[1])
+        self.assertEqual(encoded["args"], [])
+        self.assertEqual(encoded["kwargs"]["task_id"], "legacy-task")
+        self.assertEqual(encoded["kwargs"]["params"]["video_subject"], "Coffee")
+        self.assertEqual(encoded["kwargs"]["stop_at"], "audio")
+
+    def test_stale_params_fail_task_and_schedule_next_without_leaking_input(self):
+        secret_input = "private script text must not enter validation logs"
+        stale_payload = {
+            "func": "start",
+            "args": [],
+            "kwargs": {
+                "task_id": "task-stale",
+                "params": {"video_subject": "Coffee", "video_fps": secret_input},
+            },
+        }
+        valid_payload = {
+            "func": "start",
+            "args": [],
+            "kwargs": {"task_id": "task-valid", "params": {"video_subject": "Tea"}},
+        }
+        self.state.update_task("task-stale", progress=3, request_id="request-stale")
+        self.manager.current_tasks = 1
+        self.redis_client.llen.return_value = 2
+        self.redis_client.lpop.side_effect = [
+            json.dumps(stale_payload),
+            json.dumps(valid_payload),
+        ]
+        messages = []
+        sink_id = logger.add(messages.append, format="{message}")
+        self.addCleanup(logger.remove, sink_id)
+
+        with patch.object(self.manager, "execute_task") as execute_task:
+            self.manager.task_done()
+
+        failed_task = self.state.get_task("task-stale")
+        self.assertEqual(failed_task["state"], const.TASK_STATE_FAILED)
+        self.assertEqual(failed_task["failed_stage"], "dequeue")
+        self.assertEqual(failed_task["request_id"], "request-stale")
+        self.assertNotIn(secret_input, failed_task["error"])
+        self.assertNotIn(secret_input, "".join(messages))
+        self.assertEqual(self.manager.current_tasks, 1)
+        execute_task.assert_called_once()
+        self.assertIs(execute_task.call_args.args[0], task_service.start)
+        self.assertEqual(execute_task.call_args.kwargs["task_id"], "task-valid")
+        self.assertEqual(execute_task.call_args.kwargs["params"].video_subject, "Tea")
+
+    def test_dequeue_skips_corrupt_records_before_next_valid_task(self):
+        valid_payload = {
+            "func": "start",
+            "kwargs": {"task_id": "task-valid", "params": {"video_subject": "Tea"}},
+        }
+        corrupt_records = [
+            b"\xff",
+            "",
+            "{",
+            "[]",
+            json.dumps({"func": "removed-function", "kwargs": {}}),
+            json.dumps({"func": [], "kwargs": {}}),
+            json.dumps({"func": "start", "kwargs": []}),
+            json.dumps({"func": "start", "args": {}, "kwargs": {}}),
+            json.dumps({"func": "start", "kwargs": {"params": []}}),
+            json.dumps({"func": "start", "kwargs": {"task_id": "missing-params"}}),
+            json.dumps({"func": "start", "kwargs": {"params": {"video_subject": "test"}}}),
+            json.dumps({"func": "start", "kwargs": {"task_id": "old", "params": {"video_subject": "test"}, "removed_argument": True}}),
+        ]
+
+        for corrupt_record in corrupt_records:
+            with self.subTest(record=corrupt_record):
+                self.redis_client.lpop.side_effect = [
+                    corrupt_record,
+                    json.dumps(valid_payload),
+                ]
+
+                task = self.manager.dequeue()
+
+                self.assertEqual(task["kwargs"]["task_id"], "task-valid")
+                self.assertIsInstance(task["kwargs"]["params"], VideoParams)
+
+    def test_all_stale_records_leave_no_reserved_slot(self):
+        stale_payload = {
+            "func": "start",
+            "kwargs": {
+                "task_id": "task-stale",
+                "params": {"video_subject": "Coffee", "video_fps": 0},
+            },
+        }
+        self.manager.current_tasks = 1
+        self.redis_client.llen.return_value = 1
+        self.redis_client.lpop.side_effect = [json.dumps(stale_payload), None]
+
+        with patch.object(self.manager, "execute_task") as execute_task:
+            self.manager.task_done()
+
+        self.assertEqual(self.manager.current_tasks, 0)
+        execute_task.assert_not_called()
+
+    def test_discarding_stale_record_does_not_recreate_deleted_state(self):
+        stale_payload = {
+            "func": "start",
+            "kwargs": {
+                "task_id": "task-deleted",
+                "params": {"video_subject": "Coffee", "video_fps": 0},
+            },
+        }
+        self.state.update_task("task-deleted")
+        self.state.delete_task("task-deleted")
+        self.redis_client.lpop.side_effect = [json.dumps(stale_payload), None]
+
+        self.assertIsNone(self.manager.dequeue())
+        self.assertIsNone(self.state.get_task("task-deleted"))
 
 
 if __name__ == "__main__":
