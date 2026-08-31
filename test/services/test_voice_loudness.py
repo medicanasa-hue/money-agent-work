@@ -25,7 +25,10 @@ class TestNarrationLoudness(unittest.TestCase):
             ):
                 result = loudness.normalize_narration_loudness(str(source))
 
-            self.assertEqual(result, str(source.with_suffix(".normalized.wav")))
+            self.assertEqual(
+                Path(result).resolve(strict=True),
+                source.with_suffix(".normalized.wav").resolve(strict=True),
+            )
             self.assertEqual(source.read_bytes(), b"original narration")
             command = run.call_args.args[0]
             self.assertIn("loudnorm=I=-16:TP=-1.5:LRA=11,aresample=48000", command)

@@ -899,8 +899,16 @@ class TestRenderQuality(unittest.TestCase):
                 Path(package["manifest_path"]).read_text(encoding="utf-8")
             )
 
+            actual_video_paths = [
+                Path(video).resolve(strict=True) for video in package["video_paths"]
+            ]
+            expected_video_paths = [
+                first_video.resolve(strict=True),
+                second_video.resolve(strict=True),
+            ]
+
         self.assertTrue(package["ok"])
-        self.assertEqual(package["video_paths"], [str(first_video), str(second_video)])
+        self.assertEqual(actual_video_paths, expected_video_paths)
         self.assertEqual(package["gallery"], gallery)
         self.assertEqual(len(package["quality_reports"]), 2)
         self.assertEqual(len(package["safe_zone_snapshots"]), 2)
@@ -943,11 +951,16 @@ class TestRenderQuality(unittest.TestCase):
                     "review-expectations-task"
                 )
 
-        inspect.assert_called_once_with(
-            str(video_path),
-            expected_aspect=VideoAspect.portrait,
-            expected_duration=12.5,
-        )
+            inspected_path = inspect.call_args.args[0]
+            self.assertEqual(
+                Path(inspected_path).resolve(strict=True),
+                video_path.resolve(strict=True),
+            )
+            inspect.assert_called_once_with(
+                inspected_path,
+                expected_aspect=VideoAspect.portrait,
+                expected_duration=12.5,
+            )
 
     def test_build_task_visual_review_allows_intentionally_silent_no_voice_output(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -988,12 +1001,17 @@ class TestRenderQuality(unittest.TestCase):
             ):
                 render_quality.build_task_visual_review_package("review-no-voice-task")
 
-        inspect.assert_called_once_with(
-            str(video_path),
-            expected_aspect=VideoAspect.portrait,
-            expected_duration=None,
-            allow_silent_audio=True,
-        )
+            inspected_path = inspect.call_args.args[0]
+            self.assertEqual(
+                Path(inspected_path).resolve(strict=True),
+                video_path.resolve(strict=True),
+            )
+            inspect.assert_called_once_with(
+                inspected_path,
+                expected_aspect=VideoAspect.portrait,
+                expected_duration=None,
+                allow_silent_audio=True,
+            )
 
     def test_build_task_visual_review_uses_saved_primary_aspect_without_filename_suffix(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1029,11 +1047,16 @@ class TestRenderQuality(unittest.TestCase):
                     "review-primary-aspect-task"
                 )
 
-        inspect.assert_called_once_with(
-            str(video_path),
-            expected_aspect=VideoAspect.portrait_4_5,
-            expected_duration=None,
-        )
+            inspected_path = inspect.call_args.args[0]
+            self.assertEqual(
+                Path(inspected_path).resolve(strict=True),
+                video_path.resolve(strict=True),
+            )
+            inspect.assert_called_once_with(
+                inspected_path,
+                expected_aspect=VideoAspect.portrait_4_5,
+                expected_duration=None,
+            )
 
     def test_build_task_visual_review_package_rejects_unknown_task(self):
         with tempfile.TemporaryDirectory() as temp_dir, patch.object(

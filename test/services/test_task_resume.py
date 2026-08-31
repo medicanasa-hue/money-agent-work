@@ -156,11 +156,15 @@ class TestInterruptedTaskResume(unittest.TestCase):
             ):
                 tm.resume_interrupted_task(task_id)
 
-        self.assertEqual(start.call_args.kwargs["resume_audio_file"], str(audio_file))
-        self.assertEqual(start.call_args.kwargs["resume_audio_duration"], 7)
-        self.assertEqual(
-            start.call_args.kwargs["resume_subtitle_path"], str(subtitle_file)
-        )
+            self.assertEqual(
+                Path(start.call_args.kwargs["resume_audio_file"]).resolve(strict=True),
+                audio_file.resolve(strict=True),
+            )
+            self.assertEqual(start.call_args.kwargs["resume_audio_duration"], 7)
+            self.assertEqual(
+                Path(start.call_args.kwargs["resume_subtitle_path"]).resolve(strict=True),
+                subtitle_file.resolve(strict=True),
+            )
 
     def test_start_reuses_saved_audio_and_subtitle_without_regeneration(self):
         params = VideoParams(video_subject="saved subject", video_source="pexels")

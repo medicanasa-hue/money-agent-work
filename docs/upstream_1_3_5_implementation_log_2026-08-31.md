@@ -546,3 +546,36 @@ Kanıtlar `.codex/integration/container-round4/`,
 başlangıçta yedeklenen 30 özgün dosyanın hâlâ aynı olduğunu doğruladı. Son CPU
 imajı yerelde tutuldu; daha eski bu tura ait test etiketi kaldırıldı. Bu turda
 Copilot isteği veya AI kredi tüketimi olmadı.
+
+## GitHub PR kabul turu — 1 Eylül
+
+Yerel entegrasyon iki commit halinde `codex/integrate-upstream-v1.3.5` dalına
+alındı ve `medicanasa-hue/money-agent-work` deposunda taslak PR #4 açıldı. İlk
+uzak koşuda CodeQL Python `security-extended` analizi başarıyla tamamlandı.
+Linux Python 3.11 ve 3.13 CI işleri de tam test ve coverage adımlarıyla geçti.
+
+Windows işi 1.510 test geçtikten sonra altı path assertion'ında durdu. GitHub
+runner aynı gerçek temp dizinini test tarafında `C:\Users\RUNNER~1`, uygulama
+tarafında `C:\Users\runneradmin` biçiminde gösteriyordu. Production davranışı
+değiştirilmedi; dosyalar temp context içinde hâlâ mevcutken
+`Path.resolve(strict=True)` ile canonical eşdeğerlik sınandı. Mock çağrı sayısı,
+kwargs ve diğer davranış assertion'ları korundu. Üç ilgili dosyadaki 49 test hem
+normal temp diziniyle hem gerçek bir Windows 8.3 alias üzerinden geçti.
+
+İlk koşu ayrıca Node.js 20 action deprecation uyarısı verdi. Resmî action
+release ve `action.yml` kayıtları doğrulanarak checkout 7.0.1, setup-python
+7.0.0, setup-uv 10.0.1 ve upload-artifact 7.0.1 Node 24 sürümlerine geçirildi.
+Dependency audit action'ı da yayımlanmış 1.1.0 commit'ine sabitlendi. Dört
+workflow'daki 19 `uses:` girdisinin tamamı artık değişmez 40 haneli commit SHA
+kullanıyor; altı checkout adımının tamamında credentials kalıcı değil.
+[checkout 7.0.1](https://github.com/actions/checkout/releases/tag/v7.0.1),
+[setup-python 7.0.0](https://github.com/actions/setup-python/releases/tag/v7.0.0),
+[setup-uv 10.0.1](https://github.com/astral-sh/setup-uv/releases/tag/v10.0.1),
+[upload-artifact 7.0.1](https://github.com/actions/upload-artifact/releases/tag/v7.0.1).
+
+Push sırasında GitHub varsayılan dal için 70 açık Dependabot kaydı bildirdi.
+Bunlar 62 benzersiz pip paket/advisory eşleşmesi: PR lock sürümleri 61'ini
+güvenli aralığa taşıyor, kalan `httplib2` artık lock'ta yok. GitPython'ın
+`= 3.1.50` biçimli kaydı ayrıca elle kontrol edildi; PR sürümü 3.1.58. Uzak
+uyarılar yalnız varsayılan dal güncellendiğinde yeniden hesaplanacağından PR
+taslak haldeyken açık görünmeleri bekleniyor.
