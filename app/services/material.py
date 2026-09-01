@@ -56,6 +56,10 @@ from app.services.providers.museum import (
     search_photos_artic,
     search_photos_met,
 )
+from app.services.url_security import (
+    is_public_ip_address,
+    public_http_url_addresses,
+)
 from app.utils import utils
 
 # ─── Thread-safe API key rotasyonu (eski işlevler için) ──────────────────────
@@ -69,6 +73,7 @@ _VIDEO_DOWNLOAD_TIMEOUT = (30, 90)
 _VIDEO_DOWNLOAD_TOTAL_TIMEOUT_SECONDS = 120
 _VIDEO_DOWNLOAD_CHUNK_SIZE = 1024 * 1024
 _MAX_VIDEO_DOWNLOAD_BYTES = 512 * 1024 * 1024
+_MAX_REMOTE_MATERIAL_REDIRECTS = 3
 
 
 def _read_video_response_content(response) -> bytes | None:
@@ -106,8 +111,133 @@ def _close_response(response) -> None:
     if callable(close):
         try:
             close()
-        except requests.RequestException:
+        except Exception:
             pass
+
+
+def _response_peer_address(response) -> str | None:
+    """Best-effort origin peer lookup for DNS-rebinding protection."""
+    raw_response = getattr(response, "raw", None)
+    socket_paths = (
+        ("_connection", "sock"),
+        ("connection", "sock"),
+        ("_fp", "fp", "raw", "_sock"),
+        ("_original_response", "fp", "raw", "_sock"),
+    )
+    for path in socket_paths:
+        socket_object = raw_response
+        try:
+            for attribute in path:
+                socket_object = getattr(socket_object, attribute)
+        except (AttributeError, TypeError):
+            continue
+        getpeername = getattr(socket_object, "getpeername", None)
+        if not callable(getpeername):
+            continue
+        try:
+            peer = getpeername()
+        except OSError:
+            continue
+        if isinstance(peer, tuple) and peer:
+            return str(peer[0])
+    return None
+
+
+def _request_uses_proxy(request_url: str) -> bool:
+    configured_proxies = config.proxy if isinstance(config.proxy, dict) else {}
+    if any(value for value in configured_proxies.values()):
+        return True
+    try:
+        return bool(requests.utils.get_environ_proxies(request_url))
+    except (AttributeError, OSError, ValueError):
+        return False
+
+
+def _response_peer_is_safe(response, request_url: str) -> bool:
+    # When a trusted configured/environment proxy is in use, the connected peer
+    # is the proxy rather than the origin. The target still passes the DNS gate.
+    if _request_uses_proxy(request_url):
+        return True
+    peer_address = _response_peer_address(response)
+    return peer_address is None or is_public_ip_address(peer_address)
+
+
+def _request_safe_remote_response(
+    request_url: str,
+    *,
+    headers: dict[str, str],
+    timeout: tuple[int, int],
+    resource_name: str,
+    redirect_url_validator: Optional[Callable[[str], bool]] = None,
+):
+    """GET an untrusted material URL after validating every redirect hop."""
+    for redirect_count in range(_MAX_REMOTE_MATERIAL_REDIRECTS + 1):
+        if public_http_url_addresses(request_url) is None:
+            logger.warning(f"{resource_name} URL was rejected by the network safety gate")
+            return None
+
+        try:
+            response = requests.get(
+                request_url,
+                headers=headers,
+                proxies=config.proxy,
+                verify=_get_tls_verify(),
+                timeout=timeout,
+                stream=True,
+                allow_redirects=False,
+            )
+        except Exception as error:
+            logger.warning(
+                f"{resource_name} request failed: {safe_error_details(error)}"
+            )
+            return None
+
+        try:
+            peer_is_safe = _response_peer_is_safe(response, request_url)
+            status_code = getattr(response, "status_code", 200)
+            is_redirect = isinstance(status_code, int) and 300 <= status_code < 400
+            response_headers = getattr(response, "headers", {}) or {}
+            location = response_headers.get("Location") if is_redirect else None
+        except Exception:
+            _close_response(response)
+            logger.warning(
+                f"{resource_name} response metadata could not be validated"
+            )
+            return None
+
+        if not peer_is_safe:
+            _close_response(response)
+            logger.warning(
+                f"{resource_name} connection was rejected by the network safety gate"
+            )
+            return None
+
+        if not is_redirect:
+            return response
+
+        try:
+            redirected_url = urljoin(request_url, str(location or ""))
+        except (TypeError, ValueError):
+            redirected_url = ""
+        _close_response(response)
+
+        if not location:
+            logger.warning(f"{resource_name} redirect did not include a target")
+            return None
+        if redirect_count >= _MAX_REMOTE_MATERIAL_REDIRECTS:
+            logger.warning(f"{resource_name} exceeded the redirect limit")
+            return None
+        if redirect_url_validator is not None:
+            try:
+                redirect_is_allowed = bool(redirect_url_validator(redirected_url))
+            except Exception:
+                redirect_is_allowed = False
+            if not redirect_is_allowed:
+                logger.warning(f"{resource_name} redirect target was rejected")
+                return None
+        request_url = redirected_url
+
+    return None
 
 
 def _get_tls_verify() -> bool:
@@ -783,23 +913,21 @@ def _preview_visual_quality_score(item: MaterialInfo) -> Optional[float]:
         return float(cached_score)
 
     preview_url = str(getattr(item, "preview_url", "") or "").strip()
-    parsed_url = urlsplit(preview_url)
-    if parsed_url.scheme not in ("http", "https") or not parsed_url.netloc:
-        return None
-
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/115.0.0.0 Safari/537.36"
     }
+    response = _request_safe_remote_response(
+        preview_url,
+        headers=headers,
+        timeout=(10, 20),
+        resource_name="material preview download",
+    )
+    if response is None:
+        return None
+
     try:
-        response = requests.get(
-            preview_url,
-            headers=headers,
-            proxies=config.proxy,
-            verify=_get_tls_verify(),
-            timeout=(10, 20),
-        )
         if getattr(response, "status_code", 200) != 200:
             return None
         response_headers = getattr(response, "headers", {}) or {}
@@ -821,6 +949,8 @@ def _preview_visual_quality_score(item: MaterialInfo) -> Optional[float]:
     except Exception as error:
         logger.debug(f"could not score material preview: {safe_error_details(error)}")
         return None
+    finally:
+        _close_response(response)
 
     score = _preview_quality_score_from_frame(frame)
     if score is not None:
@@ -1037,7 +1167,9 @@ def save_video(
     if not os.path.exists(save_dir):
         os.makedirs(save_dir)
 
-    url_hash = utils.md5(_material_url_key(video_url) or video_url.split("?")[0])
+    url_hash = utils.stable_cache_key(
+        _material_url_key(video_url) or video_url.split("?")[0]
+    )
     video_id = f"vid-{url_hash}"
     video_path = f"{save_dir}/{video_id}.mp4"
 
@@ -1054,68 +1186,68 @@ def save_video(
                       "AppleWebKit/537.36 (KHTML, like Gecko) "
                       "Chrome/115.0.0.0 Safari/537.36"
     }
+    resp = _request_safe_remote_response(
+        video_url,
+        headers=headers,
+        timeout=_VIDEO_DOWNLOAD_TIMEOUT,
+        resource_name="video download",
+    )
+    if resp is None:
+        return ""
+
     try:
-        resp = requests.get(
-            video_url, headers=headers, proxies=config.proxy,
-            verify=_get_tls_verify(), timeout=_VIDEO_DOWNLOAD_TIMEOUT, stream=True,
-        )
-    except Exception as e:
-        logger.warning(
-            f"video download request failed: {safe_error_details(e)}"
-        )
-        return ""
-
-    # getattr ile erişiyoruz: gerçek requests.Response nesnelerinde bu alanlar
-    # her zaman mevcut, ama testlerdeki basit mock nesneleri sadece .content
-    # tanımlayabiliyor; onlarla geriye dönük uyumluluğu koruyoruz.
-    status_code = getattr(resp, "status_code", 200)
-    if status_code != 200:
-        logger.warning(f"video download failed: HTTP {status_code}")
-        _close_response(resp)
-        return ""
-
-    resp_headers = getattr(resp, "headers", {}) or {}
-    content_type = resp_headers.get("Content-Type", "")
-    if content_type and not (
-        content_type.startswith("video/") or content_type == "application/octet-stream"
-    ):
-        logger.warning(
-            f"video download returned non-video content: Content-Type={content_type}"
-        )
-        _close_response(resp)
-        return ""
-
-    declared_length_value = resp_headers.get("Content-Length")
-    declared_length = None
-    if declared_length_value is not None:
-        try:
-            declared_length = int(declared_length_value)
-        except (TypeError, ValueError):
-            pass
-        if declared_length is not None and declared_length > _MAX_VIDEO_DOWNLOAD_BYTES:
-            logger.warning("video download exceeded its size limit")
-            _close_response(resp)
+        # getattr ile erişiyoruz: gerçek requests.Response nesnelerinde bu alanlar
+        # her zaman mevcut, ama testlerdeki basit mock nesneleri sadece .content
+        # tanımlayabiliyor; onlarla geriye dönük uyumluluğu koruyoruz.
+        status_code = getattr(resp, "status_code", 200)
+        if status_code != 200:
+            logger.warning(f"video download failed: HTTP {status_code}")
             return ""
 
-    content = _read_video_response_content(resp)
-    if content is None:
-        _close_response(resp)
-        return ""
-    if declared_length is not None:
-        if declared_length > len(content):
+        resp_headers = getattr(resp, "headers", {}) or {}
+        content_type = resp_headers.get("Content-Type", "")
+        if content_type and not (
+            content_type.startswith("video/")
+            or content_type == "application/octet-stream"
+        ):
+            logger.warning(
+                "video download returned non-video content: "
+                f"Content-Type={content_type}"
+            )
+            return ""
+
+        declared_length_value = resp_headers.get("Content-Length")
+        declared_length = None
+        if declared_length_value is not None:
+            try:
+                declared_length = int(declared_length_value)
+            except (TypeError, ValueError):
+                pass
+            if (
+                declared_length is not None
+                and declared_length > _MAX_VIDEO_DOWNLOAD_BYTES
+            ):
+                logger.warning("video download exceeded its size limit")
+                return ""
+
+        content = _read_video_response_content(resp)
+        if content is None:
+            return ""
+        if declared_length is not None and declared_length > len(content):
             logger.warning(
                 f"video download truncated: expected {declared_length} bytes, "
                 f"got {len(content)}"
             )
-            _close_response(resp)
             return ""
 
-    try:
-        with open(video_path, "wb") as f:
-            f.write(content)
-    except OSError as error:
-        logger.warning(f"failed to save downloaded video: {safe_error_details(error)}")
-        return ""
+        try:
+            with open(video_path, "wb") as f:
+                f.write(content)
+        except OSError as error:
+            logger.warning(
+                f"failed to save downloaded video: {safe_error_details(error)}"
+            )
+            return ""
     finally:
         _close_response(resp)
 
@@ -1145,7 +1277,9 @@ def save_image(
     elif not os.path.exists(save_dir):
         os.makedirs(save_dir)
 
-    url_hash = utils.md5(_material_url_key(image_url) or image_url.split("?")[0])
+    url_hash = utils.stable_cache_key(
+        _material_url_key(image_url) or image_url.split("?")[0]
+    )
     image_path = os.path.join(save_dir, f"img-{url_hash}.jpg")
     if os.path.isfile(image_path) and os.path.getsize(image_path) > 0:
         logger.info(f"image already exists: {image_path}")
@@ -1156,56 +1290,37 @@ def save_image(
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/115.0.0.0 Safari/537.36"
     }
-    request_url = image_url
-    for _redirect_count in range(4):
-        request_kwargs = {
-            "headers": headers,
-            "proxies": config.proxy,
-            "verify": _get_tls_verify(),
-            "timeout": (60, 240),
-        }
-        if redirect_url_validator is not None:
-            request_kwargs["allow_redirects"] = False
-        try:
-            response = requests.get(request_url, **request_kwargs)
-        except Exception as error:
-            logger.warning(
-                f"image download request failed: {safe_error_details(error)}"
-            )
+    response = _request_safe_remote_response(
+        image_url,
+        headers=headers,
+        timeout=(60, 240),
+        resource_name="image download",
+        redirect_url_validator=redirect_url_validator,
+    )
+    if response is None:
+        return ""
+
+    try:
+        if getattr(response, "status_code", 200) != 200:
+            logger.warning("image download failed")
             return ""
 
-        status_code = getattr(response, "status_code", 200)
-        if redirect_url_validator is None or not 300 <= status_code < 400:
-            break
         response_headers = getattr(response, "headers", {}) or {}
-        location = response_headers.get("Location")
-        redirected_url = urljoin(request_url, str(location or ""))
-        if not location or not redirect_url_validator(redirected_url):
-            logger.warning("image download redirect target was rejected")
+        content_type = str(response_headers.get("Content-Type", "")).lower()
+        if content_type and not content_type.startswith("image/"):
+            logger.warning("image download returned non-image content")
             return ""
-        request_url = redirected_url
-    else:
-        logger.warning("image download exceeded the redirect limit")
-        return ""
 
-    if getattr(response, "status_code", 200) != 200:
-        logger.warning("image download failed")
-        return ""
+        content = getattr(response, "content", b"")
+        if not isinstance(content, bytes) or not content:
+            logger.warning("image download returned empty content")
+            return ""
 
-    response_headers = getattr(response, "headers", {}) or {}
-    content_type = str(response_headers.get("Content-Type", "")).lower()
-    if content_type and not content_type.startswith("image/"):
-        logger.warning("image download returned non-image content")
-        return ""
-
-    content = getattr(response, "content", b"")
-    if not isinstance(content, bytes) or not content:
-        logger.warning("image download returned empty content")
-        return ""
-
-    with open(image_path, "wb") as file:
-        file.write(content)
-    return image_path if os.path.getsize(image_path) > 0 else ""
+        with open(image_path, "wb") as file:
+            file.write(content)
+        return image_path if os.path.getsize(image_path) > 0 else ""
+    finally:
+        _close_response(response)
 
 
 def _score_resolution(

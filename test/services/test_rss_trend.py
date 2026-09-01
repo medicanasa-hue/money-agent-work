@@ -37,8 +37,10 @@ class TestRssTrend(unittest.TestCase):
         self.assertIn("Third finance headline", result)
         self.assertNotIn("Ignored headline", result)
         get.assert_called_once()
-        self.assertIn("personal+finance", get.call_args.args[0])
+        self.assertEqual(get.call_args.args[0], rss_trend.GOOGLE_NEWS_RSS_URL)
+        self.assertEqual(get.call_args.kwargs["params"]["q"], "personal finance")
         self.assertEqual(get.call_args.kwargs["timeout"], 3.0)
+        self.assertFalse(get.call_args.kwargs["allow_redirects"])
 
     def test_fetch_rss_trend_uses_turkish_google_news_locale(self):
         class Response:
@@ -55,9 +57,10 @@ class TestRssTrend(unittest.TestCase):
             )
 
         self.assertEqual(result, "Turkish economy headline")
-        self.assertIn("hl=tr", get.call_args.args[0])
-        self.assertIn("gl=TR", get.call_args.args[0])
-        self.assertIn("ceid=TR:tr", get.call_args.args[0])
+        self.assertEqual(get.call_args.args[0], rss_trend.GOOGLE_NEWS_RSS_URL)
+        self.assertEqual(get.call_args.kwargs["params"]["hl"], "tr")
+        self.assertEqual(get.call_args.kwargs["params"]["gl"], "TR")
+        self.assertEqual(get.call_args.kwargs["params"]["ceid"], "TR:tr")
 
     def test_fetch_rss_trend_keeps_localized_results_separate_in_cache(self):
         class Response:
@@ -124,10 +127,13 @@ class TestRssTrend(unittest.TestCase):
             items = rss_trend.fetch_rss_trend_items("ekonomi", language="tr")
 
         self.assertEqual(items[0]["title"], "Turkish headline")
-        self.assertIn("hl=tr", get.call_args.args[0])
+        self.assertEqual(get.call_args.args[0], rss_trend.GOOGLE_NEWS_RSS_URL)
+        self.assertEqual(get.call_args.kwargs["params"]["hl"], "tr")
 
     def test_fetch_rss_trend_returns_empty_on_network_error(self):
-        with patch.object(rss_trend.requests, "get", side_effect=RuntimeError("offline")):
+        with patch.object(
+            rss_trend.requests, "get", side_effect=RuntimeError("offline")
+        ):
             result = rss_trend.fetch_rss_trend("personal finance")
 
         self.assertEqual(result, "")
@@ -143,6 +149,125 @@ class TestRssTrend(unittest.TestCase):
             result = rss_trend.fetch_rss_trend("personal finance")
 
         self.assertEqual(result, "")
+
+    def test_fetch_functions_reject_external_xml_entities(self):
+        class Response:
+            content = b"""<?xml version="1.0" encoding="UTF-8"?>
+            <!DOCTYPE rss [
+              <!ENTITY unsafe SYSTEM "file:///etc/passwd">
+            ]>
+            <rss><channel><item><title>&unsafe;</title></item></channel></rss>"""
+
+            def raise_for_status(self):
+                return None
+
+        cases = (
+            (rss_trend.fetch_rss_trend, ""),
+            (rss_trend.fetch_rss_trend_items, []),
+        )
+        for fetch, expected in cases:
+            with self.subTest(fetch=fetch.__name__):
+                with patch.object(rss_trend.requests, "get", return_value=Response()):
+                    result = fetch("personal finance")
+
+                self.assertEqual(result, expected)
+
+    def test_fetch_functions_keep_untrusted_topic_out_of_request_url(self):
+        class Response:
+            content = b"<rss><channel /></rss>"
+
+            def raise_for_status(self):
+                return None
+
+        topic = "https://169.254.169.254/latest/meta-data/../credentials?x=1"
+        cases = (
+            (rss_trend.fetch_rss_trend, {"cache_ttl_seconds": 0}),
+            (rss_trend.fetch_rss_trend_items, {}),
+        )
+        for fetch, kwargs in cases:
+            with self.subTest(fetch=fetch.__name__):
+                with patch.object(
+                    rss_trend.requests, "get", return_value=Response()
+                ) as get:
+                    fetch(topic, **kwargs)
+
+                self.assertEqual(get.call_args.args, (rss_trend.GOOGLE_NEWS_RSS_URL,))
+                self.assertEqual(get.call_args.kwargs["params"]["q"], topic)
+                self.assertFalse(get.call_args.kwargs["allow_redirects"])
+                self.assertTrue(get.call_args.kwargs["stream"])
+
+    def test_fetch_functions_reject_redirect_responses(self):
+        class Response:
+            status_code = 302
+            headers = {"Location": "http://169.254.169.254/latest/meta-data"}
+            content = b"""<rss><channel><item>
+                <title>Redirected headline</title>
+            </item></channel></rss>"""
+
+            def raise_for_status(self):
+                return None
+
+        cases = (
+            (rss_trend.fetch_rss_trend, ""),
+            (rss_trend.fetch_rss_trend_items, []),
+        )
+        for fetch, expected in cases:
+            with self.subTest(fetch=fetch.__name__):
+                with patch.object(
+                    rss_trend.requests, "get", return_value=Response()
+                ) as get:
+                    result = fetch("personal finance")
+
+                self.assertEqual(result, expected)
+                self.assertFalse(get.call_args.kwargs["allow_redirects"])
+
+    def test_fetch_functions_reject_dtd_payloads(self):
+        class Response:
+            status_code = 200
+            content = b"""<?xml version="1.0"?>
+            <!DOCTYPE rss [<!ELEMENT rss ANY>]>
+            <rss><channel><item><title>DTD headline</title></item></channel></rss>"""
+
+            def raise_for_status(self):
+                return None
+
+        cases = (
+            (rss_trend.fetch_rss_trend, ""),
+            (rss_trend.fetch_rss_trend_items, []),
+        )
+        for fetch, expected in cases:
+            with self.subTest(fetch=fetch.__name__):
+                with patch.object(rss_trend.requests, "get", return_value=Response()):
+                    result = fetch("personal finance")
+
+                self.assertEqual(result, expected)
+
+    def test_fetch_functions_reject_oversized_payloads(self):
+        class Response:
+            status_code = 200
+            content = b"""<rss><channel><item>
+                <title>Unsafe fallback headline</title>
+            </item></channel></rss>"""
+
+            def raise_for_status(self):
+                return None
+
+            def iter_content(self, chunk_size):
+                del chunk_size
+                yield b"<rss><channel>"
+                yield b" " * (1024 * 1024)
+                yield b"</channel></rss>"
+
+        cases = (
+            (rss_trend.fetch_rss_trend, ""),
+            (rss_trend.fetch_rss_trend_items, []),
+        )
+        for fetch, expected in cases:
+            with self.subTest(fetch=fetch.__name__):
+                with patch.object(rss_trend.requests, "get", return_value=Response()):
+                    result = fetch("personal finance")
+
+                self.assertEqual(result, expected)
 
     def test_fetch_rss_trend_reuses_a_recent_successful_result(self):
         class Response:

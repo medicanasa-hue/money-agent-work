@@ -579,3 +579,41 @@ güvenli aralığa taşıyor, kalan `httplib2` artık lock'ta yok. GitPython'ın
 `= 3.1.50` biçimli kaydı ayrıca elle kontrol edildi; PR sürümü 3.1.58. Uzak
 uyarılar yalnız varsayılan dal güncellendiğinde yeniden hesaplanacağından PR
 taslak haldeyken açık görünmeleri bekleniyor.
+
+### CodeQL güvenlik düzeltme turu
+
+İkinci PR koşusunda normal CI ve workflow içindeki CodeQL işi yeşile döndü;
+GitHub Advanced Security'nin ayrı `CodeQL` kapısı ise üç yeni uyarıyla PR'ı
+`UNSTABLE` tuttu: Google News RSS konu parametresinden kısmi SSRF, RSS XML
+payload'unda entity/DTD riski ve materyal cache anahtarında zayıf MD5 kullanımı.
+
+RSS istemcisi sabit `https://news.google.com/rss/search` endpoint'ine alındı;
+kullanıcı konusu yalnız `params["q"]` olarak gönderiliyor, Türkçe locale
+parametreleri ayrıca ekleniyor. RSS istekleri redirect takip etmiyor, response
+stream'i 1 MiB ile sınırlandırılıyor ve parse `defusedxml.ElementTree` ile
+DTD/entity/external referansları kapalı çalışıyor. `defusedxml==0.7.1`
+`pyproject.toml`, `requirements.txt` ve `uv.lock` içine kilitlendi.
+
+Materyal video, image ve preview indirme yüzeyi aynı güvenlik turunda
+sertleştirildi. `app/services/url_security.py` HTTP(S) dışı URL'leri, userinfo
+içeren URL'leri, whitespace/control karakterlerini, literal private IP'leri,
+IPv4-mapped IPv6 private adresleri, boş DNS cevaplarını ve public/private karışık
+DNS sonuçlarını fail-closed reddediyor. Materyal indirme helper'ı her redirect
+hop'unu en fazla üç adımla ve `allow_redirects=False` ile elle takip ediyor;
+redirect hedefleri yeniden aynı public DNS kapısından geçiyor, provider'a özel
+image redirect validator'ı ek kapı olarak korunuyor ve response nesneleri
+kapatılıyor. Public DNS sonrası private connected peer görülürse proxy yokken
+istek reddediliyor.
+
+Cache dosya isimleri için `utils.md5` kaldırıldı; video/image cache anahtarları
+deterministik 128-bit SHA-256 prefix'i üreten `utils.stable_cache_key` ile
+hesaplanıyor. Dosya adı uzunluğu eski 32 hex karakterlik yapıda kaldığından
+filesystem yüzeyi büyümedi; eski cache dosyaları yeniden indirilebilir, bu kabul
+edilen davranış değişikliğidir.
+
+Bu tur için önce başarısız güvenlik regresyon testleri yazıldı, sonra üretim
+düzeltmeleri uygulandı. Son doğrulama: `uv lock --check`, `uv sync --frozen`,
+`ruff check app test`, `compileall app test`, tam `pytest` ve `uvx pip-audit
+--local` geçti. Tam suite sonucu **1.540 geçti / 13 atlandı / 3 mevcut uyarı**
+ve `pip-audit` sonucu "No known vulnerabilities found". Uzak CodeQL yeniden
+koşusu bu commit pushlandıktan sonra izlenecek.

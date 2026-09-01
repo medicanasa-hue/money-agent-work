@@ -5360,9 +5360,16 @@ class TestPhotoFallback(unittest.TestCase):
             content=b"",
         )
 
-        with tempfile.TemporaryDirectory() as temp_dir, patch(
-            "app.services.material.requests.get", return_value=redirect
-        ) as get:
+        with (
+            tempfile.TemporaryDirectory() as temp_dir,
+            patch(
+                "app.services.material.public_http_url_addresses",
+                return_value=frozenset({"93.184.216.34"}),
+            ),
+            patch(
+                "app.services.material.requests.get", return_value=redirect
+            ) as get,
+        ):
             image_path = material.save_image(
                 "https://images.example/cc0-city.jpg",
                 save_dir=temp_dir,
@@ -5518,6 +5525,10 @@ class TestPhotoFallback(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             with (
                 patch("app.services.material.utils.storage_dir", return_value=temp_dir),
+                patch(
+                    "app.services.material.public_http_url_addresses",
+                    return_value=frozenset({"93.184.216.34"}),
+                ),
                 patch("app.services.material.requests.get", return_value=response) as get,
             ):
                 image_path = material.save_image("https://images.example/photo.jpg")

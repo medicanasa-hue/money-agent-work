@@ -335,10 +335,11 @@ def normalize_script_for_subtitle_matching(video_script: str) -> str:
     return normalized_script
 
 
-def md5(text):
+def stable_cache_key(text: str) -> str:
+    """Return a stable 128-bit SHA-256 prefix for cache filenames."""
     import hashlib
 
-    return hashlib.md5(text.encode("utf-8")).hexdigest()
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:32]
 
 
 def get_system_locale() -> str:

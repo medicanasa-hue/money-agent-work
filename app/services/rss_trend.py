@@ -1,19 +1,21 @@
 import threading
 import time
 from typing import Any
-from urllib.parse import quote_plus, urlparse
-from xml.etree import ElementTree
+from urllib.parse import urlparse
 
 import requests
+from defusedxml import ElementTree
 from loguru import logger
 
 MAX_RSS_TREND_LENGTH = 500
 MAX_RSS_SOURCE_TITLE_LENGTH = 200
 MAX_RSS_SOURCE_URL_LENGTH = 2048
 MAX_RSS_SOURCE_PUBLISHER_LENGTH = 120
-GOOGLE_NEWS_RSS_URL = "https://news.google.com/rss/search?q={query}{locale}"
-TURKISH_GOOGLE_NEWS_LOCALE = "&hl=tr&gl=TR&ceid=TR:tr"
+MAX_RSS_RESPONSE_BYTES = 1024 * 1024
+GOOGLE_NEWS_RSS_URL = "https://news.google.com/rss/search"
+TURKISH_GOOGLE_NEWS_PARAMS = {"hl": "tr", "gl": "TR", "ceid": "TR:tr"}
 DEFAULT_RSS_TREND_CACHE_SECONDS = 300.0
+_RSS_RESPONSE_CHUNK_BYTES = 64 * 1024
 _MAX_RSS_TREND_CACHE_ENTRIES = 64
 _rss_trend_cache: dict[tuple[str, int, str], tuple[float, str]] = {}
 _rss_trend_cache_lock = threading.Lock()
@@ -63,13 +65,68 @@ def _normalized_news_locale(value: object | None) -> str:
     return ""
 
 
-def _google_news_rss_url(topic: str, language: object | None = None) -> str:
-    locale = (
-        TURKISH_GOOGLE_NEWS_LOCALE
-        if _normalized_news_locale(language) == "tr"
-        else ""
+def _google_news_rss_params(
+    topic: str, language: object | None = None
+) -> dict[str, str]:
+    params = {"q": topic}
+    if _normalized_news_locale(language) == "tr":
+        params.update(TURKISH_GOOGLE_NEWS_PARAMS)
+    return params
+
+
+def _bounded_response_content(response: requests.Response) -> bytes:
+    headers = getattr(response, "headers", {}) or {}
+    content_length = headers.get("Content-Length")
+    if content_length is not None:
+        try:
+            declared_length = int(content_length)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("invalid RSS Content-Length") from exc
+        if declared_length < 0 or declared_length > MAX_RSS_RESPONSE_BYTES:
+            raise ValueError("RSS response exceeds the size limit")
+
+    iter_content = getattr(response, "iter_content", None)
+    if not callable(iter_content):
+        content = bytes(response.content)
+        if len(content) > MAX_RSS_RESPONSE_BYTES:
+            raise ValueError("RSS response exceeds the size limit")
+        return content
+
+    content = bytearray()
+    for chunk in iter_content(chunk_size=_RSS_RESPONSE_CHUNK_BYTES):
+        if not chunk:
+            continue
+        if len(content) + len(chunk) > MAX_RSS_RESPONSE_BYTES:
+            raise ValueError("RSS response exceeds the size limit")
+        content.extend(chunk)
+    return bytes(content)
+
+
+def _fetch_google_news_rss(topic: str, timeout: float, language: object | None):
+    response = requests.get(
+        GOOGLE_NEWS_RSS_URL,
+        params=_google_news_rss_params(topic, language),
+        timeout=timeout,
+        allow_redirects=False,
+        stream=True,
     )
-    return GOOGLE_NEWS_RSS_URL.format(query=quote_plus(topic), locale=locale)
+    try:
+        status_code = int(getattr(response, "status_code", 200))
+        if 300 <= status_code < 400:
+            raise requests.TooManyRedirects("Google News RSS redirect rejected")
+        response.raise_for_status()
+        content = _bounded_response_content(response)
+    finally:
+        close = getattr(response, "close", None)
+        if callable(close):
+            close()
+
+    return ElementTree.fromstring(
+        content,
+        forbid_dtd=True,
+        forbid_entities=True,
+        forbid_external=True,
+    )
 
 
 def clear_rss_trend_cache() -> None:
@@ -135,10 +192,7 @@ def fetch_rss_trend(
         return cached
 
     try:
-        url = _google_news_rss_url(topic, language)
-        response = requests.get(url, timeout=timeout)
-        response.raise_for_status()
-        root = ElementTree.fromstring(response.content)
+        root = _fetch_google_news_rss(topic, timeout, language)
     except Exception as exc:
         logger.warning(f"failed to fetch RSS trend context for '{topic}': {exc}")
         return ""
@@ -168,10 +222,7 @@ def fetch_rss_trend_items(
         return []
 
     try:
-        url = _google_news_rss_url(topic, language)
-        response = requests.get(url, timeout=timeout)
-        response.raise_for_status()
-        root = ElementTree.fromstring(response.content)
+        root = _fetch_google_news_rss(topic, timeout, language)
     except Exception as exc:
         logger.warning(f"failed to fetch RSS trend context for '{topic}': {exc}")
         return []
