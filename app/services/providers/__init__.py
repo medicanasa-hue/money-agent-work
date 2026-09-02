@@ -12,7 +12,11 @@ from .base import VideoProvider
 from .pexels import PexelsProvider
 from .pixabay import PixabayProvider
 from .coverr import CoverrProvider
+from .dvids import DVIDSProvider
+from .vecteezy import VecteezyProvider
 from .nasa import NASAProvider
+from .noaa_ocean import NOAOOceanExplorationProvider
+from .loc import LibraryOfCongressProvider
 from .wikimedia import WikimediaProvider
 from .archive_org import ArchiveOrgProvider
 from .utils import safe_error_details
@@ -22,7 +26,11 @@ PROVIDER_REGISTRY: Dict[str, Type[VideoProvider]] = {
     "pexels":       PexelsProvider,
     "pixabay":      PixabayProvider,
     "coverr":       CoverrProvider,
+    "dvids":        DVIDSProvider,
+    "vecteezy":     VecteezyProvider,
     "nasa":         NASAProvider,
+    "noaa_ocean":   NOAOOceanExplorationProvider,
+    "loc":          LibraryOfCongressProvider,
     "wikimedia":    WikimediaProvider,
     "archive_org":  ArchiveOrgProvider,
 }
@@ -32,7 +40,11 @@ PROVIDER_QUALITY_WEIGHTS: Dict[str, float] = {
     "pexels":       1.00,
     "pixabay":      0.95,
     "coverr":       0.90,
+    "dvids":        0.78,
+    "vecteezy":     0.80,
     "nasa":         0.75,
+    "noaa_ocean":   0.78,
+    "loc":          0.65,
     "wikimedia":    0.70,
     "archive_org":  0.65,
 }
@@ -42,13 +54,23 @@ PROVIDER_DISPLAY_NAMES: Dict[str, str] = {
     "pexels":       "Pexels",
     "pixabay":      "Pixabay",
     "coverr":       "Coverr",
+    "dvids":        "DVIDS Public Media",
+    "vecteezy":     "Vecteezy (free plan, attribution required)",
     "nasa":         "NASA Image Library",
+    "noaa_ocean":   "NOAA Ocean Exploration (public domain)",
+    "loc":          "Library of Congress (public domain)",
     "wikimedia":    "Wikimedia Commons",
     "archive_org":  "Internet Archive",
 }
 
 # API key gerektirmeyen provider'lar
-FREE_PROVIDERS: List[str] = ["nasa", "wikimedia", "archive_org"]
+FREE_PROVIDERS: List[str] = [
+    "nasa",
+    "noaa_ocean",
+    "loc",
+    "wikimedia",
+    "archive_org",
+]
 
 
 def get_provider(name: str) -> VideoProvider:

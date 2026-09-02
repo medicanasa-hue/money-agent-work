@@ -1,55 +1,31 @@
-# Use NVIDIA CUDA runtime as parent image (includes CUDA 12.1 + cuDNN 8)
-FROM nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04
+FROM ghcr.io/astral-sh/uv:0.12.7@sha256:95f2aa1fe59274951cfe9b0cbc7972e879ff1004bc8945d130a32eb0dbd85945 AS uv
+# CTranslate2 4.7.1 in uv.lock needs CUDA 12 and cuDNN 9 (not cuDNN 8).
+FROM nvidia/cuda:12.3.2-cudnn9-runtime-ubuntu22.04@sha256:fa44193567d1908f7ca1f3abf8623ce9c63bc8cba7bcfdb32702eb04d326f7a8
 
-# Avoid interactive timezone prompt
-ENV DEBIAN_FRONTEND=noninteractive
-
-# Set the working directory in the container
 WORKDIR /MoneyPrinterTurbo
-RUN chmod 777 /MoneyPrinterTurbo
+COPY --from=uv /uv /uvx /bin/
 
-ENV PYTHONPATH="/MoneyPrinterTurbo"
+ENV DEBIAN_FRONTEND="noninteractive" \
+    PYTHONPATH="/MoneyPrinterTurbo" \
+    UV_PROJECT_ENVIRONMENT="/opt/venv" \
+    UV_PYTHON_INSTALL_DIR="/opt/python" \
+    UV_LINK_MODE="copy" \
+    PATH="/opt/venv/bin:$PATH" \
+    IMAGEIO_FFMPEG_EXE="/usr/bin/ffmpeg" \
+    FFMPEG_BINARY="/usr/bin/ffmpeg"
 
-# Install Python 3.11 and system dependencies
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        software-properties-common \
-        git \
-        imagemagick \
-        ffmpeg \
-        curl \
-        && add-apt-repository ppa:deadsnakes/ppa \
-        && apt-get update && apt-get install -y --no-install-recommends \
-        python3.11 \
-        python3.11-venv \
-        python3.11-dev \
-        python3-pip \
-        && ln -sf /usr/bin/python3.11 /usr/bin/python3 \
-        && ln -sf /usr/bin/python3.11 /usr/bin/python \
-        && python3.11 -m pip install --upgrade pip \
-        && apt-get remove -y python3-blinker || true \
-        && rm -rf /var/lib/apt/lists/*
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates git ffmpeg libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
 
-# Fix security policy for ImageMagick
-RUN sed -i '/<policy domain="path" rights="none" pattern="@\*"/d' /etc/ImageMagick-6/policy.xml
+# Match the CPU image's Python patch without replacing Ubuntu's system Python.
+# uv uses the official python-build-standalone distribution; no PPA/system pip.
+RUN UV_PYTHON_CPYTHON_BUILD=20260825 uv python install 3.11.16
+COPY pyproject.toml uv.lock .python-version ./
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --locked --no-dev --no-install-project --python 3.11.16 --no-python-downloads
 
-# Copy only the requirements.txt first to leverage Docker cache
-COPY requirements.txt ./
-
-# Install Python dependencies
-RUN python3 -m pip install --no-cache-dir \
-    -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com \
-    --retries 3 --timeout 60 -r requirements.txt || \
-    python3 -m pip install --no-cache-dir \
-    -i https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple/ --trusted-host mirrors.tuna.tsinghua.edu.cn \
-    --retries 3 --timeout 60 -r requirements.txt || \
-    python3 -m pip install --no-cache-dir \
-    --retries 3 --timeout 60 -r requirements.txt
-
-# Now copy the rest of the codebase into the image
 COPY . .
+EXPOSE 8501 8080
 
-# Expose the port the app runs on
-EXPOSE 8501
-
-# Command to run the application
-CMD ["streamlit", "run", "./webui/Main.py","--browser.serverAddress=127.0.0.1","--server.enableCORS=True","--browser.gatherUsageStats=False","--server.showEmailPrompt=False"]
+CMD ["streamlit", "run", "./webui/Main.py", "--server.address=0.0.0.0", "--server.port=8501", "--browser.serverAddress=127.0.0.1", "--server.enableCORS=True", "--browser.gatherUsageStats=False", "--client.toolbarMode=minimal", "--logger.hideWelcomeMessage=True", "--server.showEmailPrompt=False"]

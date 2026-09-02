@@ -5,6 +5,7 @@ import requests
 from loguru import logger
 
 from app.config import config
+from app.models.schema import VideoAspect
 
 _api_key_counter = 0
 _api_key_lock = threading.Lock()
@@ -81,6 +82,41 @@ def get_search_page(source: str = "") -> int:
     if max_page <= 1:
         return 1
     return random.randint(1, max_page)
+
+
+def select_best_video_variant(variants, *, video_aspect: VideoAspect, url_key: str):
+    """Prefer a native output aspect before a larger but crop-prone file."""
+    try:
+        target_width, target_height = VideoAspect(video_aspect).to_resolution()
+    except (TypeError, ValueError):
+        target_width, target_height = VideoAspect.portrait.to_resolution()
+    target_aspect = target_width / target_height
+
+    selected = None
+    selected_score = None
+    for index, variant in enumerate(variants or []):
+        if not isinstance(variant, dict):
+            continue
+        source_url = variant.get(url_key)
+        if not isinstance(source_url, str) or not source_url.strip():
+            continue
+        try:
+            width = int(variant.get("width") or 0)
+            height = int(variant.get("height") or 0)
+        except (TypeError, ValueError):
+            continue
+        if width < target_width or height < target_height:
+            continue
+
+        source_aspect = width / height
+        aspect_fit = min(source_aspect, target_aspect) / max(
+            source_aspect, target_aspect
+        )
+        score = (aspect_fit, width * height, -index)
+        if selected_score is None or score > selected_score:
+            selected = (variant, width, height)
+            selected_score = score
+    return selected
 
 
 # Ortak User-Agent

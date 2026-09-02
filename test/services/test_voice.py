@@ -1,6 +1,10 @@
+from app.services.voice import subtitles as voice_subtitles
+from app.models.schema import VideoAspect
+
 import asyncio
 import base64
 import os
+import shutil
 import unittest
 import sys
 import tempfile
@@ -99,6 +103,24 @@ class TestVoiceService(unittest.TestCase):
         self.assertEqual(getattr(sub_maker, "subs", []), ["第一句话", "Second sentence"])
         self.assertEqual(len(getattr(sub_maker, "offset", [])), 2)
         self.assertGreater(vs.get_audio_duration(sub_maker), 0)
+
+    def test_get_audio_duration_accepts_non_mp3_files(self):
+        """
+        自定义音频（custom_audio_file）常见为 m4a/wav/aac 等非 mp3 格式。
+        get_audio_duration 不应因扩展名不是 .mp3 就报 "Invalid target type" 并返回 0，
+        而应交给 moviepy(ffmpeg) 读取真实时长。
+        """
+        for path in ("custom-audio.m4a", "voice.wav", "clip.aac"):
+            with patch.object(vs.os.path, "exists", return_value=True), \
+                    patch.object(voice_subtitles, "AudioFileClip") as mock_afc:
+                mock_afc.return_value.__enter__.return_value.duration = 28.89
+                self.assertEqual(vs.get_audio_duration(path), 28.89)
+                mock_afc.assert_called_once_with(path)
+
+    def test_get_audio_duration_missing_file_returns_zero(self):
+        """音频文件不存在时安全返回 0，而不是抛异常或读取失败。"""
+        with patch.object(vs.os.path, "exists", return_value=False):
+            self.assertEqual(vs.get_audio_duration("does-not-exist.m4a"), 0.0)
 
     def test_no_voice_alias_none_is_supported_temporarily(self):
         """
@@ -335,7 +357,10 @@ class TestVoiceService(unittest.TestCase):
             voice_file = f"{temp_dir}/tts-azure-v2-{voice_name}.mp3"
             subtitle_file = f"{temp_dir}/tts-azure-v2-{voice_name}.srt"
             sub_maker = vs.azure_tts_v2(
-                text=text_zh, voice_name=voice_name, voice_file=voice_file
+                text=text_zh,
+                voice_name=voice_name,
+                voice_file=voice_file,
+                voice_rate=1.0,
             )
             if not sub_maker:
                 self.fail("azure tts v2 failed")
@@ -345,11 +370,43 @@ class TestVoiceService(unittest.TestCase):
 
         self.loop.run_until_complete(_do())
 
-    def test_gemini_tts_uses_legacy_submaker_fields(self):
+    def test_azure_tts_v2_ssml_applies_rate_and_escapes_text(self):
+        """Azure V2 必须通过 SSML 应用语速，并避免用户文案破坏 XML。"""
+        ssml = vs._build_azure_v2_ssml(
+            text='A < B & "quoted"',
+            voice_name="zh-CN-XiaoxiaoMultilingualNeural",
+            voice_rate=1.8,
+        )
+
+        self.assertIn('xml:lang="zh-CN"', ssml)
+        self.assertIn('rate="1.8"', ssml)
+        self.assertIn("A &lt; B &amp; \"quoted\"", ssml)
+
+    def test_tts_forwards_rate_to_azure_v2(self):
+        """统一 TTS 入口不能在分发 Azure V2 时丢失 voice_rate。"""
+        voice_name = "zh-CN-XiaoxiaoMultilingualNeural-V2-Female"
+        with patch.object(vs, "azure_tts_v2", return_value=object()) as mock_tts:
+            result = vs.tts(
+                text="语速测试",
+                voice_name=voice_name,
+                voice_rate=1.8,
+                voice_file="/tmp/azure-v2-rate.mp3",
+            )
+
+        self.assertIsNotNone(result)
+        mock_tts.assert_called_once_with(
+            "语速测试",
+            voice_name,
+            "/tmp/azure-v2-rate.mp3",
+            voice_rate=1.8,
+        )
+
+    def test_gemini_tts_uses_google_genai_and_compatible_submaker_fields(self):
         """
         验证 Gemini TTS 在 edge_tts 7.x 环境下仍会返回项目兼容的字幕结构，
         并且可以被 `subtitle_provider=edge` 的字幕生成链路直接消费，
-        避免再次回退 Whisper。
+        避免再次回退 Whisper。同时使用不存在的嵌套输出目录，覆盖 API 或
+        CLI 直接调用服务时没有提前创建任务目录的边界情况。
         """
 
         class _InlineData:
@@ -372,11 +429,11 @@ class TestVoiceService(unittest.TestCase):
             def __init__(self, data):
                 self.candidates = [_Candidate(data)]
 
-        class _FakeModel:
-            def __init__(self, name):
-                self.name = name
+        captured = {}
 
-            def generate_content(self, contents, generation_config):
+        class _FakeModels:
+            def generate_content(self, **kwargs):
+                captured.update(kwargs)
                 tone = (
                     AudioSegment.silent(duration=1800)
                     .set_frame_rate(24000)
@@ -385,13 +442,31 @@ class TestVoiceService(unittest.TestCase):
                 )
                 return _Response(tone.raw_data)
 
-        voice_file = f"{temp_dir}/tts-gemini-Zephyr.mp3"
-        subtitle_file = f"{temp_dir}/tts-gemini-Zephyr.srt"
+        class _FakeClient:
+            def __init__(self, **kwargs):
+                captured["client_kwargs"] = kwargs
+                self.models = _FakeModels()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc_value, traceback):
+                captured["closed"] = True
+
+        temp_root = Path(tempfile.mkdtemp(prefix="gemini-tts-output-"))
+        self.addCleanup(shutil.rmtree, temp_root, True)
+        output_dir = temp_root / "nested" / "audio"
+        voice_file = str(output_dir / "tts-gemini-Zephyr.mp3")
+        subtitle_file = str(output_dir / "tts-gemini-Zephyr.srt")
         text = "Gemini subtitle generation should work now. Testing multiple lines."
 
-        with patch("google.generativeai.configure"), patch(
-            "google.generativeai.GenerativeModel", _FakeModel
-        ), patch.object(vs.config, "app", dict(vs.config.app, gemini_api_key="test-key")):
+        self.assertFalse(output_dir.exists())
+
+        with patch("google.genai.Client", _FakeClient), patch.object(
+            vs.config,
+            "app",
+            dict(vs.config.app, gemini_api_key="test-key"),
+        ):
             sub_maker = vs.gemini_tts(
                 text=text,
                 voice_name="Zephyr",
@@ -400,6 +475,7 @@ class TestVoiceService(unittest.TestCase):
             )
 
         self.assertIsNotNone(sub_maker)
+        self.assertTrue(Path(voice_file).is_file())
         self.assertEqual(
             getattr(sub_maker, "subs", []),
             ["Gemini subtitle generation should work now", "Testing multiple lines"],
@@ -407,6 +483,16 @@ class TestVoiceService(unittest.TestCase):
         self.assertEqual(len(getattr(sub_maker, "offset", [])), 2)
         self.assertEqual(sub_maker.offset[0][0], 0)
         self.assertLess(sub_maker.offset[0][1], sub_maker.offset[1][1])
+        self.assertEqual(captured["client_kwargs"], {"api_key": "test-key"})
+        self.assertEqual(captured["model"], "gemini-2.5-flash-preview-tts")
+        self.assertEqual(captured["contents"], text)
+        self.assertEqual(captured["config"].response_modalities, ["AUDIO"])
+        voice_config = captured["config"].speech_config.voice_config
+        self.assertEqual(
+            voice_config.prebuilt_voice_config.voice_name,
+            "Zephyr",
+        )
+        self.assertTrue(captured["closed"])
 
         vs.create_subtitle(sub_maker=sub_maker, text=text, subtitle_file=subtitle_file)
         subtitle_content = Path(subtitle_file).read_text(encoding="utf-8")
@@ -662,47 +748,6 @@ class TestVoiceService(unittest.TestCase):
             self.assertIn("Gemini subtitle generation should work now", subtitle_content)
             self.assertIn("Testing multiple lines", subtitle_content)
 
-    def test_generate_subtitle_uses_whisper_when_sub_maker_missing(self):
-        script = "Custom audio should still get subtitles."
-
-        def fake_whisper_create(audio_file, subtitle_file):
-            Path(subtitle_file).write_text(
-                "1\n00:00:00,000 --> 00:00:01,000\nCustom audio subtitles\n",
-                encoding="utf-8",
-            )
-
-        with tempfile.TemporaryDirectory() as tmp_dir, patch.object(
-            task_service.config,
-            "app",
-            dict(task_service.config.app, subtitle_provider="whisper"),
-        ), patch.object(
-            task_service.subtitle, "create", side_effect=fake_whisper_create
-        ) as whisper_create, patch.object(
-            task_service.subtitle, "correct"
-        ) as correct, patch(
-            "app.utils.utils.task_dir",
-            lambda tid="": str(Path(tmp_dir) / tid) if tid else str(Path(tmp_dir)),
-        ):
-            task_id = "custom-audio-whisper-subtitle-task"
-            Path(tmp_dir, task_id).mkdir(parents=True, exist_ok=True)
-            subtitle_path = task_service.generate_subtitle(
-                task_id=task_id,
-                params=SimpleNamespace(subtitle_enabled=True),
-                video_script=script,
-                sub_maker=None,
-                audio_file="custom-audio.mp3",
-            )
-
-        self.assertTrue(subtitle_path.endswith("subtitle.srt"))
-        whisper_create.assert_called_once_with(
-            audio_file="custom-audio.mp3",
-            subtitle_file=subtitle_path,
-        )
-        correct.assert_called_once_with(
-            subtitle_file=subtitle_path,
-            video_script=script,
-        )
-
     def test_script_split_keeps_thousand_separator_comma(self):
         """
         Edge TTS 会把 "1,000 years" 作为连续文本返回。脚本断句时不能把
@@ -818,130 +863,6 @@ class TestVoiceService(unittest.TestCase):
         self.assertIn("أهلاً وسهلاً بك في المدرسة", sub_items[0])
         self.assertIn("شكراً لك", sub_items[-1])
 
-    def test_create_karaoke_subtitle_uses_edge_cue_timing(self):
-        sub_maker = SimpleNamespace(
-            cues=[
-                SimpleNamespace(
-                    content="Hello",
-                    start=timedelta(seconds=0),
-                    end=timedelta(seconds=0.4),
-                ),
-                SimpleNamespace(
-                    content="world",
-                    start=timedelta(seconds=0.4),
-                    end=timedelta(seconds=0.9),
-                ),
-            ]
-        )
-
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            subtitle_file = Path(tmp_dir) / "karaoke.srt"
-            created = vs.create_karaoke_subtitle(
-                sub_maker=sub_maker,
-                text="Hello world.",
-                subtitle_file=str(subtitle_file),
-            )
-            subtitle_content = subtitle_file.read_text(encoding="utf-8")
-
-        self.assertTrue(created)
-        self.assertIn("00:00:00,000 --> 00:00:00,400", subtitle_content)
-        self.assertIn("00:00:00,400 --> 00:00:00,900", subtitle_content)
-        self.assertIn("\nHello\n", subtitle_content)
-        self.assertIn("\nworld\n", subtitle_content)
-
-    def test_create_karaoke_ass_subtitle_uses_edge_cue_timing(self):
-        sub_maker = SimpleNamespace(
-            cues=[
-                SimpleNamespace(
-                    content="Hello",
-                    start=timedelta(seconds=0),
-                    end=timedelta(seconds=0.4),
-                ),
-                SimpleNamespace(
-                    content="world",
-                    start=timedelta(seconds=0.4),
-                    end=timedelta(seconds=0.9),
-                ),
-                SimpleNamespace(
-                    content="{now}",
-                    start=timedelta(seconds=0.9),
-                    end=timedelta(seconds=1.2),
-                ),
-            ]
-        )
-
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            subtitle_file = Path(tmp_dir) / "karaoke.ass"
-            created = vs.create_karaoke_ass_subtitle(
-                sub_maker=sub_maker,
-                subtitle_file=str(subtitle_file),
-            )
-            subtitle_content = subtitle_file.read_text(encoding="utf-8")
-
-        self.assertTrue(created)
-        self.assertIn("[Script Info]", subtitle_content)
-        self.assertIn("[Events]", subtitle_content)
-        self.assertIn("Dialogue: 0,0:00:00.00,0:00:01.20,Karaoke", subtitle_content)
-        self.assertIn(r"{\kf40}Hello {\kf50}world {\kf30}(now)", subtitle_content)
-        self.assertNotIn("{now}", subtitle_content)
-
-    def test_create_karaoke_ass_subtitle_returns_false_without_edge_cues(self):
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            subtitle_file = Path(tmp_dir) / "karaoke.ass"
-            created = vs.create_karaoke_ass_subtitle(
-                sub_maker=SimpleNamespace(),
-                subtitle_file=str(subtitle_file),
-            )
-
-            self.assertFalse(created)
-            self.assertFalse(subtitle_file.exists())
-
-    def test_generate_subtitle_uses_karaoke_when_requested(self):
-        sub_maker = SimpleNamespace(
-            cues=[
-                SimpleNamespace(
-                    content="Hello",
-                    start=timedelta(seconds=0),
-                    end=timedelta(seconds=0.4),
-                ),
-                SimpleNamespace(
-                    content="world",
-                    start=timedelta(seconds=0.4),
-                    end=timedelta(seconds=0.9),
-                ),
-            ]
-        )
-
-        with tempfile.TemporaryDirectory() as tmp_dir, patch.object(
-            task_service.config,
-            "app",
-            dict(task_service.config.app, subtitle_provider="edge"),
-        ), patch.object(
-            task_service.subtitle, "create"
-        ) as whisper_create, patch(
-            "app.utils.utils.task_dir",
-            lambda tid="": str(Path(tmp_dir) / tid) if tid else str(Path(tmp_dir)),
-        ):
-            task_id = "karaoke-subtitle-edge-task"
-            Path(tmp_dir, task_id).mkdir(parents=True, exist_ok=True)
-            subtitle_path = task_service.generate_subtitle(
-                task_id=task_id,
-                params=SimpleNamespace(subtitle_enabled=True, subtitle_style="karaoke"),
-                video_script="Hello world.",
-                sub_maker=sub_maker,
-                audio_file="",
-            )
-            subtitle_content = Path(subtitle_path).read_text(encoding="utf-8")
-            srt_content = Path(subtitle_path).with_suffix(".srt").read_text(
-                encoding="utf-8"
-            )
-
-        self.assertTrue(subtitle_path.endswith("subtitle.ass"))
-        self.assertFalse(whisper_create.called)
-        self.assertIn(r"{\kf40}Hello {\kf50}world", subtitle_content)
-        self.assertIn("\nHello\n", srt_content)
-        self.assertIn("\nworld\n", srt_content)
-
     def test_create_subtitle_ignores_markdown_separator_lines(self):
         """
         用户手动脚本可能包含 `---` 这类 Markdown 分隔符。TTS 不会朗读
@@ -1027,6 +948,902 @@ class TestVoiceService(unittest.TestCase):
         self.assertEqual(vs.convert_rate_to_percent(None), "+0%")
         self.assertEqual(vs.convert_rate_to_percent(""), "+0%")
 
+    def test_tts_uses_an_opt_in_fallback_voice_after_primary_failure(self):
+        sentinel = object()
+        primary_voice = "tr-TR-AhmetNeural-Male"
+        fallback_voice = "tr-TR-EmelNeural-Female"
+
+        with patch.object(
+            vs.config,
+            "app",
+            dict(vs.config.app, tts_fallback_voice_names=[fallback_voice]),
+        ), patch.object(
+            vs,
+            "azure_tts_v1",
+            side_effect=[None, sentinel],
+        ) as azure_tts_v1:
+            result = vs.tts(
+                text="Fallback narration",
+                voice_name=primary_voice,
+                voice_rate=1.0,
+                voice_file="/tmp/fallback-narration.mp3",
+            )
+
+        self.assertIs(result, sentinel)
+        self.assertEqual(
+            [call.args[1] for call in azure_tts_v1.call_args_list],
+            [primary_voice, fallback_voice],
+        )
+    def test_no_voice_never_uses_a_configured_tts_fallback(self):
+        with patch.object(
+            vs.config,
+            "app",
+            dict(
+                vs.config.app,
+                tts_fallback_voice_names=["tr-TR-EmelNeural-Female"],
+            ),
+        ), patch(
+            "app.services.voice.dispatch.generate_silent_audio",
+            return_value=False,
+        ), patch.object(vs, "azure_tts_v1") as azure_tts_v1:
+            result = vs.tts(
+                text="No narration requested",
+                voice_name=vs.NO_VOICE_NAME,
+                voice_rate=1.0,
+                voice_file="/tmp/no-voice.mp3",
+            )
+
+        self.assertIsNone(result)
+        azure_tts_v1.assert_not_called()
+    def test_gemini_tts_uses_legacy_submaker_fields(self):
+        """
+        验证 Gemini TTS 在 edge_tts 7.x 环境下仍会返回项目兼容的字幕结构，
+        并且可以被 `subtitle_provider=edge` 的字幕生成链路直接消费，
+        避免再次回退 Whisper。
+        """
+
+        class _InlineData:
+            def __init__(self, data):
+                self.data = data
+
+        class _Part:
+            def __init__(self, data):
+                self.inline_data = _InlineData(data)
+
+        class _Content:
+            def __init__(self, data):
+                self.parts = [_Part(data)]
+
+        class _Candidate:
+            def __init__(self, data):
+                self.content = _Content(data)
+
+        class _Response:
+            def __init__(self, data):
+                self.candidates = [_Candidate(data)]
+
+        captured = {}
+
+        class _FakeModels:
+            def generate_content(self, *, model, contents, config):
+                captured["api_model"] = model
+                captured["contents"] = contents
+                captured["config"] = config
+                tone = (
+                    AudioSegment.silent(duration=1800)
+                    .set_frame_rate(24000)
+                    .set_channels(1)
+                    .set_sample_width(2)
+                )
+                return _Response(tone.raw_data)
+
+        class _FakeClient:
+            def __init__(self, *, api_key):
+                captured["api_key"] = api_key
+                self.models = _FakeModels()
+
+        voice_file = f"{temp_dir}/tts-gemini-Zephyr.mp3"
+        subtitle_file = f"{temp_dir}/tts-gemini-Zephyr.srt"
+        text = "Gemini subtitle generation should work now. Testing multiple lines."
+
+        with patch("google.genai.Client", _FakeClient), patch.object(
+            vs.config, "app", dict(vs.config.app, gemini_api_key="test-key")
+        ):
+            sub_maker = vs.gemini_tts(
+                text=text,
+                voice_name="Zephyr",
+                voice_rate=1.0,
+                voice_file=voice_file,
+            )
+
+        self.assertIsNotNone(sub_maker)
+        self.assertEqual(captured["api_key"], "test-key")
+        self.assertEqual(captured["api_model"], "gemini-2.5-flash-preview-tts")
+        self.assertEqual(captured["contents"], text)
+        self.assertEqual(
+            getattr(sub_maker, "subs", []),
+            ["Gemini subtitle generation should work now", "Testing multiple lines"],
+        )
+        self.assertEqual(len(getattr(sub_maker, "offset", [])), 2)
+        self.assertEqual(sub_maker.offset[0][0], 0)
+        self.assertLess(sub_maker.offset[0][1], sub_maker.offset[1][1])
+
+        vs.create_subtitle(sub_maker=sub_maker, text=text, subtitle_file=subtitle_file)
+        subtitle_content = Path(subtitle_file).read_text(encoding="utf-8")
+        self.assertIn("Gemini subtitle generation should work now", subtitle_content)
+        self.assertIn("Testing multiple lines", subtitle_content)
+    def test_generate_subtitle_uses_whisper_when_sub_maker_missing(self):
+        script = "Custom audio should still get subtitles."
+
+        def fake_whisper_create(audio_file, subtitle_file):
+            Path(subtitle_file).write_text(
+                "1\n00:00:00,000 --> 00:00:01,000\nCustom audio subtitles\n",
+                encoding="utf-8",
+            )
+
+        with tempfile.TemporaryDirectory() as tmp_dir, patch.object(
+            task_service.config,
+            "app",
+            dict(task_service.config.app, subtitle_provider="whisper"),
+        ), patch.object(
+            task_service.subtitle, "create", side_effect=fake_whisper_create
+        ) as whisper_create, patch.object(
+            task_service.subtitle, "correct"
+        ) as correct, patch(
+            "app.utils.utils.task_dir",
+            lambda tid="": str(Path(tmp_dir) / tid) if tid else str(Path(tmp_dir)),
+        ):
+            task_id = "custom-audio-whisper-subtitle-task"
+            Path(tmp_dir, task_id).mkdir(parents=True, exist_ok=True)
+            subtitle_path = task_service.generate_subtitle(
+                task_id=task_id,
+                params=SimpleNamespace(subtitle_enabled=True),
+                video_script=script,
+                sub_maker=None,
+                audio_file="custom-audio.mp3",
+            )
+
+        self.assertTrue(subtitle_path.endswith("subtitle.srt"))
+        whisper_create.assert_called_once_with(
+            audio_file="custom-audio.mp3",
+            subtitle_file=subtitle_path,
+        )
+        correct.assert_called_once_with(
+            subtitle_file=subtitle_path,
+            video_script=script,
+        )
+    def test_create_karaoke_subtitle_uses_edge_cue_timing(self):
+        sub_maker = SimpleNamespace(
+            cues=[
+                SimpleNamespace(
+                    content="Hello",
+                    start=timedelta(seconds=0),
+                    end=timedelta(seconds=0.4),
+                ),
+                SimpleNamespace(
+                    content="world",
+                    start=timedelta(seconds=0.4),
+                    end=timedelta(seconds=0.9),
+                ),
+            ]
+        )
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            subtitle_file = Path(tmp_dir) / "karaoke.srt"
+            created = vs.create_karaoke_subtitle(
+                sub_maker=sub_maker,
+                text="Hello world.",
+                subtitle_file=str(subtitle_file),
+            )
+            subtitle_content = subtitle_file.read_text(encoding="utf-8")
+
+        self.assertTrue(created)
+        self.assertIn("00:00:00,000 --> 00:00:00,400", subtitle_content)
+        self.assertIn("00:00:00,400 --> 00:00:00,900", subtitle_content)
+        self.assertIn("\nHello\n", subtitle_content)
+        self.assertIn("\nworld.\n", subtitle_content)
+    def test_create_karaoke_ass_subtitle_uses_edge_cue_timing(self):
+        sub_maker = SimpleNamespace(
+            cues=[
+                SimpleNamespace(
+                    content="Hello",
+                    start=timedelta(seconds=0),
+                    end=timedelta(seconds=0.4),
+                ),
+                SimpleNamespace(
+                    content="world",
+                    start=timedelta(seconds=0.4),
+                    end=timedelta(seconds=0.9),
+                ),
+                SimpleNamespace(
+                    content="{now}",
+                    start=timedelta(seconds=0.9),
+                    end=timedelta(seconds=1.2),
+                ),
+            ]
+        )
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            subtitle_file = Path(tmp_dir) / "karaoke.ass"
+            created = vs.create_karaoke_ass_subtitle(
+                sub_maker=sub_maker,
+                subtitle_file=str(subtitle_file),
+            )
+            subtitle_content = subtitle_file.read_text(encoding="utf-8")
+
+        self.assertTrue(created)
+        self.assertIn("[Script Info]", subtitle_content)
+        self.assertIn("[Events]", subtitle_content)
+        self.assertIn("PlayResX: 1080", subtitle_content)
+        self.assertIn("PlayResY: 1920", subtitle_content)
+        self.assertIn("WrapStyle: 0", subtitle_content)
+        self.assertIn("Dialogue: 0,0:00:00.00,0:00:01.20,Karaoke", subtitle_content)
+        self.assertIn(r"{\kf40}Hello {\kf50}world {\kf30}(now)", subtitle_content)
+        self.assertNotIn("{now}", subtitle_content)
+    def test_create_karaoke_ass_subtitle_keeps_long_edge_captions_compact(self):
+        words = [
+            "internationalization",
+            "characteristically",
+            "misinterpretation",
+            "unpredictability",
+            "interdisciplinary",
+            "responsibilities",
+            "counterproductive",
+            "incomprehensible",
+        ]
+        sub_maker = SimpleNamespace(
+            cues=[
+                SimpleNamespace(
+                    content=word,
+                    start=timedelta(seconds=index * 0.5),
+                    end=timedelta(seconds=(index + 1) * 0.5),
+                )
+                for index, word in enumerate(words)
+            ]
+        )
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            subtitle_file = Path(tmp_dir) / "karaoke.ass"
+            created = vs.create_karaoke_ass_subtitle(
+                sub_maker=sub_maker,
+                subtitle_file=str(subtitle_file),
+            )
+            subtitle_content = subtitle_file.read_text(encoding="utf-8")
+
+        dialogue_lines = [
+            line
+            for line in subtitle_content.splitlines()
+            if line.startswith("Dialogue:")
+        ]
+        self.assertTrue(created)
+        self.assertGreater(len(dialogue_lines), 1)
+    def test_create_karaoke_ass_subtitle_returns_false_without_edge_cues(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            subtitle_file = Path(tmp_dir) / "karaoke.ass"
+            created = vs.create_karaoke_ass_subtitle(
+                sub_maker=SimpleNamespace(),
+                subtitle_file=str(subtitle_file),
+            )
+
+            self.assertFalse(created)
+            self.assertFalse(subtitle_file.exists())
+
+    def test_create_karaoke_ass_subtitle_uses_srt_timings_without_edge_cues(self):
+        subtitle_items = [
+            (
+                1,
+                "00:00:00,000 --> 00:00:02,000",
+                "Merhaba dünya",
+            )
+        ]
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            subtitle_file = Path(tmp_dir) / "karaoke.ass"
+            created = vs.create_karaoke_ass_subtitle(
+                sub_maker=SimpleNamespace(),
+                subtitle_file=str(subtitle_file),
+                subtitle_items=subtitle_items,
+                video_aspect="9:16",
+            )
+            subtitle_content = subtitle_file.read_text(encoding="utf-8")
+
+        self.assertTrue(created)
+        self.assertIn("Style: Karaoke,Arial,56", subtitle_content)
+        self.assertIn(r"{\kf", subtitle_content)
+        self.assertIn("Merhaba", subtitle_content)
+        self.assertIn("dünya", subtitle_content)
+    def test_create_karaoke_ass_subtitle_uses_matching_srt_text_overrides(self):
+        sub_maker = SimpleNamespace(
+            cues=[
+                SimpleNamespace(
+                    content="Hello",
+                    start=timedelta(seconds=0),
+                    end=timedelta(seconds=0.4),
+                ),
+                SimpleNamespace(
+                    content="world",
+                    start=timedelta(seconds=0.4),
+                    end=timedelta(seconds=0.9),
+                ),
+            ]
+        )
+        subtitle_items = [
+            (1, "00:00:00,000 --> 00:00:00,400", "Greetings"),
+            (2, "00:00:00,400 --> 00:00:00,900", "Earth!"),
+        ]
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            subtitle_file = Path(tmp_dir) / "karaoke.ass"
+            created = vs.create_karaoke_ass_subtitle(
+                sub_maker=sub_maker,
+                subtitle_file=str(subtitle_file),
+                subtitle_items=subtitle_items,
+            )
+            subtitle_content = subtitle_file.read_text(encoding="utf-8")
+
+        self.assertTrue(created)
+        self.assertIn(r"{\kf40}Greetings {\kf50}Earth!", subtitle_content)
+        self.assertNotIn("Hello", subtitle_content)
+    def test_create_karaoke_ass_from_word_timings_preserves_corrected_text(self):
+        subtitle_items = [
+            (
+                1,
+                "00:00:00,000 --> 00:00:01,000",
+                "Merhaba dünya.",
+            )
+        ]
+        word_timings = [
+            {"text": "Meraba", "start_time": 0.0, "end_time": 0.4},
+            {"text": "dunya", "start_time": 0.4, "end_time": 1.0},
+        ]
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            subtitle_file = Path(tmp_dir) / "karaoke.ass"
+            created = vs.create_karaoke_ass_from_word_timings(
+                subtitle_items=subtitle_items,
+                word_timings=word_timings,
+                subtitle_file=str(subtitle_file),
+            )
+            subtitle_content = subtitle_file.read_text(encoding="utf-8")
+
+        self.assertTrue(created)
+        self.assertIn(
+            r"{\kf40}Merhaba {\kf60}dünya.",
+            subtitle_content,
+        )
+    def test_inspect_subtitle_readability_reports_fast_and_crowded_items(self):
+        subtitle_items = [
+            (1, "00:00:00,000 --> 00:00:02,000", "Short readable line."),
+            (
+                2,
+                "00:00:02,000 --> 00:00:03,000",
+                "This subtitle line is deliberately much too long to read comfortably.\n"
+                "It also has a second overly long line.\n"
+                "And a third line.",
+            ),
+        ]
+
+        report = vs.inspect_subtitle_readability(
+            subtitle_items,
+            max_characters_per_second=17.0,
+            max_lines=2,
+            max_characters_per_line=42,
+        )
+
+        self.assertFalse(report["ok"])
+        self.assertEqual(report["checked_count"], 2)
+        self.assertEqual(report["skipped_count"], 0)
+        self.assertEqual(report["high_reading_speed_count"], 1)
+        self.assertEqual(report["too_many_lines_count"], 1)
+        self.assertEqual(report["overlong_line_count"], 1)
+        self.assertEqual(report["items"][0]["issues"], [])
+        self.assertIn("reading_speed", report["items"][1]["issues"])
+        self.assertIn("line_count", report["items"][1]["issues"])
+        self.assertIn("line_length", report["items"][1]["issues"])
+    def test_inspect_subtitle_readability_skips_malformed_items_without_mutation(self):
+        subtitle_items = [
+            (1, "invalid timing", "Ignored"),
+            (2, "00:00:00,000 --> 00:00:01,000", "Readable"),
+        ]
+        original_items = list(subtitle_items)
+
+        report = vs.inspect_subtitle_readability(subtitle_items)
+
+        self.assertTrue(report["ok"])
+        self.assertEqual(report["checked_count"], 1)
+        self.assertEqual(report["skipped_count"], 1)
+        self.assertEqual(report["items"][0]["subtitle_id"], 2)
+        self.assertEqual(subtitle_items, original_items)
+    def test_reflow_subtitle_items_splits_long_cues_without_changing_words_or_timing(self):
+        subtitle_items = [
+            (
+                1,
+                "00:00:00,000 --> 00:00:08,000",
+                "This deliberately long subtitle keeps every word short while it "
+                "requires several compact visual caption events for a portrait video.",
+            )
+        ]
+        original_items = list(subtitle_items)
+
+        reflowed_items = vs.reflow_subtitle_items(
+            subtitle_items,
+            max_lines=2,
+            max_characters_per_line=20,
+        )
+
+        self.assertEqual(subtitle_items, original_items)
+        self.assertGreater(len(reflowed_items), 1)
+        self.assertEqual(
+            " ".join(item[2] for item in reflowed_items).split(),
+            subtitle_items[0][2].split(),
+        )
+
+        time_ranges = [
+            voice_subtitles._subtitle_item_time_range(item[1])
+            for item in reflowed_items
+        ]
+        self.assertEqual(time_ranges[0][0], 0.0)
+        self.assertEqual(time_ranges[-1][1], 8.0)
+        self.assertTrue(
+            all(
+                previous_range[1] == next_range[0]
+                for previous_range, next_range in zip(time_ranges, time_ranges[1:])
+            )
+        )
+
+        report = vs.inspect_subtitle_readability(
+            reflowed_items,
+            max_lines=2,
+            max_characters_per_line=20,
+        )
+        self.assertEqual(report["too_many_lines_count"], 0)
+        self.assertEqual(report["overlong_line_count"], 0)
+    def test_reflow_subtitle_items_uses_whisper_word_boundaries_when_available(self):
+        subtitle_items = [
+            (
+                1,
+                "00:00:00,000 --> 00:00:08,000",
+                "bir iki üç dört beş altı yedi sekiz",
+            )
+        ]
+        word_timings = [
+            {"text": text, "start_time": index, "end_time": index + 1}
+            for index, text in enumerate(
+                "bir iki üç dört beş altı yedi sekiz".split()
+            )
+        ]
+
+        reflowed_items = vs.reflow_subtitle_items(
+            subtitle_items,
+            max_lines=1,
+            max_characters_per_line=8,
+            word_timings=word_timings,
+        )
+
+        self.assertEqual(
+            [item[1] for item in reflowed_items],
+            [
+                "00:00:00,000 --> 00:00:02,000",
+                "00:00:02,000 --> 00:00:04,000",
+                "00:00:04,000 --> 00:00:06,000",
+                "00:00:06,000 --> 00:00:07,000",
+                "00:00:07,000 --> 00:00:08,000",
+            ],
+        )
+    def test_reflow_subtitle_items_keeps_all_items_when_one_item_is_malformed(self):
+        subtitle_items = [
+            (
+                1,
+                "00:00:00,000 --> 00:00:08,000",
+                "This deliberately long subtitle would otherwise be reflowed.",
+            ),
+            ("malformed",),
+        ]
+
+        reflowed_items = vs.reflow_subtitle_items(subtitle_items)
+
+        self.assertEqual(reflowed_items, subtitle_items)
+    def test_generate_subtitle_uses_reflowed_render_file_without_changing_source_srt(self):
+        long_caption = (
+            "This deliberately long subtitle keeps every word short while it "
+            "requires several compact visual caption events for a portrait video."
+        )
+
+        def write_source_subtitle(*, subtitle_file, **_):
+            Path(subtitle_file).write_text(
+                "1\n00:00:00,000 --> 00:00:08,000\n"
+                f"{long_caption}\n\n",
+                encoding="utf-8",
+            )
+
+        with tempfile.TemporaryDirectory() as tmp_dir, patch.object(
+            task_service.config,
+            "app",
+            dict(task_service.config.app, subtitle_provider="edge"),
+        ), patch.object(
+            task_service.voice,
+            "create_subtitle",
+            side_effect=write_source_subtitle,
+        ), patch(
+            "app.utils.utils.task_dir",
+            lambda tid="": str(Path(tmp_dir) / tid) if tid else str(Path(tmp_dir)),
+        ):
+            task_id = "reflowed-subtitle-task"
+            task_directory = Path(tmp_dir, task_id)
+            task_directory.mkdir(parents=True, exist_ok=True)
+            subtitle_path = task_service.generate_subtitle(
+                task_id=task_id,
+                params=SimpleNamespace(
+                    subtitle_enabled=True,
+                    subtitle_style="classic",
+                ),
+                video_script=long_caption,
+                sub_maker=SimpleNamespace(),
+                audio_file="",
+            )
+            source_content = (task_directory / "subtitle.srt").read_text(
+                encoding="utf-8"
+            )
+            rendered_items = task_service.subtitle.file_to_subtitles(subtitle_path)
+
+        self.assertEqual(Path(subtitle_path).name, "subtitle.render.srt")
+        self.assertIn(long_caption, source_content)
+        self.assertGreater(len(rendered_items), 1)
+        report = vs.inspect_subtitle_readability(rendered_items)
+        self.assertEqual(report["too_many_lines_count"], 0)
+        self.assertEqual(report["overlong_line_count"], 0)
+    def test_generate_subtitle_builds_karaoke_ass_from_reflowed_whisper_cues(self):
+        words = (
+            "one two three four five six seven eight nine ten eleven twelve "
+            "thirteen fourteen fifteen sixteen seventeen eighteen nineteen twenty"
+        ).split()
+        long_caption = " ".join(words)
+        word_timings = [
+            {
+                "text": word,
+                "start_time": index * 0.5,
+                "end_time": (index + 1) * 0.5,
+            }
+            for index, word in enumerate(words)
+        ]
+
+        def write_whisper_subtitle(*, subtitle_file, **_):
+            Path(subtitle_file).write_text(
+                "1\n00:00:00,000 --> 00:00:10,000\n"
+                f"{long_caption}\n\n",
+                encoding="utf-8",
+            )
+
+        with tempfile.TemporaryDirectory() as tmp_dir, patch.object(
+            task_service.config,
+            "app",
+            dict(task_service.config.app, subtitle_provider="whisper"),
+        ), patch.object(
+            task_service.subtitle,
+            "create",
+            side_effect=write_whisper_subtitle,
+        ), patch.object(
+            task_service.subtitle,
+            "correct",
+        ), patch.object(
+            task_service.subtitle,
+            "read_word_timings",
+            return_value=word_timings,
+        ), patch(
+            "app.utils.utils.task_dir",
+            lambda tid="": str(Path(tmp_dir) / tid) if tid else str(Path(tmp_dir)),
+        ):
+            task_id = "reflowed-karaoke-whisper-task"
+            task_directory = Path(tmp_dir, task_id)
+            task_directory.mkdir(parents=True, exist_ok=True)
+            subtitle_path = task_service.generate_subtitle(
+                task_id=task_id,
+                params=SimpleNamespace(
+                    subtitle_enabled=True,
+                    subtitle_style="karaoke",
+                    video_aspect="9:16",
+                ),
+                video_script=long_caption,
+                sub_maker=None,
+                audio_file="narration.mp3",
+            )
+            rendered_items = task_service.subtitle.file_to_subtitles(
+                str(task_directory / "subtitle.render.srt")
+            )
+            ass_content = Path(subtitle_path).read_text(encoding="utf-8")
+
+        dialogue_lines = [
+            line for line in ass_content.splitlines() if line.startswith("Dialogue:")
+        ]
+        self.assertEqual(Path(subtitle_path).name, "subtitle.ass")
+        self.assertGreater(len(rendered_items), 1)
+        self.assertEqual(len(dialogue_lines), len(rendered_items))
+        self.assertIn(r"{\kf", ass_content)
+
+    def test_generate_subtitle_builds_karaoke_ass_from_reflowed_subtitle_cues_without_word_timings(self):
+        long_caption = (
+            "Sepetinde uc yuz seksen liralik urun var kargo kirk bes lira "
+            "ucretsiz kargo siniri bes yuz"
+        )
+
+        def write_whisper_subtitle(*, subtitle_file, **_):
+            Path(subtitle_file).write_text(
+                "1\n00:00:00,000 --> 00:00:08,000\n"
+                f"{long_caption}\n\n",
+                encoding="utf-8",
+            )
+
+        with tempfile.TemporaryDirectory() as tmp_dir, patch.object(
+            task_service.config,
+            "app",
+            dict(task_service.config.app, subtitle_provider="whisper"),
+        ), patch.object(
+            task_service.subtitle,
+            "create",
+            side_effect=write_whisper_subtitle,
+        ), patch.object(
+            task_service.subtitle,
+            "correct",
+        ), patch.object(
+            task_service.subtitle,
+            "read_word_timings",
+            return_value=[],
+        ), patch(
+            "app.utils.utils.task_dir",
+            lambda tid="": str(Path(tmp_dir) / tid) if tid else str(Path(tmp_dir)),
+        ):
+            task_id = "reflowed-karaoke-without-word-timings-task"
+            task_directory = Path(tmp_dir, task_id)
+            task_directory.mkdir(parents=True, exist_ok=True)
+            subtitle_path = task_service.generate_subtitle(
+                task_id=task_id,
+                params=SimpleNamespace(
+                    subtitle_enabled=True,
+                    subtitle_style="karaoke",
+                    video_aspect="9:16",
+                ),
+                video_script=long_caption,
+                sub_maker=None,
+                audio_file="narration.mp3",
+            )
+            rendered_items = task_service.subtitle.file_to_subtitles(
+                str(task_directory / "subtitle.render.srt")
+            )
+            ass_content = Path(subtitle_path).read_text(encoding="utf-8")
+
+        dialogue_lines = [
+            line for line in ass_content.splitlines() if line.startswith("Dialogue:")
+        ]
+        self.assertEqual(Path(subtitle_path).name, "subtitle.ass")
+        self.assertGreater(len(rendered_items), 1)
+        self.assertEqual(len(dialogue_lines), len(rendered_items))
+        self.assertIn(r"{\kf", ass_content)
+
+    def test_create_karaoke_ass_from_word_timings_returns_false_without_timings(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            subtitle_file = Path(tmp_dir) / "karaoke.ass"
+            created = vs.create_karaoke_ass_from_word_timings(
+                subtitle_items=[
+                    (1, "00:00:00,000 --> 00:00:01,000", "Hello world.")
+                ],
+                word_timings=[],
+                subtitle_file=str(subtitle_file),
+            )
+
+        self.assertFalse(created)
+        self.assertFalse(subtitle_file.exists())
+    def test_karaoke_subtitles_preserve_matching_script_spelling(self):
+        sub_maker = SimpleNamespace(
+            cues=[
+                SimpleNamespace(
+                    content="Enflasyon",
+                    start=timedelta(seconds=0),
+                    end=timedelta(seconds=0.4),
+                ),
+                SimpleNamespace(
+                    content="arttiginda",
+                    start=timedelta(seconds=0.4),
+                    end=timedelta(seconds=0.8),
+                ),
+                SimpleNamespace(
+                    content="butceyle",
+                    start=timedelta(seconds=0.8),
+                    end=timedelta(seconds=1.2),
+                ),
+                SimpleNamespace(
+                    content="urun",
+                    start=timedelta(seconds=1.2),
+                    end=timedelta(seconds=1.6),
+                ),
+            ]
+        )
+        script = "Enflasyon arttığında bütçeyle ürün."
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            srt_file = Path(tmp_dir) / "karaoke.srt"
+            ass_file = Path(tmp_dir) / "karaoke.ass"
+            srt_created = vs.create_karaoke_subtitle(
+                sub_maker=sub_maker,
+                text=script,
+                subtitle_file=str(srt_file),
+            )
+            ass_created = vs.create_karaoke_ass_subtitle(
+                sub_maker=sub_maker,
+                subtitle_file=str(ass_file),
+                text=script,
+            )
+            srt_content = srt_file.read_text(encoding="utf-8")
+            ass_content = ass_file.read_text(encoding="utf-8")
+
+        self.assertTrue(srt_created)
+        self.assertTrue(ass_created)
+        self.assertIn("arttığında", srt_content)
+        self.assertIn("bütçeyle", srt_content)
+        self.assertIn("ürün.", srt_content)
+        self.assertIn("arttığında", ass_content)
+        self.assertIn("bütçeyle", ass_content)
+        self.assertIn("ürün.", ass_content)
+    def test_karaoke_subtitles_keep_cue_text_when_script_does_not_match(self):
+        sub_maker = SimpleNamespace(
+            cues=[
+                SimpleNamespace(
+                    content="Hello",
+                    start=timedelta(seconds=0),
+                    end=timedelta(seconds=0.4),
+                ),
+                SimpleNamespace(
+                    content="Mars",
+                    start=timedelta(seconds=0.4),
+                    end=timedelta(seconds=0.8),
+                ),
+            ]
+        )
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            subtitle_file = Path(tmp_dir) / "karaoke.srt"
+            created = vs.create_karaoke_subtitle(
+                sub_maker=sub_maker,
+                text="Hello world.",
+                subtitle_file=str(subtitle_file),
+            )
+            subtitle_content = subtitle_file.read_text(encoding="utf-8")
+
+        self.assertTrue(created)
+        self.assertIn("\nMars\n", subtitle_content)
+    def test_generate_subtitle_uses_karaoke_when_requested(self):
+        sub_maker = SimpleNamespace(
+            cues=[
+                SimpleNamespace(
+                    content="Hello",
+                    start=timedelta(seconds=0),
+                    end=timedelta(seconds=0.4),
+                ),
+                SimpleNamespace(
+                    content="world",
+                    start=timedelta(seconds=0.4),
+                    end=timedelta(seconds=0.9),
+                ),
+            ]
+        )
+
+        with tempfile.TemporaryDirectory() as tmp_dir, patch.object(
+            task_service.config,
+            "app",
+            dict(task_service.config.app, subtitle_provider="edge"),
+        ), patch.object(
+            task_service.subtitle, "create"
+        ) as whisper_create, patch(
+            "app.utils.utils.task_dir",
+            lambda tid="": str(Path(tmp_dir) / tid) if tid else str(Path(tmp_dir)),
+        ):
+            task_id = "karaoke-subtitle-edge-task"
+            Path(tmp_dir, task_id).mkdir(parents=True, exist_ok=True)
+            subtitle_path = task_service.generate_subtitle(
+                task_id=task_id,
+                params=SimpleNamespace(
+                    subtitle_enabled=True,
+                    subtitle_style="karaoke",
+                    video_aspect="4:5",
+                ),
+                video_script="Hello world.",
+                sub_maker=sub_maker,
+                audio_file="",
+            )
+            subtitle_content = Path(subtitle_path).read_text(encoding="utf-8")
+            srt_content = Path(subtitle_path).with_suffix(".srt").read_text(
+                encoding="utf-8"
+            )
+
+        self.assertTrue(subtitle_path.endswith("subtitle.ass"))
+        self.assertFalse(whisper_create.called)
+        self.assertIn("PlayResX: 1080", subtitle_content)
+        self.assertIn("PlayResY: 1350", subtitle_content)
+        self.assertIn("WrapStyle: 0", subtitle_content)
+        self.assertIn(r"{\kf40}Hello {\kf50}world", subtitle_content)
+        self.assertIn("\nHello\n", srt_content)
+        self.assertIn("\nworld.\n", srt_content)
+    def test_karaoke_ass_header_uses_portrait_safe_margin_only(self):
+        portrait_header = voice_subtitles._build_ass_header(VideoAspect.portrait)
+        landscape_header = voice_subtitles._build_ass_header(VideoAspect.landscape)
+        four_five_header = voice_subtitles._build_ass_header(VideoAspect.portrait_4_5)
+
+        self.assertIn(",2,80,80,307,1", portrait_header)
+        self.assertIn(",2,80,80,80,1", landscape_header)
+        self.assertIn(",2,80,80,80,1", four_five_header)
+
+    def test_karaoke_ass_header_uses_custom_vertical_position(self):
+        header = voice_subtitles._build_ass_header(
+            VideoAspect.portrait,
+            style_options={
+                "subtitle_position": "custom",
+                "custom_position": 70.0,
+            },
+        )
+
+        self.assertIn(",2,80,80,576,1", header)
+    def test_create_karaoke_ass_variant_rebuilds_header_and_preserves_events(self):
+        source_content = (
+            "[Script Info]\n"
+            "ScriptType: v4.00+\n"
+            "PlayResX: 1080\n"
+            "PlayResY: 1920\n"
+            "\n"
+            "[V4+ Styles]\n"
+            "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, "
+            "OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, "
+            "ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, "
+            "Alignment, MarginL, MarginR, MarginV, Encoding\n"
+            "Style: Karaoke,Arial,56,&H00FFFFFF,&H0000D7FF,&H8A000000,"
+            "&H80000000,1,0,0,0,100,100,0,0,1,3,1,2,80,80,307,1\n"
+            "\n"
+            "[Events]\n"
+            "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, "
+            "Effect, Text\n"
+            "Dialogue: 0,0:00:00.00,0:00:01.00,Karaoke,,0,0,0,,"
+            "{\\kf50}Hello {\\kf50}world.\n"
+        )
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            source_file = Path(tmp_dir) / "subtitle.ass"
+            target_file = Path(tmp_dir) / "subtitle-4x5.ass"
+            source_file.write_text(source_content, encoding="utf-8")
+
+            created = vs.create_karaoke_ass_variant(
+                str(source_file),
+                str(target_file),
+                VideoAspect.portrait_4_5,
+            )
+            variant_content = target_file.read_text(encoding="utf-8")
+
+        self.assertTrue(created)
+        self.assertIn("PlayResX: 1080", variant_content)
+        self.assertIn("PlayResY: 1350", variant_content)
+        self.assertIn(",2,80,80,80,1", variant_content)
+        self.assertNotIn("PlayResY: 1920", variant_content)
+        self.assertIn(
+            "Dialogue: 0,0:00:00.00,0:00:01.00,Karaoke,,0,0,0,,"
+            "{\\kf50}Hello {\\kf50}world.",
+            variant_content,
+        )
+    def test_create_karaoke_ass_variant_rejects_empty_events(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            source_file = Path(tmp_dir) / "subtitle.ass"
+            target_file = Path(tmp_dir) / "subtitle-4x5.ass"
+            source_file.write_text(
+                "[Events]\nFormat: Layer, Start, End, Style\n\n",
+                encoding="utf-8",
+            )
+
+            created = vs.create_karaoke_ass_variant(
+                str(source_file),
+                str(target_file),
+                VideoAspect.portrait_4_5,
+            )
+            target_exists = target_file.exists()
+
+        self.assertFalse(created)
+        self.assertFalse(target_exists)
+
 
 class TestElevenLabsVoice(unittest.TestCase):
 
@@ -1051,21 +1868,107 @@ class TestElevenLabsVoice(unittest.TestCase):
 
     @patch("app.services.voice.requests.get")
     def test_get_elevenlabs_voices_success(self, mock_get):
-        mock_get.return_value.status_code = 200
-        mock_get.return_value.json.return_value = {
-            "voices": [
-                {"voice_id": "abc123", "name": "Adam"},
-                {"voice_id": "def456", "name": "Rachel"},
-            ]
-        }
+        subscription_response = SimpleNamespace(
+            status_code=200,
+            text="",
+            json=lambda: {"tier": "starter"},
+        )
+        voices_response = SimpleNamespace(
+            status_code=200,
+            text="",
+            json=lambda: {
+                "voices": [
+                    {"voice_id": "abc123", "name": "Adam"},
+                    {"voice_id": "def456", "name": "Rachel"},
+                ]
+            },
+        )
+        mock_get.side_effect = [subscription_response, voices_response]
+
         result = vs.get_elevenlabs_voices("fake-api-key")
-        self.assertEqual(result, [
-            "elevenlabs:abc123:Adam",
-            "elevenlabs:def456:Rachel",
-        ])
-        mock_get.assert_called_once()
-        call_kwargs = mock_get.call_args
-        self.assertIn("xi-api-key", call_kwargs.kwargs.get("headers", {}))
+        self.assertEqual(
+            result,
+            [
+                "elevenlabs:abc123:Adam",
+                "elevenlabs:def456:Rachel",
+            ],
+        )
+        self.assertEqual(mock_get.call_count, 2)
+        self.assertTrue(
+            all(
+                "xi-api-key" in call.kwargs.get("headers", {})
+                for call in mock_get.call_args_list
+            )
+        )
+
+    @patch("app.services.voice.requests.get")
+    def test_get_elevenlabs_voice_catalog_filters_library_voices_on_free_tier(
+        self,
+        mock_get,
+    ):
+        subscription_response = SimpleNamespace(
+            status_code=200,
+            text="",
+            json=lambda: {"tier": "free"},
+        )
+        voices_response = SimpleNamespace(
+            status_code=200,
+            text="",
+            json=lambda: {
+                "voices": [
+                    {
+                        "voice_id": "premade",
+                        "name": "Default",
+                        "category": "premade",
+                    },
+                    {
+                        "voice_id": "library",
+                        "name": "Library",
+                        "category": "professional",
+                        "sharing": {"free_users_allowed": True},
+                    },
+                ]
+            },
+        )
+        mock_get.side_effect = [subscription_response, voices_response]
+
+        catalog = vs.get_elevenlabs_voice_catalog("free-api-key")
+
+        self.assertEqual(catalog["tier"], "free")
+        self.assertEqual(catalog["filtered_count"], 1)
+        self.assertEqual(catalog["voices"], ["elevenlabs:premade:Default"])
+
+    @patch("app.services.voice.requests.get")
+    def test_get_elevenlabs_voice_catalog_keeps_library_voices_on_paid_tier(
+        self,
+        mock_get,
+    ):
+        subscription_response = SimpleNamespace(
+            status_code=200,
+            text="",
+            json=lambda: {"tier": "creator"},
+        )
+        voices_response = SimpleNamespace(
+            status_code=200,
+            text="",
+            json=lambda: {
+                "voices": [
+                    {
+                        "voice_id": "library",
+                        "name": "Library",
+                        "category": "professional",
+                        "sharing": {"free_users_allowed": False},
+                    }
+                ]
+            },
+        )
+        mock_get.side_effect = [subscription_response, voices_response]
+
+        catalog = vs.get_elevenlabs_voice_catalog("paid-api-key")
+
+        self.assertEqual(catalog["tier"], "creator")
+        self.assertEqual(catalog["filtered_count"], 0)
+        self.assertEqual(catalog["voices"], ["elevenlabs:library:Library"])
 
     @patch("app.services.voice.requests.get")
     def test_get_elevenlabs_voices_http_error(self, mock_get):
@@ -1088,7 +1991,6 @@ class TestElevenLabsVoice(unittest.TestCase):
         mock_config.elevenlabs.get.return_value = "fake-api-key"
         mock_post.return_value.status_code = 200
         mock_post.return_value.content = b"fake-mp3-bytes"
-        mock_clip = mock_clip_cls.return_value.__enter__.return_value
         mock_clip_cls.return_value.duration = 3.0
         mock_clip_cls.return_value.close = lambda: None
 
@@ -1120,4 +2022,4 @@ class TestElevenLabsVoice(unittest.TestCase):
 if __name__ == "__main__":
     # python -m unittest test.services.test_voice.TestVoiceService.test_azure_tts_v1
     # python -m unittest test.services.test_voice.TestVoiceService.test_azure_tts_v2
-    unittest.main() 
+    unittest.main()

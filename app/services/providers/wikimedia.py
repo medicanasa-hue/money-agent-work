@@ -12,7 +12,6 @@ Notlar:
 import html
 import re
 from typing import List
-from urllib.parse import quote
 
 import requests
 from loguru import logger
@@ -47,6 +46,53 @@ def _clean_extmetadata_value(value) -> str:
 def _build_attribution(title: str, artist: str, license_name: str) -> str:
     parts = [part for part in (title, artist, license_name) if part]
     return " - ".join(parts)
+
+
+def _positive_dimension(value) -> int:
+    try:
+        dimension = int(value)
+    except (TypeError, ValueError):
+        return 0
+    return dimension if dimension > 0 else 0
+
+
+def _select_mp4_derivative(derivatives, video_aspect: VideoAspect):
+    """Choose the closest native aspect before preferring more pixels."""
+    if not isinstance(derivatives, list):
+        return None
+
+    try:
+        target_width, target_height = VideoAspect(video_aspect).to_resolution()
+    except (TypeError, ValueError):
+        target_width, target_height = VideoAspect.portrait.to_resolution()
+    target_aspect = target_width / target_height
+
+    selected = None
+    selected_score = None
+    for index, derivative in enumerate(derivatives):
+        if not isinstance(derivative, dict) or derivative.get("type") != "video/mp4":
+            continue
+        source_url = derivative.get("src")
+        if not isinstance(source_url, str) or not source_url.strip():
+            continue
+
+        width = _positive_dimension(derivative.get("width"))
+        height = _positive_dimension(derivative.get("height"))
+        if width and height:
+            source_aspect = width / height
+            aspect_fit = min(source_aspect, target_aspect) / max(
+                source_aspect, target_aspect
+            )
+            pixels = width * height
+        else:
+            aspect_fit = 0.0
+            pixels = 0
+        score = (aspect_fit, pixels, -index)
+        if selected_score is None or score > selected_score:
+            selected = derivative
+            selected_score = score
+
+    return selected
 
 
 class WikimediaProvider(VideoProvider):
@@ -93,7 +139,16 @@ class WikimediaProvider(VideoProvider):
             return []
 
         # ── 2. Toplu videoinfo çek ────────────────────────────────────────
-        titles = "|".join(res["title"] for res in results[:10])
+        titles = "|".join(
+            title.strip()
+            for result in results[:10]
+            if isinstance(result, dict)
+            and isinstance((title := result.get("title")), str)
+            and title.strip()
+        )
+        if not titles:
+            logger.info("[wikimedia] search returned no usable video titles")
+            return []
         info_params = {
             **_COMMON_PARAMS,
             "action": "query",
@@ -118,14 +173,20 @@ class WikimediaProvider(VideoProvider):
             )
             return []
 
+        if not isinstance(pages, dict):
+            logger.error("[wikimedia] videoinfo returned unexpected response")
+            return []
+
         video_items: List[MaterialInfo] = []
         for page_id, page in pages.items():
-            if page_id == "-1":
+            if page_id == "-1" or not isinstance(page, dict):
                 continue
             vi_list = page.get("videoinfo", [])
-            if not vi_list:
+            if not isinstance(vi_list, (list, tuple)) or not vi_list:
                 continue
             vi = vi_list[0]
+            if not isinstance(vi, dict):
+                continue
 
             # Sadece VIDEO medya tipi
             if vi.get("mediatype", "") != "VIDEO":
@@ -141,10 +202,11 @@ class WikimediaProvider(VideoProvider):
 
             # MP4 derivative varsa onu al; yoksa doğrudan kaynağı kullan
             url: str | None = None
-            for d in vi.get("derivatives", []):
-                if d.get("type") == "video/mp4":
-                    url = d.get("src")
-                    break
+            selected_derivative = _select_mp4_derivative(
+                vi.get("derivatives"), video_aspect
+            )
+            if selected_derivative:
+                url = selected_derivative.get("src")
 
             if not url:
                 # Native MP4 veya WebM/OGV (ffmpeg her ikisini de okur)
@@ -160,6 +222,18 @@ class WikimediaProvider(VideoProvider):
             item.url = url
             item.duration = duration
             item.search_query = search_term
+            derivative_width = _positive_dimension(
+                selected_derivative.get("width") if selected_derivative else None
+            )
+            derivative_height = _positive_dimension(
+                selected_derivative.get("height") if selected_derivative else None
+            )
+            if derivative_width and derivative_height:
+                item.width = derivative_width
+                item.height = derivative_height
+            else:
+                item.width = _positive_dimension(vi.get("width"))
+                item.height = _positive_dimension(vi.get("height"))
             title = page.get("title")
             if isinstance(title, str):
                 item.title = title.strip()

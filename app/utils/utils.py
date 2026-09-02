@@ -1,12 +1,14 @@
 import json
 import locale
+import math
 import os
 import re
 import shutil
+import subprocess
 from functools import lru_cache
 from pathlib import Path
 import threading
-from typing import Any
+from typing import Any, Iterable
 from uuid import uuid4
 
 from loguru import logger
@@ -63,6 +65,26 @@ def get_uuid(remove_hyphen: bool = False):
     if remove_hyphen:
         u = u.replace("-", "")
     return u
+
+
+_CLIP_SPEED_MIN = 0.5
+_CLIP_SPEED_MAX = 2.0
+
+
+def normalize_clip_speed(value, default: float = 1.0) -> float:
+    """将片段播放速度归一化到 WebUI 支持的安全范围。"""
+    try:
+        speed = float(value)
+    except (TypeError, ValueError):
+        return default
+
+    # NaN 会绕过普通的大小比较，并在 MoviePy 计算 duration 时传播；无穷值也不
+    # 是合法用户输入。两者统一回退默认值，保证 API 和内部直接调用都不会生成
+    # 无效时间线。零值和负值同样无法表示正常播放速度。
+    if not math.isfinite(speed) or speed <= 0:
+        return default
+
+    return min(max(speed, _CLIP_SPEED_MIN), _CLIP_SPEED_MAX)
 
 
 def root_dir():
@@ -156,6 +178,43 @@ def get_ffmpeg_binary() -> str:
         logger.warning(f"failed to resolve bundled ffmpeg binary: {str(exc)}")
 
     return "ffmpeg"
+
+
+def check_ffmpeg_ready(timeout: int = 10) -> bool:
+    """Probe the configured renderer before starting costly generation work."""
+    hint = "Install FFmpeg or set app.ffmpeg_path in config.toml to a valid executable."
+    try:
+        completed = subprocess.run(
+            [get_ffmpeg_binary(), "-version"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=timeout,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        logger.warning("FFmpeg is unavailable ({}). {}", type(exc).__name__, hint)
+        return False
+    if completed.returncode != 0:
+        logger.warning("FFmpeg probe failed (exit {}). {}", completed.returncode, hint)
+        return False
+    return True
+
+
+def get_ffprobe_binary() -> str | None:
+    """Resolve FFprobe beside the configured FFmpeg before checking PATH."""
+    try:
+        ffmpeg_binary = str(get_ffmpeg_binary() or "").strip()
+    except Exception:
+        ffmpeg_binary = ""
+
+    if ffmpeg_binary:
+        probe_name = (
+            "ffprobe.exe" if ffmpeg_binary.lower().endswith(".exe") else "ffprobe"
+        )
+        probe_path = os.path.join(os.path.dirname(ffmpeg_binary), probe_name)
+        if probe_path and os.path.isfile(probe_path):
+            return probe_path
+    return shutil.which("ffprobe")
 
 
 def run_in_background(func, *args, **kwargs):
@@ -276,24 +335,69 @@ def normalize_script_for_subtitle_matching(video_script: str) -> str:
     return normalized_script
 
 
-def md5(text):
+def stable_cache_key(text: str) -> str:
+    """Return a stable 128-bit SHA-256 prefix for cache filenames."""
     import hashlib
 
-    return hashlib.md5(text.encode("utf-8")).hexdigest()
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:32]
 
 
-def get_system_locale():
+def get_system_locale() -> str:
+    """Return the system's base language code for the WebUI fallback."""
     try:
-        loc = locale.getdefaultlocale()
-        # zh_CN, zh_TW return zh
-        # en_US, en_GB return en
-        language_code = loc[0].split("_")[0]
-        return language_code
-    except Exception:
+        language = locale.getlocale()[0]
+        if not language:
+            return "en"
+        return language.replace("-", "_").split("_", 1)[0].lower()
+    except (AttributeError, TypeError, ValueError):
         return "en"
 
 
-@lru_cache(maxsize=None)
+def resolve_ui_language(
+    saved_language: str | None,
+    browser_locale: str | None,
+    supported_languages: Iterable[str],
+    default_language: str = "en",
+) -> str:
+    """
+    按“已保存设置、浏览器语言、默认语言”的优先级选择界面语言。
+
+    浏览器通常返回带地区的 locale，例如 ``zh-CN``、``pt-BR``。语言文件使用
+    ``zh``、``pt`` 这类基础代码，因此先尝试完整匹配，再回退到连字符前的语言
+    代码。函数保持纯逻辑，避免把浏览器上下文和配置写入耦合到工具层，便于测试。
+    """
+    supported = [str(language).strip() for language in supported_languages]
+    supported_by_lower = {
+        language.lower(): language for language in supported if language
+    }
+
+    def match_language(value: str | None) -> str | None:
+        normalized = str(value or "").strip().replace("_", "-").lower()
+        if not normalized:
+            return None
+        if normalized in supported_by_lower:
+            return supported_by_lower[normalized]
+        base_language = normalized.split("-", 1)[0]
+        return supported_by_lower.get(base_language)
+
+    saved_match = match_language(saved_language)
+    if saved_match:
+        return saved_match
+
+    browser_match = match_language(browser_locale)
+    if browser_match:
+        return browser_match
+
+    default_match = match_language(default_language)
+    if default_match:
+        return default_match
+
+    # 正常项目始终包含英文；保留空语言集合兜底，避免损坏的语言目录让页面
+    # 初始化直接抛异常，后续翻译函数会继续显示原始 key 以便诊断。
+    return supported[0] if supported else default_language
+
+
+@lru_cache(maxsize=8)
 def load_locales(i18n_dir):
     # WebUI 每次交互都会触发 Streamlit 重新执行脚本，语言文件运行期不会变化，
     # 因此缓存解析结果，避免反复读取和解析所有 i18n JSON 文件。

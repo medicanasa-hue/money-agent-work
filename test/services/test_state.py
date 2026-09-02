@@ -1,6 +1,13 @@
+import tempfile
+from unittest import mock
+from app.services import state as state_module
+
+import os
 import sys
 import threading
 import unittest
+import uuid
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
@@ -12,6 +19,7 @@ from app.services.state import MemoryState, RedisState
 class _FakeRedis:
     def __init__(self, batches):
         self.batches = batches
+        self.scan_types = []
         self.data = {}
         for key in [key for batch in batches for key in batch]:
             index = int(key.decode("utf-8").split(":")[-1])
@@ -21,7 +29,8 @@ class _FakeRedis:
                 b"progress": str(index).encode("utf-8"),
             }
 
-    def scan(self, cursor, count):
+    def scan(self, cursor, count, _type=None):
+        self.scan_types.append(_type)
         batch_index = int(cursor)
         next_cursor = batch_index + 1
         if next_cursor >= len(self.batches):
@@ -29,7 +38,41 @@ class _FakeRedis:
         return next_cursor, self.batches[batch_index]
 
     def hgetall(self, key):
+        if isinstance(key, str):
+            key = key.encode("utf-8")
         return self.data[key]
+
+    def exists(self, key):
+        if isinstance(key, str):
+            key = key.encode("utf-8")
+        return key in self.data
+
+    def hset(self, key, field=None, value=None, mapping=None):
+        if isinstance(key, str):
+            key = key.encode("utf-8")
+        target = self.data.setdefault(key, {})
+        if mapping:
+            target.update(
+                {
+                    str(item_key).encode("utf-8"): str(item_value).encode("utf-8")
+                    for item_key, item_value in mapping.items()
+                }
+            )
+        elif field is not None:
+            target[str(field).encode("utf-8")] = str(value).encode("utf-8")
+
+    def eval(self, script, numkeys, key, *arguments):
+        if isinstance(key, str):
+            key = key.encode("utf-8")
+        if key not in self.data:
+            return 0
+
+        target = self.data[key]
+        for index in range(0, len(arguments), 2):
+            field = str(arguments[index]).encode("utf-8")
+            value = str(arguments[index + 1]).encode("utf-8")
+            target[field] = value
+        return 1
 
 
 class TestMemoryState(unittest.TestCase):
@@ -78,6 +121,124 @@ class TestMemoryState(unittest.TestCase):
         self.assertEqual(total, thread_count * tasks_per_thread)
         self.assertEqual(len(tasks), total)
 
+    def test_patch_task_preserves_generated_outputs(self):
+        """异步发布更新不能覆盖已经完成的视频任务字段。"""
+        state = MemoryState()
+        state.update_task(
+            "task-1",
+            state=const.TASK_STATE_COMPLETE,
+            progress=100,
+            videos=["final.mp4"],
+        )
+
+        patched = state.patch_task(
+            "task-1",
+            cross_post_state=const.CROSS_POST_STATE_COMPLETE,
+            cross_post_results=[{"success": True}],
+        )
+
+        self.assertTrue(patched)
+        self.assertEqual(
+            state.get_task("task-1"),
+            {
+                "task_id": "task-1",
+                "state": const.TASK_STATE_COMPLETE,
+                "progress": 100,
+                "videos": ["final.mp4"],
+                "cross_post_state": const.CROSS_POST_STATE_COMPLETE,
+                "cross_post_results": [{"success": True}],
+            },
+        )
+        self.assertFalse(state.patch_task("missing", value="ignored"))
+
+    def test_process_probe_treats_windows_system_error_as_not_live(self):
+        with (
+            mock.patch.object(state_module.os, "name", "posix"),
+            mock.patch(
+                "app.services.state.os.kill",
+                side_effect=SystemError("Windows process probe failed"),
+            ),
+        ):
+            self.assertFalse(state_module._is_live_process(12345))
+    def test_process_probe_uses_windows_liveness_check(self):
+        with (
+            mock.patch.object(state_module.os, "name", "nt"),
+            mock.patch(
+                "app.services.state._is_live_windows_process", return_value=True
+            ) as liveness_check,
+        ):
+            self.assertTrue(state_module._is_live_process(12345))
+
+        liveness_check.assert_called_once_with(12345)
+    def test_completed_task_state_survives_memory_state_restart(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            state = MemoryState(state_dir=temporary_directory)
+            state.update_task(
+                "task-complete",
+                state=const.TASK_STATE_COMPLETE,
+                progress=100,
+                videos=["final.mp4"],
+            )
+
+            restarted_state = MemoryState(state_dir=temporary_directory)
+
+        self.assertEqual(
+            restarted_state.get_task("task-complete"),
+            {
+                "task_id": "task-complete",
+                "state": const.TASK_STATE_COMPLETE,
+                "progress": 100,
+                "videos": ["final.mp4"],
+            },
+        )
+    def test_processing_task_is_marked_interrupted_after_restart(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            state = MemoryState(state_dir=temporary_directory)
+            state.update_task(
+                "task-interrupted",
+                state=const.TASK_STATE_PROCESSING,
+                progress=55,
+                worker_pid=0,
+            )
+
+            restarted_state = MemoryState(state_dir=temporary_directory)
+
+        recovered_task = restarted_state.get_task("task-interrupted")
+        self.assertEqual(recovered_task["state"], const.TASK_STATE_FAILED)
+        self.assertEqual(recovered_task["progress"], 55)
+        self.assertTrue(recovered_task["interrupted"])
+        self.assertEqual(
+            recovered_task["error"], "task interrupted by application restart"
+        )
+    def test_processing_task_with_a_live_worker_survives_another_state_instance(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            state = MemoryState(state_dir=temporary_directory)
+            state.update_task(
+                "task-active",
+                state=const.TASK_STATE_PROCESSING,
+                progress=55,
+            )
+
+            second_state_instance = MemoryState(state_dir=temporary_directory)
+
+        active_task = second_state_instance.get_task("task-active")
+        self.assertEqual(active_task["state"], const.TASK_STATE_PROCESSING)
+        self.assertEqual(active_task["progress"], 55)
+        self.assertNotIn("interrupted", active_task)
+    def test_deleting_task_removes_its_persisted_snapshot(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            state = MemoryState(state_dir=temporary_directory)
+            state.update_task(
+                "task-deleted",
+                state=const.TASK_STATE_COMPLETE,
+                progress=100,
+            )
+            state.delete_task("task-deleted")
+
+            restarted_state = MemoryState(state_dir=temporary_directory)
+
+        self.assertIsNone(restarted_state.get_task("task-deleted"))
+
 
 class TestRedisState(unittest.TestCase):
     def _build_state(self, batch_sizes):
@@ -117,6 +278,100 @@ class TestRedisState(unittest.TestCase):
             [task["task_id"] for task in second_page],
             [f"task:{i}" for i in range(10, 18)],
         )
+        self.assertTrue(state._redis.scan_types)
+        self.assertEqual(set(state._redis.scan_types), {"HASH"})
+
+    @unittest.skipUnless(
+        os.getenv("MPT_TEST_REDIS_HOST"),
+        "MPT_TEST_REDIS_HOST not set",
+    )
+    def test_real_redis_get_all_tasks_ignores_queue_keys(self):
+        """真实 Redis 中的 List 队列不能被任务列表误当作 Hash 读取。"""
+        state = RedisState(
+            host=os.environ["MPT_TEST_REDIS_HOST"],
+            port=int(os.getenv("MPT_TEST_REDIS_PORT", "6379")),
+            db=int(os.getenv("MPT_TEST_REDIS_DB", "15")),
+        )
+        suffix = uuid.uuid4()
+        task_ids = [f"ci-list-{suffix}-{index}" for index in range(3)]
+        queue_key = f"ci-queue-{suffix}"
+
+        try:
+            for task_id in task_ids:
+                state.update_task(
+                    task_id,
+                    state=const.TASK_STATE_COMPLETE,
+                    progress=100,
+                )
+            state._redis.rpush(queue_key, *task_ids)
+
+            tasks, _ = state.get_all_tasks(page=1, page_size=1000)
+            returned_ids = {task["task_id"] for task in tasks}
+
+            self.assertTrue(set(task_ids).issubset(returned_ids))
+            self.assertNotIn(queue_key, returned_ids)
+        finally:
+            state._redis.delete(queue_key, *task_ids)
+
+    def test_patch_task_updates_only_existing_redis_task(self):
+        state = self._build_state([1])
+
+        self.assertTrue(
+            state.patch_task(
+                "task:0",
+                cross_post_state=const.CROSS_POST_STATE_FAILED,
+                cross_post_error="upload failed",
+            )
+        )
+        task = state.get_task("task:0")
+        self.assertEqual(task["progress"], 0)
+        self.assertEqual(task["cross_post_state"], const.CROSS_POST_STATE_FAILED)
+        self.assertEqual(task["cross_post_error"], "upload failed")
+        self.assertFalse(state.patch_task("missing", value="ignored"))
+
+    @unittest.skipUnless(
+        os.getenv("MPT_TEST_REDIS_HOST"),
+        "MPT_TEST_REDIS_HOST not set",
+    )
+    def test_real_redis_patch_and_delete_are_atomic(self):
+        """真实 Redis 中并发删除和局部更新不能重新创建残缺任务。"""
+        state = RedisState(
+            host=os.environ["MPT_TEST_REDIS_HOST"],
+            port=int(os.getenv("MPT_TEST_REDIS_PORT", "6379")),
+            db=int(os.getenv("MPT_TEST_REDIS_DB", "15")),
+        )
+
+        for _ in range(50):
+            task_id = f"ci-atomic-{uuid.uuid4()}"
+            state.update_task(
+                task_id,
+                state=const.TASK_STATE_COMPLETE,
+                progress=100,
+            )
+            barrier = threading.Barrier(2)
+
+            def patch_task():
+                barrier.wait()
+                state.patch_task(
+                    task_id,
+                    cross_post_state=const.CROSS_POST_STATE_COMPLETE,
+                )
+
+            def delete_task():
+                barrier.wait()
+                state.delete_task(task_id)
+
+            # Future.result() 会把工作线程异常重新抛到测试线程，避免 Redis
+            # 命令实际失败但仅打印线程异常、最终仍被误判为测试通过。
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                futures = [
+                    executor.submit(patch_task),
+                    executor.submit(delete_task),
+                ]
+                for future in futures:
+                    future.result(timeout=5)
+
+            self.assertIsNone(state.get_task(task_id))
 
 
 if __name__ == "__main__":

@@ -2,7 +2,8 @@
 
 API: https://archive.org/advancedsearch.php  +  /metadata/{id}
 Key: Gerekmez
-Lisans: Kamu malı (Prelinger Archives, NASA koleksiyonu vb.)
+Lisans: Karışık; yalnızca açıkça Public Domain, CC0, CC BY veya CC BY-SA
+        olarak işaretlenen öğeler otomatik seçilir.
 Notlar:
   - Arama → metadata → dosya listesi: her öğe için ek bir GET gerekir.
     Bu nedenle ilk 5 sonuçla sınırlıyız.
@@ -23,12 +24,40 @@ from .utils import (
     get_tls_verify,
     raise_for_http_error,
     safe_error_details,
+    select_best_video_variant,
 )
 
 _SEARCH_URL = "https://archive.org/advancedsearch.php"
 _META_URL = "https://archive.org/metadata"
 _DOWNLOAD_URL = "https://archive.org/download"
 _FALLBACK_DURATION = 30
+_OPEN_LICENSE_MARKERS = (
+    "public domain",
+    "cc0",
+    "creative commons zero",
+    "creativecommons.org/publicdomain/",
+    "creativecommons.org/licenses/by/",
+    "creativecommons.org/licenses/by-sa/",
+    "creative commons attribution",
+    "cc by",
+    "cc-by",
+)
+_RESTRICTED_LICENSE_MARKERS = (
+    "all rights reserved",
+    "copyrighted",
+    "restricted",
+    "non-commercial",
+    "noncommercial",
+    "no derivatives",
+    "permission required",
+    "not public domain",
+    "cc by-nc",
+    "cc-by-nc",
+    "cc by-nd",
+    "cc-by-nd",
+    "/by-nc",
+    "/by-nd",
+)
 
 
 def _parse_duration(value) -> int:
@@ -40,6 +69,59 @@ def _parse_duration(value) -> int:
         return max(1, int(f))
     except (ValueError, TypeError):
         return _FALLBACK_DURATION
+
+
+def _parse_dimension(value: object) -> int:
+    """Normalize optional Archive.org frame dimensions without guessing."""
+    if isinstance(value, bool):
+        return 0
+    try:
+        dimension = int(float(str(value).strip()))
+    except (ValueError, TypeError, OverflowError):
+        return 0
+    return max(0, dimension)
+
+
+def _metadata_text(metadata: dict, keys: tuple[str, ...]) -> str:
+    """Return compact text from optional Archive.org metadata fields."""
+    values = []
+    for key in keys:
+        value = metadata.get(key)
+        if isinstance(value, str) and value.strip():
+            values.append(value.strip())
+        elif isinstance(value, (list, tuple)):
+            values.extend(
+                entry.strip()
+                for entry in value
+                if isinstance(entry, str) and entry.strip()
+            )
+    return " ".join(values)
+
+
+def _open_license_details(metadata: dict) -> tuple[str, str] | None:
+    """Return explicit safe license fields, otherwise fail closed."""
+    license_url = _metadata_text(metadata, ("licenseurl", "license_url"))
+    license_name = _metadata_text(metadata, ("license",))
+    rights = _metadata_text(metadata, ("rights",))
+    policy_text = " ".join((license_url, license_name, rights)).casefold()
+    if not policy_text:
+        return None
+    if any(marker in policy_text for marker in _RESTRICTED_LICENSE_MARKERS):
+        return None
+    if not any(marker in policy_text for marker in _OPEN_LICENSE_MARKERS):
+        return None
+
+    if not license_name:
+        license_name = rights or "Public Domain"
+    return license_name, license_url
+
+
+def _archive_attribution(metadata: dict, identifier: str) -> str:
+    creator = _metadata_text(metadata, ("creator", "contributor", "publisher"))
+    details_url = f"https://archive.org/details/{identifier}"
+    if creator:
+        return f"{creator} via Internet Archive ({details_url})"
+    return f"Internet Archive ({details_url})"
 
 
 class ArchiveOrgProvider(VideoProvider):
@@ -85,7 +167,11 @@ class ArchiveOrgProvider(VideoProvider):
             if not identifier:
                 continue
 
-            item = self._fetch_best_mp4(identifier, minimum_duration)
+            item = self._fetch_best_mp4(
+                identifier,
+                minimum_duration,
+                video_aspect=video_aspect,
+            )
             if item:
                 item.search_query = search_term
                 title = doc.get("title")
@@ -97,7 +183,10 @@ class ArchiveOrgProvider(VideoProvider):
         return video_items
 
     def _fetch_best_mp4(
-        self, identifier: str, minimum_duration: int
+        self,
+        identifier: str,
+        minimum_duration: int,
+        video_aspect: VideoAspect = VideoAspect.portrait,
     ) -> Optional[MaterialInfo]:
         """Bir Archive.org item'ının en kaliteli MP4 dosyasını döndürür."""
         try:
@@ -119,6 +208,12 @@ class ArchiveOrgProvider(VideoProvider):
             )
             return None
 
+        license_details = _open_license_details(metadata)
+        if not license_details:
+            logger.info("[archive_org] skipping item without an allowed license")
+            return None
+        license_name, license_url = license_details
+
         # MP4 dosyalarını filtrele
         mp4_files = [
             f for f in files
@@ -138,11 +233,19 @@ class ArchiveOrgProvider(VideoProvider):
         if not mp4_files:
             return None
 
-        # En büyük dosyayı seç (genellikle en yüksek kalite)
-        try:
-            best = max(mp4_files, key=lambda f: int(f.get("size", 0) or 0))
-        except (ValueError, TypeError):
-            best = mp4_files[0]
+        # Prefer native target aspect when Archive exposes width/height.
+        selected_variant = select_best_video_variant(
+            mp4_files,
+            video_aspect=video_aspect,
+            url_key="name",
+        )
+        if selected_variant:
+            best, _, _ = selected_variant
+        else:
+            try:
+                best = max(mp4_files, key=lambda f: int(f.get("size", 0) or 0))
+            except (ValueError, TypeError):
+                best = mp4_files[0]
 
         filename = best.get("name")
         if not filename:
@@ -156,6 +259,11 @@ class ArchiveOrgProvider(VideoProvider):
         item.provider = "archive_org"
         item.url = f"{_DOWNLOAD_URL}/{identifier}/{filename}"
         item.duration = duration
+        item.width = _parse_dimension(best.get("width"))
+        item.height = _parse_dimension(best.get("height"))
+        item.license = license_name
+        item.license_url = license_url
+        item.attribution = _archive_attribution(metadata, identifier)
         title = metadata.get("title")
         if isinstance(title, str):
             item.title = title.strip()

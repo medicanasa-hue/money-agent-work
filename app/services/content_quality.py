@@ -8,7 +8,7 @@ from typing import Any
 
 from loguru import logger
 
-from app.services import content_intelligence, history, llm, viral_analyzer
+from app.services import claim_review, content_intelligence, history, llm, viral_analyzer
 from app.utils import utils
 
 DEFAULT_PREFLIGHT_IDEA_COUNT = 3
@@ -111,6 +111,10 @@ def build_preflight_report(
         subject,
         days=lookback_days,
     )
+    script_repeat_matches = history.find_recent_similar_scripts(
+        script,
+        days=lookback_days,
+    )
 
     script_analysis = None
     if script:
@@ -121,6 +125,8 @@ def build_preflight_report(
             language=selected_language,
         )
 
+    claim_review_report = claim_review.review_script_claims(script)
+
     return {
         "fingerprint": build_preflight_fingerprint(
             video_subject=subject,
@@ -130,7 +136,9 @@ def build_preflight_report(
         ),
         "content_plan": content_plan,
         "repeat_matches": repeat_matches,
+        "script_repeat_matches": script_repeat_matches,
         "script_analysis": script_analysis,
+        "claim_review": claim_review_report,
     }
 
 
@@ -360,8 +368,10 @@ def _extract_rewritten_script(response: str) -> str:
             for key in ("improved_script", "script", "rewrite"):
                 if _clean_text(data.get(key)):
                     return _clamp_text(data.get(key), MAX_REWRITE_SCRIPT_LENGTH)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning(
+                f"script rewrite response was not valid JSON; using plain text: {exc}"
+            )
 
     return _clamp_text(text, MAX_REWRITE_SCRIPT_LENGTH)
 

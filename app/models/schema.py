@@ -3,7 +3,7 @@ from enum import Enum
 from typing import Any, List, Literal, Optional, Union
 
 import pydantic
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.config import config
 
@@ -23,15 +23,19 @@ class VideoConcatMode(str, Enum):
 class VideoTransitionMode(str, Enum):
     none = None
     shuffle = "Shuffle"
+    crossfade = "Crossfade"
     fade_in = "FadeIn"
     fade_out = "FadeOut"
     slide_in = "SlideIn"
     slide_out = "SlideOut"
+    zoom_in = "ZoomIn"
+    zoom_out = "ZoomOut"
 
 
 class VideoAspect(str, Enum):
     landscape = "16:9"
     portrait = "9:16"
+    portrait_4_5 = "4:5"
     square = "1:1"
 
     def to_resolution(self):
@@ -39,16 +43,14 @@ class VideoAspect(str, Enum):
             return 1920, 1080
         elif self == VideoAspect.portrait:
             return 1080, 1920
+        elif self == VideoAspect.portrait_4_5:
+            return 1080, 1350
         elif self == VideoAspect.square:
             return 1080, 1080
         raise ValueError(f"unsupported video aspect: {self}")
 
 
-class _Config:
-    arbitrary_types_allowed = True
-
-
-@pydantic.dataclasses.dataclass(config=_Config)
+@pydantic.dataclasses.dataclass(config=ConfigDict(arbitrary_types_allowed=True))
 class MaterialInfo:
     provider: str = "pexels"
     url: str = ""
@@ -62,6 +64,8 @@ class MaterialInfo:
     license: str = Field(default="", repr=False)
     license_url: str = Field(default="", repr=False)
     attribution: str = Field(default="", repr=False)
+    preview_url: str = Field(default="", repr=False)
+    preview_quality_score: Optional[float] = Field(default=None, repr=False)
 
 
 class VideoParams(BaseModel):
@@ -83,12 +87,16 @@ class VideoParams(BaseModel):
     video_script: str = ""  # Script used to generate the video
     video_terms: Optional[str | list] = None  # Keywords used to generate the video
     video_aspect: Optional[VideoAspect] = VideoAspect.portrait
+    video_aspects: Optional[List[VideoAspect]] = None
     video_concat_mode: Optional[VideoConcatMode] = VideoConcatMode.random
-    video_transition_mode: Optional[VideoTransitionMode] = None
-    video_clip_duration: Optional[int] = 5
+    video_transition_mode: Optional[VideoTransitionMode] = VideoTransitionMode.crossfade
+    video_clip_duration: int = Field(default=5, ge=1)
+    video_clip_speed: Optional[float] = 1.0
+    outro_image_file: Optional[str] = ""
+    outro_duration: float = Field(default=2.0, ge=0, le=10)
     match_materials_to_script: bool = False
     smart_scene_queries: bool = False
-    video_count: Optional[int] = 1
+    video_count: int = Field(default=1, ge=1)
     video_codec: Optional[
         Literal[
             "libx264",
@@ -130,6 +138,10 @@ class VideoParams(BaseModel):
     bgm_type: Optional[str] = "random"
     bgm_file: Optional[str] = ""
     bgm_volume: Optional[float] = 0.2
+    # 视频配乐供应商共用提示词，WebUI 新任务统一写入该字段。保留下面的
+    # Sonilo 专用字段以兼容旧任务记录和现有 CLI 参数。
+    video_music_prompt: str = Field(default="", max_length=2000)
+    sonilo_bgm_prompt: str = Field(default="", max_length=2000)
 
     subtitle_enabled: Optional[bool] = True
     subtitle_style: Optional[str] = config.ui.get("subtitle_style", "classic")
@@ -137,7 +149,7 @@ class VideoParams(BaseModel):
     custom_position: float = config.ui.get("custom_position", 70.0)
     font_name: Optional[str] = "STHeitiMedium.ttc"
     text_fore_color: Optional[str] = "#FFFFFF"
-    text_background_color: Union[bool, str] = True
+    text_background_color: Union[bool, str] = False
     rounded_subtitle_background: bool = False
 
     font_size: int = 60
@@ -206,7 +218,7 @@ class SubtitleRequest(BaseModel):
     subtitle_position: Optional[str] = config.ui.get("subtitle_position", "bottom")
     font_name: Optional[str] = "STHeitiMedium.ttc"
     text_fore_color: Optional[str] = "#FFFFFF"
-    text_background_color: Union[bool, str] = True
+    text_background_color: Union[bool, str] = False
     rounded_subtitle_background: bool = False
     subtitle_style: Optional[str] = config.ui.get("subtitle_style", "classic")
     font_size: int = 60
@@ -348,39 +360,116 @@ class TaskResponse(BaseResponse):
 
     data: TaskResponseData
 
-    class Config:
-        json_schema_extra = {
+    model_config = ConfigDict(
+        json_schema_extra={
             "example": {
                 "status": 200,
                 "message": "success",
                 "data": {"task_id": "6c85c8cc-a77a-42b9-bc30-947815aa0558"},
             },
         }
+    )
+
+
+class TaskStatusData(BaseModel):
+    """任务查询对外保证的稳定字段；历史和扩展字段继续原样透传。"""
+
+    model_config = ConfigDict(extra="allow")
+
+    task_id: str
+    state: int
+    progress: int = 0
+    videos: Optional[List[str]] = None
+    combined_videos: Optional[List[str]] = None
+    failed_stage: Optional[str] = None
+    error: Optional[str] = None
+    cross_post_state: Optional[
+        Literal["pending", "processing", "complete", "failed"]
+    ] = None
+    cross_post_results: Optional[List[dict[str, Any]]] = None
+    cross_post_error: Optional[str] = None
+
+
+class TaskListData(BaseModel):
+    """分页任务列表结构。"""
+
+    tasks: List[TaskStatusData]
+    total: int
+    page: int
+    page_size: int
 
 
 class TaskQueryResponse(BaseResponse):
-    class Config:
-        json_schema_extra = {
+    """
+    任务查询会返回生成状态和可选的跨平台发布状态。
+
+    生成失败时包含 `failed_stage` 和 `error`；生成完成后如果启用了自动发布，
+    `cross_post_state` 会依次进入 pending、processing、complete 或 failed。
+    """
+
+    data: TaskStatusData
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "examples": [
+                {
+                    "status": 200,
+                    "message": "success",
+                    "data": {
+                        "task_id": "6c85c8cc-a77a-42b9-bc30-947815aa0558",
+                        "state": 1,
+                        "progress": 100,
+                        "videos": ["/tasks/example/final-1.mp4"],
+                        "cross_post_state": "complete",
+                        "cross_post_results": [{"success": True}],
+                    },
+                },
+                {
+                    "status": 200,
+                    "message": "success",
+                    "data": {
+                        "task_id": "6c85c8cc-a77a-42b9-bc30-947815aa0558",
+                        "state": -1,
+                        "progress": 30,
+                        "failed_stage": "audio",
+                        "error": "TTS request timed out",
+                    },
+                },
+            ],
+        }
+    )
+
+
+class TaskListResponse(BaseResponse):
+    """任务列表使用独立响应模型，避免与单任务查询混用文档结构。"""
+
+    data: TaskListData
+
+    model_config = ConfigDict(
+        json_schema_extra={
             "example": {
                 "status": 200,
                 "message": "success",
                 "data": {
-                    "state": 1,
-                    "progress": 100,
-                    "videos": [
-                        "http://127.0.0.1:8080/tasks/6c85c8cc-a77a-42b9-bc30-947815aa0558/final-1.mp4"
+                    "tasks": [
+                        {
+                            "task_id": "6c85c8cc-a77a-42b9-bc30-947815aa0558",
+                            "state": 4,
+                            "progress": 50,
+                        }
                     ],
-                    "combined_videos": [
-                        "http://127.0.0.1:8080/tasks/6c85c8cc-a77a-42b9-bc30-947815aa0558/combined-1.mp4"
-                    ],
+                    "total": 1,
+                    "page": 1,
+                    "page_size": 10,
                 },
-            },
+            }
         }
+    )
 
 
 class TaskDeletionResponse(BaseResponse):
-    class Config:
-        json_schema_extra = {
+    model_config = ConfigDict(
+        json_schema_extra={
             "example": {
                 "status": 200,
                 "message": "success",
@@ -396,11 +485,12 @@ class TaskDeletionResponse(BaseResponse):
                 },
             },
         }
+    )
 
 
 class VideoScriptResponse(BaseResponse):
-    class Config:
-        json_schema_extra = {
+    model_config = ConfigDict(
+        json_schema_extra={
             "example": {
                 "status": 200,
                 "message": "success",
@@ -409,22 +499,24 @@ class VideoScriptResponse(BaseResponse):
                 },
             },
         }
+    )
 
 
 class VideoTermsResponse(BaseResponse):
-    class Config:
-        json_schema_extra = {
+    model_config = ConfigDict(
+        json_schema_extra={
             "example": {
                 "status": 200,
                 "message": "success",
                 "data": {"video_terms": ["sky", "tree"]},
             },
         }
+    )
 
 
 class VideoSocialMetadataResponse(BaseResponse):
-    class Config:
-        json_schema_extra = {
+    model_config = ConfigDict(
+        json_schema_extra={
             "example": {
                 "status": 200,
                 "message": "success",
@@ -435,11 +527,12 @@ class VideoSocialMetadataResponse(BaseResponse):
                 },
             },
         }
+    )
 
 
 class ContentIntelligenceResponse(BaseResponse):
-    class Config:
-        json_schema_extra = {
+    model_config = ConfigDict(
+        json_schema_extra={
             "example": {
                 "status": 200,
                 "message": "success",
@@ -472,40 +565,43 @@ class ContentIntelligenceResponse(BaseResponse):
                 },
             },
         }
+    )
 
 
 class BgmRetrieveResponse(BaseResponse):
-    class Config:
-        json_schema_extra = {
+    model_config = ConfigDict(
+        json_schema_extra={
             "example": {
                 "status": 200,
                 "message": "success",
                 "data": {
                     "files": [
                         {
-                            "name": "output013.mp3",
+                            "name": "4fca18fce7344f3aa824777a40d45c8c.mp3",
                             "size": 1891269,
-                            "file": "/MoneyPrinterTurbo/resource/songs/output013.mp3",
+                            "file": "4fca18fce7344f3aa824777a40d45c8c.mp3",
                         }
                     ]
                 },
             },
         }
+    )
 
 
 class BgmUploadResponse(BaseResponse):
-    class Config:
-        json_schema_extra = {
+    model_config = ConfigDict(
+        json_schema_extra={
             "example": {
                 "status": 200,
                 "message": "success",
-                "data": {"file": "/MoneyPrinterTurbo/resource/songs/example.mp3"},
+                "data": {"file": "4fca18fce7344f3aa824777a40d45c8c.mp3"},
             },
         }
+    )
 
 class VideoMaterialRetrieveResponse(BaseResponse):
-    class Config:
-        json_schema_extra = {
+    model_config = ConfigDict(
+        json_schema_extra={
             "example": {
                 "status": 200,
                 "message": "success",
@@ -520,10 +616,11 @@ class VideoMaterialRetrieveResponse(BaseResponse):
                 },
             },
         }
+    )
 
 class VideoMaterialUploadResponse(BaseResponse):
-    class Config:
-        json_schema_extra = {
+    model_config = ConfigDict(
+        json_schema_extra={
             "example": {
                 "status": 200,
                 "message": "success",
@@ -532,3 +629,4 @@ class VideoMaterialUploadResponse(BaseResponse):
                 },
             },
         }
+    )

@@ -5,31 +5,119 @@ on:
   push:
     branches:
       - main
+      # The fork currently uses this as its default branch.
+      - codex/upgrade-v1.3.1
+
+env:
+  MPT_RUN_INTEGRATION_TESTS: "0"
+  HF_HUB_OFFLINE: "1"
+  TRANSFORMERS_OFFLINE: "1"
 
 jobs:
   tests:
-    name: Python tests
+    name: Python ${{ matrix.python-version }} tests
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.13"]
+
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
+    env:
+      MPT_TEST_REDIS_HOST: 127.0.0.1
+      MPT_TEST_REDIS_PORT: 6379
+      MPT_TEST_REDIS_DB: 15
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: "3.11"
+          python-version: ${{ matrix.python-version }}
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v6
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
           enable-cache: true
 
       - name: Install dependencies
-        run: uv sync --frozen
+        run: uv sync --frozen --python ${{ matrix.python-version }}
 
       - name: Compile Python sources
-        run: uv run python -m compileall app cli.py main.py webui test
+        run: uv run --no-sync python -m compileall app cli.py main.py webui test
+
+      - name: Lint Python sources
+        if: matrix.python-version == '3.11'
+        run: uv run --no-sync ruff check app cli.py main.py webui test
+
+      - name: Run unit tests with coverage
+        # pytest 兼容现有 unittest.TestCase，同时会收集仓库中的 pytest 风格
+        # 测试，避免测试文件已存在但 CI 没有真正执行。
+        run: uv run --no-sync python -X utf8 -m coverage run -m pytest -q test
+
+      - name: Report test coverage
+        run: uv run --no-sync python -m coverage report
+
+      - name: Export coverage report
+        run: uv run --no-sync python -m coverage xml
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: coverage-python-${{ matrix.python-version }}
+          path: coverage.xml
+          retention-days: 7
+
+  windows-smoke:
+    name: Windows smoke tests
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.11"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --frozen --python 3.11
+
+      - name: Verify critical runtime imports
+        run: uv run python -c "from google import genai"
+
+      - name: Compile Python sources
+        run: uv run --no-sync python -m compileall app cli.py main.py webui test
+
+      - name: Lint Python sources
+        run: uv run --no-sync ruff check --select F,E9 .
 
       - name: Run deterministic unit tests
-        run: uv run python -X utf8 -m unittest test.services.test_state test.services.test_task test.services.test_schema test.services.test_webui_i18n
+        # Collect both pytest functions and unittest cases, including Windows
+        # Unicode regressions and the synthetic render smoke test.
+        run: uv run --no-sync python -X utf8 -m pytest -q test

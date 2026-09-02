@@ -79,6 +79,7 @@ class CoverrProvider(VideoProvider):
                 item = MaterialInfo()
                 item.provider = "coverr"
                 item.url = mp4_url
+                item.preview_url = str(v.get("thumbnail") or v.get("poster") or "").strip()
                 item.duration = duration
                 item.search_query = search_term
                 title = v.get("title")

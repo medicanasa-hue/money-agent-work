@@ -61,8 +61,15 @@ class TestContentIntelligence(unittest.TestCase):
     def test_rss_trend_context_returns_planning_input(self):
         with patch.object(
             content_intelligence.rss_trend,
-            "fetch_rss_trend",
-            return_value="Headline A; Headline B",
+            "fetch_rss_trend_items",
+            return_value=[
+                {
+                    "title": "Headline A",
+                    "url": "https://news.example.test/headline-a",
+                    "publisher": "Example News",
+                },
+                {"title": "Headline B", "url": "", "publisher": ""},
+            ],
         ):
             result = content_intelligence.get_trend_context(
                 video_subject="personal finance",
@@ -75,12 +82,13 @@ class TestContentIntelligence(unittest.TestCase):
         self.assertEqual(result.source, "rss")
         self.assertIn("Headline A", result.text)
         self.assertIn("not ranking", result.warnings[0])
+        self.assertEqual(result.sources[0].url, "https://news.example.test/headline-a")
 
     def test_rss_trend_context_warns_when_empty(self):
         with patch.object(
             content_intelligence.rss_trend,
-            "fetch_rss_trend",
-            return_value="",
+            "fetch_rss_trend_items",
+            return_value=[],
         ):
             result = content_intelligence.get_trend_context(
                 video_subject="personal finance",
@@ -260,8 +268,15 @@ class TestContentIntelligence(unittest.TestCase):
 
         with patch.object(
             content_intelligence.rss_trend,
-            "fetch_rss_trend",
-            return_value="Headline A; Headline B",
+            "fetch_rss_trend_items",
+            return_value=[
+                {
+                    "title": "Headline A",
+                    "url": "https://news.example.test/headline-a",
+                    "publisher": "Example News",
+                },
+                {"title": "Headline B", "url": "", "publisher": ""},
+            ],
         ):
             with patch.object(content_intelligence.llm, "_generate_response", return_value=payload) as generate:
                 result = content_intelligence.generate_content_plan(
@@ -280,6 +295,7 @@ class TestContentIntelligence(unittest.TestCase):
         self.assertNotIn("No live trend data was used", result["warnings"][0])
         self.assertIn("RSS headlines were used", result["warnings"][0])
         self.assertIn("RSS trend context was used", result["warnings"][-1])
+        self.assertEqual(result["trend_sources"][0]["publisher"], "Example News")
 
     def test_generate_content_plan_continues_when_trend_adapter_fails(self):
         class FailingAdapter:
@@ -365,8 +381,15 @@ class TestContentIntelligence(unittest.TestCase):
     def test_generate_content_plan_fallback_keeps_rss_warning(self):
         with patch.object(
             content_intelligence.rss_trend,
-            "fetch_rss_trend",
-            return_value="Headline A; Headline B",
+            "fetch_rss_trend_items",
+            return_value=[
+                {
+                    "title": "Headline A",
+                    "url": "https://news.example.test/headline-a",
+                    "publisher": "Example News",
+                },
+                {"title": "Headline B", "url": "", "publisher": ""},
+            ],
         ):
             with patch.object(
                 content_intelligence.llm,
@@ -613,8 +636,15 @@ class TestContentIntelligence(unittest.TestCase):
 
         with patch.object(
             content_intelligence.rss_trend,
-            "fetch_rss_trend",
-            return_value="Headline A; Headline B",
+            "fetch_rss_trend_items",
+            return_value=[
+                {
+                    "title": "Headline A",
+                    "url": "https://news.example.test/headline-a",
+                    "publisher": "Example News",
+                },
+                {"title": "Headline B", "url": "", "publisher": ""},
+            ],
         ):
             with patch.object(content_intelligence.llm, "_generate_response", return_value=llm_response) as generate:
                 response = TestClient(app).post(

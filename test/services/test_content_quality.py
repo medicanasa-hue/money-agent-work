@@ -24,6 +24,14 @@ class TestContentQuality(unittest.TestCase):
                 "similarity": 0.82,
             }
         ]
+        script_repeat_matches = [
+            {
+                "task_id": "recent-script",
+                "subject": "Why interest rates rise",
+                "created_at": "2026-07-04T10:00:00+00:00",
+                "similarity": 0.91,
+            }
+        ]
         script_analysis = {
             "overall_score": 72,
             "hook_score": 80,
@@ -40,6 +48,10 @@ class TestContentQuality(unittest.TestCase):
             "find_recent_similar_subjects",
             return_value=repeat_matches,
         ) as find_subjects, patch.object(
+            content_quality.history,
+            "find_recent_similar_scripts",
+            return_value=script_repeat_matches,
+        ) as find_scripts, patch.object(
             content_quality.viral_analyzer,
             "analyze_viral_potential",
             return_value=script_analysis,
@@ -57,10 +69,16 @@ class TestContentQuality(unittest.TestCase):
             "Budget mistakes",
             days=content_quality.DEFAULT_PREFLIGHT_LOOKBACK_DAYS,
         )
+        find_scripts.assert_called_once_with(
+            "Do you know why budgets fail? Save this.",
+            days=content_quality.DEFAULT_PREFLIGHT_LOOKBACK_DAYS,
+        )
         analyze.assert_called_once()
         self.assertEqual(report["content_plan"], content_plan)
         self.assertEqual(report["repeat_matches"], repeat_matches)
+        self.assertEqual(report["script_repeat_matches"], script_repeat_matches)
         self.assertEqual(report["script_analysis"], script_analysis)
+        self.assertEqual(report["claim_review"]["status"], "clear")
         self.assertEqual(report["fingerprint"]["subject"], "Budget mistakes")
 
     def test_build_preflight_report_skips_script_analysis_without_script(self):

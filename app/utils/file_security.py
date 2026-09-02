@@ -1,6 +1,26 @@
 import os
 
 
+_WINDOWS_INVALID_FILENAME_CHARS = frozenset('<>:"/\\|?*')
+
+
+def sanitize_upload_filename(filename: object) -> str:
+    """Return a portable basename for an untrusted client upload name."""
+    if not isinstance(filename, str):
+        raise ValueError("invalid upload filename")
+    safe_name = filename.replace("\\", "/").split("/")[-1].strip()
+    if (
+        not safe_name
+        or safe_name in {".", ".."}
+        or len(safe_name) > 255
+        or safe_name.endswith((" ", "."))
+        or not safe_name.isprintable()
+        or any(character in _WINDOWS_INVALID_FILENAME_CHARS for character in safe_name)
+    ):
+        raise ValueError("invalid upload filename")
+    return safe_name
+
+
 def resolve_path_within_directory(
     base_dir: str,
     unsafe_path: str,
