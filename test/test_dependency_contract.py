@@ -40,6 +40,21 @@ class TestDependencyContract(unittest.TestCase):
             [_normalized_spec(spec) for spec in _project_dependency_specs()],
         )
 
+    def test_dependency_audit_scans_the_frozen_runtime_lock(self):
+        workflow = (
+            PROJECT_ROOT / ".github" / "workflows" / "dependency-audit.yml"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn('version: "0.12.7"', workflow)
+        self.assertIn("uv lock --check", workflow)
+        self.assertIn("uv export --frozen --no-dev", workflow)
+        self.assertIn("--output-file audit-requirements.txt", workflow)
+        self.assertIn("inputs: audit-requirements.txt", workflow)
+        self.assertIn("no-deps: true", workflow)
+        self.assertIn("require-hashes: true", workflow)
+        self.assertIn("internal-be-careful-extra-flags: --disable-pip", workflow)
+        self.assertNotIn("inputs: requirements.txt", workflow)
+
 
 if __name__ == "__main__":
     unittest.main()

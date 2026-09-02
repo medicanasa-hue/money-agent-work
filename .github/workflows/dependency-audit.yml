@@ -19,7 +19,21 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Install uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          version: "0.12.7"
+
+      - name: Verify the runtime lock is current
+        run: uv lock --check
+
+      - name: Export frozen runtime dependencies
+        run: uv export --frozen --no-dev --format requirements-txt --output-file audit-requirements.txt --quiet
+
       - name: Audit Python dependencies
         uses: pypa/gh-action-pip-audit@1220774d901786e6f652ae159f7b6bc8fea6d266 # v1.1.0
         with:
-          inputs: requirements.txt
+          inputs: audit-requirements.txt
+          no-deps: true
+          require-hashes: true
+          internal-be-careful-extra-flags: --disable-pip
