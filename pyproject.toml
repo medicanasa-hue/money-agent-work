@@ -29,7 +29,7 @@ dependencies = [
     "python-multipart==0.0.31",
     "pyyaml==6.0.3",
     "defusedxml==0.7.1",
-    "requests==2.33.1",
+    "requests==2.34.2",
     "packaging==24.2",
     "socksio==1.0.0",
     "pydub==0.25.1",
