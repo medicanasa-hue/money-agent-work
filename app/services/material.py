@@ -73,37 +73,82 @@ _VIDEO_DOWNLOAD_TIMEOUT = (30, 90)
 _VIDEO_DOWNLOAD_TOTAL_TIMEOUT_SECONDS = 120
 _VIDEO_DOWNLOAD_CHUNK_SIZE = 1024 * 1024
 _MAX_VIDEO_DOWNLOAD_BYTES = 512 * 1024 * 1024
+_MAX_IMAGE_DOWNLOAD_BYTES = 25 * 1024 * 1024
+_MAX_PREVIEW_DOWNLOAD_BYTES = 10 * 1024 * 1024
 _MAX_REMOTE_MATERIAL_REDIRECTS = 3
 
 
-def _read_video_response_content(response) -> bytes | None:
-    """Read a stock-video response without letting a slow stream run forever."""
+def _read_bounded_response_content(
+    response,
+    *,
+    max_bytes: int,
+    resource_name: str,
+    total_timeout_seconds: int | None = None,
+) -> bytes | None:
+    headers = getattr(response, "headers", {}) or {}
+    declared_length_value = headers.get("Content-Length")
+    declared_length = None
+    if declared_length_value is not None:
+        try:
+            declared_length = int(declared_length_value)
+        except (TypeError, ValueError):
+            declared_length = None
+        if declared_length is not None and declared_length > max_bytes:
+            logger.warning(f"{resource_name} exceeded its size limit")
+            return None
+
     iter_content = getattr(response, "iter_content", None)
     if not callable(iter_content):
         content = getattr(response, "content", b"")
         if not isinstance(content, bytes):
             return None
-        if len(content) > _MAX_VIDEO_DOWNLOAD_BYTES:
-            logger.warning("video download exceeded its size limit")
+        if len(content) > max_bytes:
+            logger.warning(f"{resource_name} exceeded its size limit")
+            return None
+        if declared_length is not None and declared_length > len(content):
+            logger.warning(
+                f"{resource_name} truncated: expected {declared_length} bytes, "
+                f"got {len(content)}"
+            )
             return None
         return content
 
-    deadline = time.monotonic() + _VIDEO_DOWNLOAD_TOTAL_TIMEOUT_SECONDS
+    deadline = (
+        time.monotonic() + total_timeout_seconds
+        if total_timeout_seconds is not None
+        else None
+    )
     content = bytearray()
     try:
         for chunk in iter_content(chunk_size=_VIDEO_DOWNLOAD_CHUNK_SIZE):
-            if time.monotonic() >= deadline:
-                logger.warning("video download exceeded its total time budget")
+            if deadline is not None and time.monotonic() >= deadline:
+                logger.warning(f"{resource_name} exceeded its total time budget")
                 return None
             if isinstance(chunk, bytes) and chunk:
-                if len(content) + len(chunk) > _MAX_VIDEO_DOWNLOAD_BYTES:
-                    logger.warning("video download exceeded its size limit")
+                if len(content) + len(chunk) > max_bytes:
+                    logger.warning(f"{resource_name} exceeded its size limit")
                     return None
                 content.extend(chunk)
     except requests.RequestException as error:
-        logger.warning(f"video download stream failed: {safe_error_details(error)}")
+        logger.warning(f"{resource_name} stream failed: {safe_error_details(error)}")
+        return None
+    if declared_length is not None and declared_length > len(content):
+        logger.warning(
+            f"{resource_name} truncated: expected {declared_length} bytes, "
+            f"got {len(content)}"
+        )
         return None
     return bytes(content)
+
+
+def _read_video_response_content(response) -> bytes | None:
+    """Read a stock-video response without letting a slow stream run forever."""
+    return _read_bounded_response_content(
+        response,
+        max_bytes=_MAX_VIDEO_DOWNLOAD_BYTES,
+        resource_name="video download",
+        total_timeout_seconds=_VIDEO_DOWNLOAD_TOTAL_TIMEOUT_SECONDS,
+    )
 
 
 def _close_response(response) -> None:
@@ -934,8 +979,12 @@ def _preview_visual_quality_score(item: MaterialInfo) -> Optional[float]:
         content_type = str(response_headers.get("Content-Type", "")).lower()
         if content_type and not content_type.startswith("image/"):
             return None
-        content = getattr(response, "content", b"")
-        if not isinstance(content, bytes) or not content:
+        content = _read_bounded_response_content(
+            response,
+            max_bytes=_MAX_PREVIEW_DOWNLOAD_BYTES,
+            resource_name="material preview download",
+        )
+        if not content:
             return None
         with Image.open(BytesIO(content)) as image:
             width, height = image.size
@@ -1216,28 +1265,8 @@ def save_video(
             )
             return ""
 
-        declared_length_value = resp_headers.get("Content-Length")
-        declared_length = None
-        if declared_length_value is not None:
-            try:
-                declared_length = int(declared_length_value)
-            except (TypeError, ValueError):
-                pass
-            if (
-                declared_length is not None
-                and declared_length > _MAX_VIDEO_DOWNLOAD_BYTES
-            ):
-                logger.warning("video download exceeded its size limit")
-                return ""
-
         content = _read_video_response_content(resp)
         if content is None:
-            return ""
-        if declared_length is not None and declared_length > len(content):
-            logger.warning(
-                f"video download truncated: expected {declared_length} bytes, "
-                f"got {len(content)}"
-            )
             return ""
 
         try:
@@ -1311,8 +1340,12 @@ def save_image(
             logger.warning("image download returned non-image content")
             return ""
 
-        content = getattr(response, "content", b"")
-        if not isinstance(content, bytes) or not content:
+        content = _read_bounded_response_content(
+            response,
+            max_bytes=_MAX_IMAGE_DOWNLOAD_BYTES,
+            resource_name="image download",
+        )
+        if not content:
             logger.warning("image download returned empty content")
             return ""
 

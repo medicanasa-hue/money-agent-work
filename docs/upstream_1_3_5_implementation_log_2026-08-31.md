@@ -617,3 +617,18 @@ düzeltmeleri uygulandı. Son doğrulama: `uv lock --check`, `uv sync --frozen`,
 --local` geçti. Tam suite sonucu **1.540 geçti / 13 atlandı / 3 mevcut uyarı**
 ve `pip-audit` sonucu "No known vulnerabilities found". Uzak CodeQL yeniden
 koşusu bu commit pushlandıktan sonra izlenecek.
+
+`06d52e6` güvenlik commit'inin uzak koşusunda Linux Python 3.11/3.13, Windows
+smoke, workflow içindeki Python security analysis ve GitHub Advanced Security'nin
+ayrı CodeQL kapısı birlikte geçti; PR yeniden `CLEAN` durumuna geldi.
+
+Bu uzak kabulden sonra yapılan son bellek güvenliği incelemesi, image ve preview
+yanıtlarının `stream=True` açılmasına rağmen `.content` üzerinden sınır olmadan
+belleğe alınabildiğini gösterdi. Ortak bounded response okuyucusu video
+davranışını koruyarak image için 25 MiB, preview için 10 MiB üst sınırı uyguluyor.
+Hem yanıttaki `Content-Length` indirme öncesinde denetleniyor hem de başlıksız
+stream gerçek okunan byte sayısında kesiliyor; truncated video kontrolü aynı
+helper'a taşındı. Dört yeni test önce eski uygulamada birlikte başarısız oldu,
+sonra declared-size ve streamed-size yollarında geçti. Bu ek sertleştirmeden
+sonraki yerel tam CI eşdeğeri **1.544 geçti / 13 atlandı / 3 mevcut uyarı / 12.341
+subtest**, toplam branch coverage ise yuvarlanmış **%72** oldu.

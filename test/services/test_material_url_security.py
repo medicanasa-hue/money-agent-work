@@ -377,6 +377,64 @@ class TestImageDownloadUrlSecurity(unittest.TestCase):
         self.assertTrue(result.endswith(".jpg"))
         response_close.assert_called_once_with()
 
+    def test_save_image_rejects_declared_oversized_body_before_reading_it(self):
+        class Response:
+            status_code = 200
+            headers = {"Content-Type": "image/jpeg", "Content-Length": "6"}
+
+            def __init__(self):
+                self.close = Mock()
+                self.body_was_read = False
+
+            @property
+            def content(self):
+                self.body_was_read = True
+                return b"abcdef"
+
+        response = Response()
+        with (
+            tempfile.TemporaryDirectory() as temp_dir,
+            patch(
+                "socket.getaddrinfo",
+                return_value=_dns_result("93.184.216.34"),
+            ),
+            patch.object(material, "_MAX_IMAGE_DOWNLOAD_BYTES", 5),
+            patch.object(material.requests, "get", return_value=response),
+        ):
+            result = material.save_image(
+                "https://images.example/oversized.jpg", save_dir=temp_dir
+            )
+
+        self.assertEqual(result, "")
+        self.assertFalse(response.body_was_read)
+        response.close.assert_called_once_with()
+
+    def test_save_image_rejects_oversized_stream_without_content_length(self):
+        iter_content = Mock(return_value=iter((b"abc", b"def")))
+        response = SimpleNamespace(
+            status_code=200,
+            headers={"Content-Type": "image/jpeg"},
+            iter_content=iter_content,
+            close=Mock(),
+        )
+
+        with (
+            tempfile.TemporaryDirectory() as temp_dir,
+            patch(
+                "socket.getaddrinfo",
+                return_value=_dns_result("93.184.216.34"),
+            ),
+            patch.object(material, "_MAX_IMAGE_DOWNLOAD_BYTES", 5),
+            patch.object(material.requests, "get", return_value=response),
+        ):
+            result = material.save_image(
+                "https://images.example/streamed.jpg", save_dir=temp_dir
+            )
+
+        self.assertEqual(result, "")
+        iter_content.assert_called_once_with(chunk_size=1024 * 1024)
+        response.close.assert_called_once_with()
+
 
 class TestPreviewDownloadUrlSecurity(unittest.TestCase):
     @staticmethod
@@ -460,6 +518,62 @@ class TestPreviewDownloadUrlSecurity(unittest.TestCase):
 
         self.assertIsNone(result)
         response_close.assert_called_once_with()
+
+    def test_preview_score_rejects_declared_oversized_body_before_reading_it(self):
+        class Response:
+            status_code = 200
+            headers = {"Content-Type": "image/png", "Content-Length": "6"}
+
+            def __init__(self):
+                self.close = Mock()
+                self.body_was_read = False
+
+            @property
+            def content(self):
+                self.body_was_read = True
+                return b"abcdef"
+
+        response = Response()
+        item = self._item("https://preview.example/oversized.png")
+        with (
+            patch.object(material, "_is_preview_quality_filter_enabled", return_value=True),
+            patch(
+                "socket.getaddrinfo",
+                return_value=_dns_result("93.184.216.34"),
+            ),
+            patch.object(material, "_MAX_PREVIEW_DOWNLOAD_BYTES", 5),
+            patch.object(material.requests, "get", return_value=response),
+        ):
+            result = material._preview_visual_quality_score(item)
+
+        self.assertIsNone(result)
+        self.assertFalse(response.body_was_read)
+        response.close.assert_called_once_with()
+
+    def test_preview_score_rejects_oversized_stream_without_content_length(self):
+        iter_content = Mock(return_value=iter((b"abc", b"def")))
+        response = SimpleNamespace(
+            status_code=200,
+            headers={"Content-Type": "image/png"},
+            iter_content=iter_content,
+            close=Mock(),
+        )
+        item = self._item("https://preview.example/streamed.png")
+
+        with (
+            patch.object(material, "_is_preview_quality_filter_enabled", return_value=True),
+            patch(
+                "socket.getaddrinfo",
+                return_value=_dns_result("93.184.216.34"),
+            ),
+            patch.object(material, "_MAX_PREVIEW_DOWNLOAD_BYTES", 5),
+            patch.object(material.requests, "get", return_value=response),
+        ):
+            result = material._preview_visual_quality_score(item)
+
+        self.assertIsNone(result)
+        iter_content.assert_called_once_with(chunk_size=1024 * 1024)
+        response.close.assert_called_once_with()
 
 
 if __name__ == "__main__":
