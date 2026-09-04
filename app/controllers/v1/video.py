@@ -1,5 +1,6 @@
 import os
 import pathlib
+import re
 import shutil
 from typing import Union
 
@@ -38,6 +39,10 @@ from app.utils import file_security, utils
 # 认证依赖项
 # router = new_router(dependencies=[Depends(base.verify_token)])
 router = new_router(dependencies=[Depends(base.verify_token)])
+
+_TASK_ID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+)
 
 _enable_redis = config.app.get("enable_redis", False)
 _redis_host = config.app.get("redis_host", "localhost")
@@ -88,6 +93,72 @@ def _resolve_path_within_directory(base_dir: str, unsafe_path: str, request_id: 
             status_code=404 if str(exc) == "file does not exist" else 403,
             message=f"{request_id}: invalid file path",
         )
+
+
+def _canonical_task_id(task_id: str, request_id: str) -> str:
+    """Return the path-safe canonical form used by server-generated task IDs."""
+    if not isinstance(task_id, str) or not _TASK_ID_RE.fullmatch(task_id):
+        raise HttpException(
+            task_id=request_id,
+            status_code=404,
+            message=f"{request_id}: task not found",
+        )
+    return task_id
+
+
+def _task_directory_from_root_listing(
+    tasks_dir: str,
+    canonical_task_id: str,
+    request_id: str,
+) -> str | None:
+    """Select a task directory from the server-owned root listing.
+
+    The returned path originates from ``os.scandir`` instead of being composed
+    from request data. Symlinks, junction redirects, and non-directory entries
+    are rejected before the recursive-delete boundary.
+    """
+    tasks_root = os.path.realpath(tasks_dir)
+    try:
+        with os.scandir(tasks_root) as entries:
+            for entry in entries:
+                if entry.name != canonical_task_id:
+                    continue
+
+                listed_path = os.path.abspath(entry.path)
+                resolved_path = os.path.realpath(listed_path)
+                is_direct_child = os.path.normcase(os.path.dirname(listed_path)) == (
+                    os.path.normcase(tasks_root)
+                )
+                stays_at_listed_path = os.path.normcase(resolved_path) == os.path.normcase(
+                    listed_path
+                )
+                if (
+                    not is_direct_child
+                    or not stays_at_listed_path
+                    or not entry.is_dir(follow_symlinks=False)
+                ):
+                    raise HttpException(
+                        task_id=request_id,
+                        status_code=403,
+                        message=f"{request_id}: invalid task path",
+                    )
+                return resolved_path
+    except FileNotFoundError:
+        return None
+    except HttpException:
+        raise
+    except OSError as exc:
+        logger.error(
+            "failed to inspect task directory, request_id: {}, error_type: {}",
+            request_id,
+            type(exc).__name__,
+        )
+        raise HttpException(
+            task_id=request_id,
+            status_code=500,
+            message=f"{request_id}: unable to inspect task files",
+        ) from exc
+    return None
 
 
 def _public_task_data(task: dict) -> dict:
@@ -312,12 +383,17 @@ def delete_video(request: Request, task_id: str = Path(..., description="Task ID
                 message=f"{request_id}: task is still running",
             )
 
+        canonical_task_id = _canonical_task_id(task_id, request_id)
         tasks_dir = utils.task_dir()
-        current_task_dir = os.path.join(tasks_dir, task_id)
-        if os.path.exists(current_task_dir):
+        current_task_dir = _task_directory_from_root_listing(
+            tasks_dir,
+            canonical_task_id,
+            request_id,
+        )
+        if current_task_dir is not None:
             shutil.rmtree(current_task_dir)
 
-        sm.state.delete_task(task_id)
+        sm.state.delete_task(canonical_task_id)
         logger.success(f"video deleted: {utils.to_json(task)}")
         return utils.get_response(200)
 

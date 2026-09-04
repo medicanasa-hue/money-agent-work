@@ -1,5 +1,4 @@
 import ast
-import hashlib
 import re
 import shutil
 from contextlib import nullcontext
@@ -14,7 +13,7 @@ from app.models.schema import VideoParams
 from app.services import task as tm
 from app.services import voice
 from app.services import webui_task
-from app.utils import utils
+from app.utils import secret_fingerprint, utils
 
 
 ROOT_DIR = Path(__file__).parent.parent.parent
@@ -46,13 +45,17 @@ def _load_provider_signature(test_config):
         and node.name
         in {
             "_credential_signature",
+            "_elevenlabs_voice_catalog_cache_key",
             "_get_voice_preview_provider_signature",
         }
     ]
     module = ast.Module(body=functions, type_ignores=[])
-    namespace = {"hashlib": hashlib, "config": test_config}
+    namespace = {"secret_fingerprint": secret_fingerprint, "config": test_config}
     exec(compile(module, str(WEBUI_MAIN), "exec"), namespace)
-    return namespace["_get_voice_preview_provider_signature"]
+    return (
+        namespace["_get_voice_preview_provider_signature"],
+        namespace["_elevenlabs_voice_catalog_cache_key"],
+    )
 
 
 def _button_by_key(app, key):
@@ -92,7 +95,7 @@ def test_provider_signature_changes_when_api_key_changes():
             "model_id": "chatterbox",
         },
     )
-    provider_signature = _load_provider_signature(test_config)
+    provider_signature, catalog_cache_key = _load_provider_signature(test_config)
 
     old_signature = provider_signature("elevenlabs")
     test_config.elevenlabs["api_key"] = "new-elevenlabs"
@@ -101,6 +104,8 @@ def test_provider_signature_changes_when_api_key_changes():
     assert old_signature != new_signature
     assert "old-elevenlabs" not in str(old_signature)
     assert "new-elevenlabs" not in str(new_signature)
+    assert catalog_cache_key("old-elevenlabs") != catalog_cache_key("new-elevenlabs")
+    assert catalog_cache_key("") == "elevenlabs_voice_catalog_empty"
 
 
 def test_full_voiceover_preview_is_disabled_until_script_exists():

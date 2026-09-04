@@ -363,8 +363,9 @@ class TestVideoControllerTasks(unittest.TestCase):
 
     def test_delete_allows_completed_task(self):
         """普通已完成任务仍应保持原有删除行为。"""
+        task_id = "11111111-1111-4111-8111-111111111111"
         completed_task = {
-            "task_id": "completed-task",
+            "task_id": task_id,
             "state": const.TASK_STATE_COMPLETE,
             "progress": 100,
             "cross_post_state": const.CROSS_POST_STATE_COMPLETE,
@@ -379,14 +380,147 @@ class TestVideoControllerTasks(unittest.TestCase):
             "task_dir",
             return_value="/tmp/mpt-completed-task-test",
         ), patch.object(
-            video_controller.os.path, "exists", return_value=False
+            video_controller.os.path, "isdir", return_value=False
         ), patch.object(video_controller.sm.state, "delete_task") as delete_task:
             response = video_controller.delete_video(
-                self._request(), task_id="completed-task"
+                self._request(), task_id=task_id
             )
 
         self.assertEqual(response["status"], 200)
-        delete_task.assert_called_once_with("completed-task")
+        delete_task.assert_called_once_with(task_id)
+
+    def test_delete_selects_task_directory_from_scanned_entries(self):
+        """The recursive-delete path must originate from the task root listing."""
+        task_id = "11111111-1111-4111-8111-111111111111"
+        completed_task = {
+            "task_id": task_id,
+            "state": const.TASK_STATE_COMPLETE,
+            "progress": 100,
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            tasks_dir = Path(temp_dir, "tasks")
+            current_task_dir = tasks_dir / task_id
+            current_task_dir.mkdir(parents=True)
+
+            with (
+                patch.object(
+                    video_controller.sm.state,
+                    "get_task",
+                    return_value=completed_task,
+                ),
+                patch.object(
+                    video_controller.utils,
+                    "task_dir",
+                    return_value=str(tasks_dir),
+                ),
+                patch.object(
+                    video_controller.file_security,
+                    "resolve_path_within_directory",
+                    side_effect=AssertionError(
+                        "recursive delete must not derive its path from request data"
+                    ),
+                ),
+                patch.object(video_controller.shutil, "rmtree") as remove_tree,
+                patch.object(video_controller.sm.state, "delete_task") as delete_task,
+            ):
+                response = video_controller.delete_video(
+                    self._request(), task_id=task_id
+                )
+
+        self.assertEqual(response["status"], 200)
+        remove_tree.assert_called_once_with(os.path.realpath(current_task_dir))
+        delete_task.assert_called_once_with(task_id)
+
+    def test_delete_rejects_traversal_task_id_before_recursive_delete(self):
+        """Bozuk durum kaydı bile görev kökü dışındaki bir dizini sildirememeli."""
+        completed_task = {
+            "task_id": "../outside",
+            "state": const.TASK_STATE_COMPLETE,
+            "progress": 100,
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            tasks_dir = Path(temp_dir, "tasks")
+            outside_dir = Path(temp_dir, "outside")
+            tasks_dir.mkdir()
+            outside_dir.mkdir()
+            sentinel = outside_dir / "keep.txt"
+            sentinel.write_text("keep", encoding="utf-8")
+
+            with (
+                patch.object(
+                    video_controller.sm.state,
+                    "get_task",
+                    return_value=completed_task,
+                ),
+                patch.object(
+                    video_controller.utils,
+                    "task_dir",
+                    return_value=str(tasks_dir),
+                ),
+                patch.object(video_controller.shutil, "rmtree") as remove_tree,
+            ):
+                with self.assertRaises(HttpException) as raised:
+                    video_controller.delete_video(
+                        self._request(), task_id="../outside"
+                    )
+
+                self.assertIn(raised.exception.status_code, {403, 404})
+                self.assertTrue(sentinel.exists())
+                remove_tree.assert_not_called()
+
+    def test_delete_rejects_task_directory_that_resolves_to_another_task(self):
+        task_id = "11111111-1111-4111-8111-111111111111"
+        completed_task = {
+            "task_id": task_id,
+            "state": const.TASK_STATE_COMPLETE,
+            "progress": 100,
+        }
+        original_realpath = os.path.realpath
+        with tempfile.TemporaryDirectory() as temp_dir:
+            tasks_dir = Path(temp_dir, "tasks")
+            tasks_dir.mkdir()
+            listed_path = os.path.abspath(tasks_dir / task_id)
+            redirected_path = os.path.abspath(tasks_dir / "another-task")
+
+            entry = MagicMock()
+            entry.name = task_id
+            entry.path = listed_path
+            entry.is_dir.return_value = True
+            entries = MagicMock()
+            entries.__enter__.return_value = iter([entry])
+
+            def redirect_matching_entry(path):
+                absolute_path = os.path.abspath(path)
+                if os.path.normcase(absolute_path) == os.path.normcase(listed_path):
+                    return redirected_path
+                return original_realpath(path)
+
+            with (
+                patch.object(
+                    video_controller.sm.state,
+                    "get_task",
+                    return_value=completed_task,
+                ),
+                patch.object(
+                    video_controller.utils,
+                    "task_dir",
+                    return_value=str(tasks_dir),
+                ),
+                patch.object(video_controller.os, "scandir", return_value=entries),
+                patch.object(
+                    video_controller.os.path,
+                    "realpath",
+                    side_effect=redirect_matching_entry,
+                ),
+                patch.object(video_controller.shutil, "rmtree") as remove_tree,
+                patch.object(video_controller.sm.state, "delete_task") as delete_task,
+            ):
+                with self.assertRaises(HttpException) as raised:
+                    video_controller.delete_video(self._request(), task_id=task_id)
+
+        self.assertEqual(raised.exception.status_code, 403)
+        remove_tree.assert_not_called()
+        delete_task.assert_not_called()
 
     def test_get_and_delete_missing_task_return_404(self):
         """查询或删除未知任务都应返回一致的 404，而不是空成功响应。"""

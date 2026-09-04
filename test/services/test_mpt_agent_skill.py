@@ -138,10 +138,11 @@ class TestMptAgentSkill(unittest.TestCase):
     def test_existing_provider_key_is_reused_without_asking_user(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             config_path = Path(temp_dir) / "config.toml"
-            secret = "test-value"
+            configured_value = "test-value"
             config_path.write_text(
                 MINIMAL_CONFIG.replace(
-                    'deepseek_api_key = ""', f'deepseek_api_key = "{secret}"'
+                    'deepseek_api_key = ""',
+                    f'deepseek_api_key = "{configured_value}"',
                 ).replace("pexels_api_keys = []", 'pexels_api_keys = ["key"]'),
                 encoding="utf-8",
             )
@@ -157,7 +158,7 @@ class TestMptAgentSkill(unittest.TestCase):
                 'llm_provider = "deepseek"',
                 config_path.read_text(encoding="utf-8"),
             )
-            self.assertNotIn(secret, output.getvalue())
+            self.assertNotIn(configured_value, output.getvalue())
 
     def test_only_missing_pexels_key_does_not_ask_for_llm_again(self):
         output = io.StringIO()
