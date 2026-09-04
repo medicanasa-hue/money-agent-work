@@ -1,5 +1,6 @@
 import os
 import pathlib
+import re
 import shutil
 from typing import Union
 
@@ -38,6 +39,10 @@ from app.utils import file_security, utils
 # 认证依赖项
 # router = new_router(dependencies=[Depends(base.verify_token)])
 router = new_router(dependencies=[Depends(base.verify_token)])
+
+_TASK_ID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+)
 
 _enable_redis = config.app.get("enable_redis", False)
 _redis_host = config.app.get("redis_host", "localhost")
@@ -88,6 +93,17 @@ def _resolve_path_within_directory(base_dir: str, unsafe_path: str, request_id: 
             status_code=404 if str(exc) == "file does not exist" else 403,
             message=f"{request_id}: invalid file path",
         )
+
+
+def _canonical_task_id(task_id: str, request_id: str) -> str:
+    """Return the path-safe canonical form used by server-generated task IDs."""
+    if not isinstance(task_id, str) or not _TASK_ID_RE.fullmatch(task_id):
+        raise HttpException(
+            task_id=request_id,
+            status_code=404,
+            message=f"{request_id}: task not found",
+        )
+    return task_id
 
 
 def _public_task_data(task: dict) -> dict:
@@ -312,12 +328,33 @@ def delete_video(request: Request, task_id: str = Path(..., description="Task ID
                 message=f"{request_id}: task is still running",
             )
 
+        canonical_task_id = _canonical_task_id(task_id, request_id)
         tasks_dir = utils.task_dir()
-        current_task_dir = os.path.join(tasks_dir, task_id)
-        if os.path.exists(current_task_dir):
+        try:
+            current_task_dir = file_security.resolve_path_within_directory(
+                tasks_dir,
+                canonical_task_id,
+                require_file=False,
+            )
+        except ValueError as exc:
+            raise HttpException(
+                task_id=request_id,
+                status_code=403,
+                message=f"{request_id}: invalid task path",
+            ) from exc
+        expected_task_dir = os.path.abspath(
+            os.path.join(os.path.realpath(tasks_dir), canonical_task_id)
+        )
+        if os.path.normcase(current_task_dir) != os.path.normcase(expected_task_dir):
+            raise HttpException(
+                task_id=request_id,
+                status_code=403,
+                message=f"{request_id}: invalid task path",
+            )
+        if os.path.isdir(current_task_dir):
             shutil.rmtree(current_task_dir)
 
-        sm.state.delete_task(task_id)
+        sm.state.delete_task(canonical_task_id)
         logger.success(f"video deleted: {utils.to_json(task)}")
         return utils.get_response(200)
 

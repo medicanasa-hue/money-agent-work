@@ -427,28 +427,31 @@ class TestContentIntelligence(unittest.TestCase):
         self.assertEqual(len(hooks), 3)
         self.assertGreater(len(set(hooks)), 1)
 
-    def test_fallback_content_plan_includes_last_error_warning(self):
+    def test_fallback_content_plan_does_not_disclose_last_error_details(self):
+        sensitive_error = (
+            "Traceback: C:\\private\\worker.py api_key=content-sensitive-marker"
+        )
         result = content_intelligence.fallback_content_plan(
             video_subject="Voyager",
             platform="youtube_shorts",
             days=7,
             daily_count=1,
             idea_count=1,
-            last_error="content intelligence response is not a JSON object",
+            last_error=sensitive_error,
         )
 
-        self.assertTrue(
-            any(
-                "content intelligence response is not a JSON object" in warning
-                for warning in result["warnings"]
-            )
-        )
+        warnings = " ".join(result["warnings"])
+        self.assertIn("LLM planning failed", warnings)
+        self.assertNotIn(sensitive_error, warnings)
+        self.assertNotIn("content-sensitive-marker", warnings)
+        self.assertNotIn("worker.py", warnings)
 
-    def test_generate_content_plan_fallback_includes_last_error_warning(self):
+    def test_generate_content_plan_fallback_hides_provider_error_details(self):
+        sensitive_error = "Error: api_key is not set; token=provider-sensitive-marker"
         with patch.object(
             content_intelligence.llm,
             "_generate_response",
-            return_value="Error: api_key is not set",
+            return_value=sensitive_error,
         ):
             result = content_intelligence.generate_content_plan(
                 video_subject="Voyager",
@@ -459,9 +462,10 @@ class TestContentIntelligence(unittest.TestCase):
             )
 
         self.assertEqual(result["source"], "fallback")
-        self.assertTrue(
-            any("api_key is not set" in warning for warning in result["warnings"])
-        )
+        warnings = " ".join(result["warnings"])
+        self.assertIn("LLM planning failed", warnings)
+        self.assertNotIn(sensitive_error, warnings)
+        self.assertNotIn("provider-sensitive-marker", warnings)
 
     def test_generate_content_plan_stops_retrying_non_retryable_errors(self):
         with patch.object(
@@ -479,9 +483,9 @@ class TestContentIntelligence(unittest.TestCase):
 
         self.assertEqual(result["source"], "fallback")
         self.assertEqual(generate.call_count, 1)
-        self.assertTrue(
-            any("429 quota exceeded" in warning for warning in result["warnings"])
-        )
+        warnings = " ".join(result["warnings"])
+        self.assertIn("LLM planning failed", warnings)
+        self.assertNotIn("429 quota exceeded", warnings)
 
     def test_content_plan_parse_column_number_is_still_retryable(self):
         self.assertFalse(
@@ -549,6 +553,39 @@ class TestContentIntelligence(unittest.TestCase):
             "Quiet Tokyo coffee shops",
         )
         self.assertEqual(len(body["data"]["calendar"]), 7)
+
+    def test_content_intelligence_endpoint_hides_provider_exception_details(self):
+        from fastapi.testclient import TestClient
+
+        from app.asgi import app
+
+        sensitive_error = (
+            "Error: api_key is not set; Traceback C:\\private\\provider.py "
+            "token=endpoint-sensitive-marker"
+        )
+        with patch.object(
+            content_intelligence.llm,
+            "_generate_response",
+            return_value=sensitive_error,
+        ):
+            response = TestClient(app).post(
+                "/api/v1/content-intelligence",
+                json={
+                    "video_subject": "Tokyo coffee shops",
+                    "language": "en",
+                    "platform": "youtube_shorts",
+                    "days": 7,
+                    "daily_count": 1,
+                    "idea_count": 1,
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        response_text = response.text
+        self.assertIn("LLM planning failed", response_text)
+        self.assertNotIn(sensitive_error, response_text)
+        self.assertNotIn("endpoint-sensitive-marker", response_text)
+        self.assertNotIn("provider.py", response_text)
 
     def test_content_intelligence_endpoint_uses_static_trend_context(self):
         from fastapi.testclient import TestClient

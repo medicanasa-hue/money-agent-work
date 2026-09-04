@@ -8,13 +8,13 @@ from urllib.parse import urlparse
 from loguru import logger
 
 from app.services import llm, rss_trend
+from app.services.providers.utils import safe_error_details
 
 MAX_CONTENT_SUBJECT_LENGTH = 500
 MAX_CONTENT_SCRIPT_LENGTH = 8000
 MAX_CONTENT_CONTEXT_LENGTH = 500
 MAX_CONTENT_TONE_LENGTH = 128
 MAX_TREND_CONTEXT_LENGTH = 500
-MAX_FALLBACK_ERROR_WARNING_LENGTH = 300
 MAX_RAW_LLM_RESPONSE_LOG_LENGTH = 1200
 TREND_SOURCE_NONE = "none"
 TREND_SOURCE_STATIC = "static"
@@ -350,11 +350,11 @@ def _normalize_warning_items(value: Any) -> list[str]:
 
 
 def _fallback_error_warning(last_error: str = "") -> str:
-    clean_error = _clean_text(
-        last_error,
-        MAX_FALLBACK_ERROR_WARNING_LENGTH,
+    return (
+        "LLM planning failed; diagnostic details are available in server logs."
+        if bool(last_error)
+        else ""
     )
-    return f"LLM planning failed: {clean_error}" if clean_error else ""
 
 
 def _is_non_retryable_content_plan_error(error_message: str) -> bool:
@@ -763,7 +763,9 @@ def generate_content_plan(
             )
         except Exception as exc:
             last_error = str(exc)
-            logger.warning(f"failed to generate content plan: {last_error}")
+            logger.warning(
+                f"failed to generate content plan: {safe_error_details(exc)}"
+            )
             _log_raw_llm_response_excerpt(response)
             if _is_non_retryable_content_plan_error(last_error):
                 logger.warning(

@@ -9,7 +9,6 @@ import webbrowser
 from collections.abc import Mapping
 from uuid import UUID, uuid4
 
-import requests
 import streamlit as st
 from loguru import logger
 
@@ -40,6 +39,7 @@ from app.services import (
     cost_estimate,
     content_quality,
     content_intelligence,
+    groq_catalog,
     history,
     llm,
     local_material_catalog,
@@ -71,7 +71,7 @@ from app.utils.openmontage_materials import (
     validate_openmontage_output,
 )
 from app.utils.logging_utils import configure_terminal_logger
-from app.utils import file_security, utils
+from app.utils import file_security, secret_fingerprint, utils
 
 st.set_page_config(
     page_title="MoneyPrinterTurbo",
@@ -2668,11 +2668,13 @@ def _voice_preview_fingerprint(
 
 
 def _credential_signature(value: str) -> str:
-    """Hash credentials used by the preview cache without storing the secret."""
-    normalized_value = str(value or "")
-    if not normalized_value:
-        return ""
-    return hashlib.sha256(normalized_value.encode("utf-8")).hexdigest()
+    """Create a process-local opaque credential marker for preview caches."""
+    return secret_fingerprint.for_cache(value)
+
+
+def _elevenlabs_voice_catalog_cache_key(api_key: str) -> str:
+    signature = _credential_signature(api_key)
+    return f"elevenlabs_voice_catalog_{signature or 'empty'}"
 
 
 def _get_voice_preview_provider_signature(tts_server: str) -> dict:
@@ -2926,12 +2928,7 @@ def _render_tts_settings_panel(params):
         )
         if saved_elevenlabs_api_key:
             config.elevenlabs["api_key"] = saved_elevenlabs_api_key
-        api_key_fingerprint = (
-            hashlib.sha256(saved_elevenlabs_api_key.encode("utf-8")).hexdigest()[:16]
-            if saved_elevenlabs_api_key
-            else "empty"
-        )
-        cache_key = f"elevenlabs_voice_catalog_{api_key_fingerprint}"
+        cache_key = _elevenlabs_voice_catalog_cache_key(saved_elevenlabs_api_key)
         if cache_key not in st.session_state:
             st.session_state[cache_key] = voice.get_elevenlabs_voice_catalog(
                 saved_elevenlabs_api_key
@@ -9565,33 +9562,7 @@ if pending_video_preset:
 
 @st.cache_data(ttl=300, show_spinner=False)
 def get_groq_model_ids(api_key: str, base_url: str) -> list[str]:
-    if not api_key:
-        return []
-
-    normalized_base_url = (base_url or "https://api.groq.com/openai/v1").strip().rstrip("/")
-    models_url = f"{normalized_base_url}/models"
-
-    try:
-        response = requests.get(
-            models_url,
-            headers={"Authorization": f"Bearer {api_key}"},
-            timeout=10,
-        )
-        response.raise_for_status()
-        payload = response.json()
-        data = payload.get("data", [])
-
-        model_ids = []
-        for item in data:
-            if isinstance(item, dict):
-                model_id = item.get("id")
-                if isinstance(model_id, str) and model_id.strip():
-                    model_ids.append(model_id.strip())
-
-        return sorted(set(model_ids))
-    except Exception as e:
-        logger.warning(f"failed to fetch groq models: {e}")
-        return []
+    return groq_catalog.get_model_ids(api_key, base_url)
 
 
 def _render_llm_provider_settings():
