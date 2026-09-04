@@ -106,6 +106,61 @@ def _canonical_task_id(task_id: str, request_id: str) -> str:
     return task_id
 
 
+def _task_directory_from_root_listing(
+    tasks_dir: str,
+    canonical_task_id: str,
+    request_id: str,
+) -> str | None:
+    """Select a task directory from the server-owned root listing.
+
+    The returned path originates from ``os.scandir`` instead of being composed
+    from request data. Symlinks, junction redirects, and non-directory entries
+    are rejected before the recursive-delete boundary.
+    """
+    tasks_root = os.path.realpath(tasks_dir)
+    try:
+        with os.scandir(tasks_root) as entries:
+            for entry in entries:
+                if entry.name != canonical_task_id:
+                    continue
+
+                listed_path = os.path.abspath(entry.path)
+                resolved_path = os.path.realpath(listed_path)
+                is_direct_child = os.path.normcase(os.path.dirname(listed_path)) == (
+                    os.path.normcase(tasks_root)
+                )
+                stays_at_listed_path = os.path.normcase(resolved_path) == os.path.normcase(
+                    listed_path
+                )
+                if (
+                    not is_direct_child
+                    or not stays_at_listed_path
+                    or not entry.is_dir(follow_symlinks=False)
+                ):
+                    raise HttpException(
+                        task_id=request_id,
+                        status_code=403,
+                        message=f"{request_id}: invalid task path",
+                    )
+                return resolved_path
+    except FileNotFoundError:
+        return None
+    except HttpException:
+        raise
+    except OSError as exc:
+        logger.error(
+            "failed to inspect task directory, request_id: {}, error_type: {}",
+            request_id,
+            type(exc).__name__,
+        )
+        raise HttpException(
+            task_id=request_id,
+            status_code=500,
+            message=f"{request_id}: unable to inspect task files",
+        ) from exc
+    return None
+
+
 def _public_task_data(task: dict) -> dict:
     """复制任务状态并移除仅用于服务端进程协调的内部字段。"""
     public_task = dict(task)
@@ -330,28 +385,12 @@ def delete_video(request: Request, task_id: str = Path(..., description="Task ID
 
         canonical_task_id = _canonical_task_id(task_id, request_id)
         tasks_dir = utils.task_dir()
-        try:
-            current_task_dir = file_security.resolve_path_within_directory(
-                tasks_dir,
-                canonical_task_id,
-                require_file=False,
-            )
-        except ValueError as exc:
-            raise HttpException(
-                task_id=request_id,
-                status_code=403,
-                message=f"{request_id}: invalid task path",
-            ) from exc
-        expected_task_dir = os.path.abspath(
-            os.path.join(os.path.realpath(tasks_dir), canonical_task_id)
+        current_task_dir = _task_directory_from_root_listing(
+            tasks_dir,
+            canonical_task_id,
+            request_id,
         )
-        if os.path.normcase(current_task_dir) != os.path.normcase(expected_task_dir):
-            raise HttpException(
-                task_id=request_id,
-                status_code=403,
-                message=f"{request_id}: invalid task path",
-            )
-        if os.path.isdir(current_task_dir):
+        if current_task_dir is not None:
             shutil.rmtree(current_task_dir)
 
         sm.state.delete_task(canonical_task_id)
