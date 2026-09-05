@@ -7,13 +7,13 @@ from loguru import logger
 
 from app.config import config
 from app.models.schema import MaterialInfo, VideoAspect
+from app.services import material_cache
 
 from .base import VideoProvider
 from .utils import (
     get_api_key,
     get_search_page,
     get_tls_verify,
-    raise_for_http_error,
     safe_error_details,
     select_best_video_variant,
 )
@@ -51,14 +51,13 @@ class PixabayProvider(VideoProvider):
         logger.info("[pixabay] searching videos")
 
         try:
-            r = requests.get(
+            response = material_cache.get_search_json(
                 query_url,
+                items_key="hits", request_get=requests.get,
                 proxies=config.proxy,
                 verify=get_tls_verify(),
                 timeout=(30, 60),
             )
-            raise_for_http_error(r)
-            response = r.json()
             video_items: List[MaterialInfo] = []
 
             if "hits" not in response:

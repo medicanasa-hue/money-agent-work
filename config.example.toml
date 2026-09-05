@@ -423,6 +423,10 @@ max_material_duration = 180
 # Increase to 2-5 to let Pexels/Pixabay/Coverr sample different result pages.
 # Higher values may improve variety, but can use more API quota or return fewer matches.
 material_search_max_page = 1
+# Reuse successful Pexels/Pixabay video search responses in this process.
+# 24h TTL, at most 64 entries / 1 MiB each; no disk persistence.
+# Actual page, credentials, proxy and TLS settings remain separate cache keys.
+material_search_cache_enabled = true
 # Optional per-source overrides. Uncomment only when you want source-specific behavior.
 # pexels_search_max_page = 1
 # pixabay_search_max_page = 1

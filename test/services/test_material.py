@@ -10,6 +10,7 @@ from unittest.mock import Mock, patch
 
 import requests
 import numpy as np
+import pytest
 from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
@@ -36,6 +37,14 @@ from app.services.providers.vecteezy import (
 )
 from app.services.providers.wikimedia import WikimediaProvider
 from app.services.providers import utils as provider_utils
+
+
+@pytest.fixture(autouse=True)
+def disable_search_cache_for_provider_unit_tests():
+    # These tests isolate individual HTTP/parsing behavior. Cache reuse is
+    # exercised separately with real cache state in test_material_search_cache*.
+    with patch.dict(config.app, {"material_search_cache_enabled": False}):
+        yield
 
 
 class TestMaterialTlsVerification(unittest.TestCase):
