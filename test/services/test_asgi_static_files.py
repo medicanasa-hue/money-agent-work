@@ -126,7 +126,7 @@ class TestTaskStaticFiles(unittest.TestCase):
         self.assertEqual(response.status_code, 500)
         self.assertNotIn(b"0123456789", response.content)
 
-    def test_docs_and_cors_preflight_do_not_require_task_key(self):
+    def test_docs_remain_public_but_untrusted_cors_preflight_is_rejected(self):
         with patch.object(asgi.config, "app", {"api_key": "secret"}):
             docs = self.client.get("/docs")
             preflight = self.client.options(
@@ -139,9 +139,8 @@ class TestTaskStaticFiles(unittest.TestCase):
             )
 
         self.assertEqual(docs.status_code, 200)
-        # CORS may reject an origin; API authentication must not reject preflight.
-        self.assertIn(preflight.status_code, (200, 400))
-        self.assertIn("access-control-allow-methods", preflight.headers)
+        self.assertEqual(preflight.status_code, 403)
+        self.assertNotIn("access-control-allow-origin", preflight.headers)
 
 
 if __name__ == "__main__":

@@ -298,6 +298,12 @@ Open your browser and visit http://127.0.0.1:8501
 
 Open your browser and visit http://127.0.0.1:8080/docs or http://127.0.0.1:8080/redoc
 
+> Browser API access follows the same-origin policy by default. Set
+> `CORS_ALLOWED_ORIGINS` only when a separate browser frontend must call the API
+> from another trusted origin, for example
+> `http://localhost:3000,https://frontend.example.com`. Server-side clients such
+> as curl, Postman, and n8n are unaffected.
+
 ### Manual Deployment 📦
 
 #### ① Create a Python Virtual Environment

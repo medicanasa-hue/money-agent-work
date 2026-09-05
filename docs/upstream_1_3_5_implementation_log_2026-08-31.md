@@ -2,7 +2,7 @@
 
 Tarih: 31 Ağustos 2026. [Ana plan](upstream_1_3_5_student_pack_ai_plan_2026-08-31.md).
 
-**Durum:** A güvenlik işleri ve B grubundaki öncelikli düzeltmeler yerel entegrasyon dalına uygulandı. Bu, bütün v1.3.5/main özelliklerinin taşındığı veya dağıtıma hazır bir sürüm olduğu anlamına gelmiyor. Sürüm etiketi bu nedenle değiştirilmedi. Docker doğrulaması, genel coverage eşiği ve aşağıdaki kalan işler açık.
+**Güncel durum — 5 Eylül:** A/B öncelikli entegrasyonu ve takip güvenlik düzeltmeleri GitHub varsayılan dalına alındı. `08b9a7c` üzerinde CI, CodeQL, ağsız Docker kabulü ve kilitli bağımlılık denetimi geçti. İmaj yayımlanmadı. Genel coverage %72; %80 hedefi, C1–C4, GPU kabulü ve canlı veriyle geçiş/geri dönüş işleri açık. Aşağıdaki tarihli bölümler yapıldıkları andaki durumu kaydeder; tüm v1.3.5/main davranışlarının alındığı veya ana yerel çalışma kopyasının güncellendiği iddia edilmiyor.
 
 ## Korunan çalışma
 
@@ -632,3 +632,51 @@ helper'a taşındı. Dört yeni test önce eski uygulamada birlikte başarısız
 sonra declared-size ve streamed-size yollarında geçti. Bu ek sertleştirmeden
 sonraki yerel tam CI eşdeğeri **1.544 geçti / 13 atlandı / 3 mevcut uyarı / 12.341
 subtest**, toplam branch coverage ise yuvarlanmış **%72** oldu.
+
+## GitHub kabulü ve v1.3.6 takip düzeltmeleri — 5 Eylül
+
+Entegrasyon ve [güvenlik PR #14](https://github.com/medicanasa-hue/money-agent-work/pull/14)
+varsayılan dala alındı. GitPython 3.1.61, python-multipart 0.0.32,
+requests 2.34.2, Docker uv 0.12.9 ve Docker Actions güncellemeleri de birleşti.
+Python 3.14 Docker tabanı ayrı runtime uyumluluk çalışmasına ertelendi.
+
+`08b9a7cf6a3bc53d15b3762fbdf7204c1a38ea65` üzerinde
+[CI](https://github.com/medicanasa-hue/money-agent-work/actions/runs/33884670650),
+[CodeQL](https://github.com/medicanasa-hue/money-agent-work/actions/runs/33884670643),
+[ağsız Docker kabulü](https://github.com/medicanasa-hue/money-agent-work/actions/runs/33884718513)
+ve [kilitli bağımlılık denetimi](https://github.com/medicanasa-hue/money-agent-work/actions/runs/33885119957)
+başarılı. Docker koşusunda `publish=false`, yayın işi atlandı. Bu kabul
+anında açık PR, CodeQL, Dependabot ve secret-scanning kayıtlarının sayısı sıfırdı;
+bu sayılar ayrıca uygulama açığı bulunamayacağı anlamına gelmez.
+
+Yeni upstream [v1.3.6](https://github.com/harry0703/MoneyPrinterTurbo/releases/tag/v1.3.6)
+2 Eylül'de yayımlandı. Sesin gerçek süresi, SiliconFlow son cue, mevcut TTS
+handle kapanışı, senaryo regex'i, Windows Unicode ve API indirme header'ı
+zaten yerel mimariye uyarlanmıştı. CORS'un loopback varsayılanı ve aktif
+Origin reddi ise eksikti; bunu yalnız network host için boş CORS listesiyle
+aynı davranış saymak doğru değil.
+
+### CORS / Origin sınırı
+
+[Upstream 373ec46](https://github.com/harry0703/MoneyPrinterTurbo/commit/373ec466485b8524abb98196154f0c7686bcfc15),
+GHSA-j455-rq5m-m3m6 düzeltmesi `codex/harden-v136-browser-origin` dalında
+uyarlandı. Boş `CORS_ALLOWED_ORIGINS` tüm dinleme adreslerinde aynı-origin
+varsayılanını kullanır. Güvenilmeyen Origin taşıyan basit multipart istekleri
+upload handler'ına ulaşmadan 403 alır. Aynı-origin ve Origin göndermeyen
+istemciler çalışmaya devam eder. Açık allowlist güvenilen tarayıcı frontend'ine
+izin verir; wildcard credentials ve Private Network Access izni açmaz.
+Anahtar kontrolü ve task dosyası sınırı ayrıca korunur.
+
+Yedi davranış testi önce eksik korumada başarısız oldu, ardından geçti.
+Tam yerel paket: **1.566 geçti / 14 atlandı / 12.346 subtest**, toplam coverage
+**%72**, ASGI **%97**. Bağımsız incelemenin bulduğu ret günlüğü kontrol-karakter
+riski için ek test önce başarısız oldu; istemciden gelen metin yerine sabit
+uyarıyla düzeltildi. Bu son değişiklik sonrası güvenlik paketi **37 geçti /
+3 platform skip / 19 subtest**. Tam paket bu günlük düzeltmesinden önce ölçüldü;
+son PR commit'i GitHub CI'da yeniden doğrulanacak. Ruff ve compile kontrolü
+geçti; kurulu bağımlılık taraması bilinen açık bulmadı.
+
+Sıradaki doğrulanmış eksik küçük hata: upstream `c88e864` parolasız Redis
+URL'sinden auth bölümünü kaldırıyor. C1 arama cache'i ve C2–C4 işleri ayrı
+dilimler olarak açık. Yeni ücretli video sağlayıcıları, tüm v1.3.6 özellikleri
+ve release sonrasındaki altyazı animasyonları bu CORS düzeltmesine dahil değil.

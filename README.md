@@ -295,6 +295,11 @@ docker compose -f docker-compose.release.yml up -d
 
 打开浏览器，访问 http://127.0.0.1:8080/docs 或者 http://127.0.0.1:8080/redoc
 
+> 浏览器调用 API 默认遵循同源策略。只有独立网页前端需要从其他可信来源直接调用 API
+> 时，才应设置 `CORS_ALLOWED_ORIGINS`，例如
+> `http://localhost:3000,https://frontend.example.com`。curl、Postman、n8n
+> 等服务端客户端不受影响。
+
 ### 手动部署 📦
 
 > 视频教程
