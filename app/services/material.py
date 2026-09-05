@@ -33,7 +33,7 @@ from PIL import Image
 
 from app.config import config
 from app.models.schema import MaterialInfo, VideoAspect, VideoConcatMode
-from app.services import review_feedback, video_cooldown
+from app.services import material_cache, review_feedback, video_cooldown
 from app.services.providers.utils import (
     get_search_page,
     raise_for_http_error,
@@ -340,12 +340,12 @@ def search_videos_pexels(
     query_url = f"https://api.pexels.com/videos/search?{urlencode(params)}"
     logger.info("[pexels] searching videos")
     try:
-        r = requests.get(
-            query_url, headers=headers, proxies=config.proxy,
+        response = material_cache.get_search_json(
+            query_url,
+            items_key="videos", request_get=requests.get,
+            headers=headers, proxies=config.proxy,
             verify=_get_tls_verify(), timeout=(30, 60),
         )
-        raise_for_http_error(r)
-        response = r.json()
         video_items = []
         if "videos" not in response:
             logger.error("[pexels] search returned unexpected response")
@@ -394,12 +394,12 @@ def search_videos_pixabay(
     query_url = f"https://pixabay.com/api/videos/?{urlencode(params)}"
     logger.info("[pixabay] searching videos")
     try:
-        r = requests.get(
-            query_url, proxies=config.proxy,
+        response = material_cache.get_search_json(
+            query_url,
+            items_key="hits", request_get=requests.get,
+            proxies=config.proxy,
             verify=_get_tls_verify(), timeout=(30, 60),
         )
-        raise_for_http_error(r)
-        response = r.json()
         video_items = []
         if "hits" not in response:
             logger.error("[pixabay] search returned unexpected response")

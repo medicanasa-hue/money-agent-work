@@ -704,3 +704,51 @@ ve ASGI paketi **70 geçti / 3 platform skip / 56 subtest**. Ruff, compile ve
 kurulu bağımlılık denetimi geçti. Birleşik tam paket GitHub PR kontrollerinde
 yeniden çalıştırılacak; yerel %72 ölçümü hedeflenen %80'in tamamlandığı anlamına
 gelmez. Kullanıcı yapılandırması, parolaları ve ana çalışma klasörü değiştirilmedi.
+
+## C1a — Pexels/Pixabay video arama önbelleği — 5 Eylül
+
+Önceki paketin [Redis PR #16](https://github.com/medicanasa-hue/money-agent-work/pull/16)
+birleşimi `c72afa8` üzerinde [CI](https://github.com/medicanasa-hue/money-agent-work/actions/runs/33934519612)
+ve [CodeQL](https://github.com/medicanasa-hue/money-agent-work/actions/runs/33934519650)
+geçti. Linux PR kontrollerinde 1.577, Windows'ta 1.575 test başarılıydı.
+
+### Kapsam ve kabul planı
+
+C1'i küçük sağlayıcı bağlantıları olarak uyguluyoruz. İlk dilim, Pexels ve
+Pixabay'ın tek kaynak ve çok kaynak video aramalarında ham JSON yanıtlarını
+önbelleğe alır. Süre/en-boy filtreleri ve MaterialInfo dönüşümü her çağrıda
+yeniden çalışır; görevlerin sonradan değiştirdiği puan ve etiketler taşınmaz.
+Seçilmiş gerçek sayfa, URL/parametreler, hesap, proxy ve TLS ayarı aynı isteğin
+kimliğine dahildir. İstek kimliği yalnız SHA-256 özeti olarak tutulur.
+
+Önceki ayrı `material-search-cache` çalışma kopyasında kalan disk taslağı
+değiştirilmedi. Bu dilimde süreç içi bellek kullanılır: 24 saat TTL, en fazla
+64 kayıt ve kayıt başına 1 MiB JSON. Uygulama yeniden başlatılınca önbellek
+boşalır; diske sorgu/anahtar yazılmaz. `material_search_cache_enabled=false`
+okuma ve yazmayı kapatır. Fotoğraflar, Coverr ve diğer sağlayıcılar, kalıcı disk
+önbelleği ve C2–C4 bu dilime dahil değildir.
+
+1. Çekirdek: süre/boyut sınırı, kopya izolasyonu ve eşzamanlı aynı isteği
+   birleştirme için önce başarısız testler, sonra uygulama.
+2. Bağlantı: dört gerçek video arama yolu; tekrarlı istek, sayfa seçimi,
+   filtrelerin yeniden çalışması ve kaldırılmış anahtar için ağsız testler.
+3. Kabul: tam yerel paket, coverage, Ruff/compile, bağımlılık denetimi,
+   bağımsız inceleme ve GitHub CI/CodeQL. Boş/bozuk/başarısız yanıtlar
+   önbelleğe alınmaz; sonraki arama uzak sağlayıcıyı yeniden deneyebilir.
+
+### Yerel kabul
+
+Çekirdek için 20 test önce eksik API nedeniyle başarısız oldu. Çekirdek
+uygulandıktan sonra dört bağlantıyı kapsayan sekiz davranış testi, beklenen
+tek istek yerine üç istek gözleyerek başarısız oldu; HTTP noktaları bağlanınca
+hepsi geçti. İlgili mevcut sağlayıcı testleriyle **243 test / 78 subtest**
+başarılı. Tam paket **1.601 geçti / 14 atlandı / 7 mevcut uyarı / 12.392
+subtest**, yeni önbellek modülü branch coverage **%96**.
+
+Bağımsız inceleme engelleyici bulgu bildirmedi. Önerilen eşzamanlılık testinde
+ilk yanıt, sekiz çağrının tamamı cache miss gördükten sonra serbest bırakılıyor;
+böylece anında tamamlanan sahte HTTP'nin yarış durumunu gizlemesi önlendi.
+Bu yalnız-test iyileştirmesinden sonra **30 önbellek testi / 37 subtest** geçti.
+Ruff, compile ve kurulu bağımlılık denetimi başarılı; yeni paket eklenmedi.
+Ana çalışma klasöründe başlangıçtaki 30 dosyanın SHA-256 kontrolü yine 30/30.
+Son PR commit'inin birleşik GitHub kontrolleri ayrıca beklenecek.

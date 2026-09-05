@@ -457,7 +457,7 @@ Her satır bir küçük iş veya açıkça ayrılmış alt iş ailesidir. Hedef 
 
 | İş | Kabul ölçütü ve doğrulama | Bağımlılık / muhtemel dosyalar |
 |---|---|---|
-| C1: Arama cache'i | Aynı sorgu gereksiz tekrar çağrılmaz, kaynak/parametre/TTL ayrımı doğru. `test_material` + yeni cache testi. | B; yeni `material_cache.py`, `material.py`, iki test; provider bağlantıları ayrı küçük işler. |
+| C1: Arama cache'i — C1a yerelde tamamlandı | Pexels/Pixabay tek/çok kaynak video aramasında sayfa, hesap, proxy ve TLS ayrımı olan 24 saatlik süreç içi önbellek; filtreleme yeniden çalışır. Yeni modül kapsamı %96; tam yerel suite 1.601 geçti. | Diğer sağlayıcılar/fotoğraflar ve kalıcı disk cache'i ayrı işler olarak açık. Ayrıntılar uygulama kaydının C1a bölümünde; GitHub kabulü PR'da izlenir. |
 | C2: Kaynak manifesti | Yerel lisans/atıf bilgileri ve sanitize provenance tek şemada korunur. `test_material`, `test_task`. | C1; task artifacts yardımcı modülü, material/task bağlantısı ve testler ayrı dilimler. |
 | C3: Preset kalıcılığı | Eski preset açılır; varsayılan export secrets içermez. `test_presets` ve UI testleri. | B5a; `presets.py`, `Main.py`, iki test. Ertelenen ElevenLabs B5b işi engel değildir. |
 | C4: Sosyal açıklamalar | Platform metni üretilir ama inceleme/disclosure/attribution atlanmaz. `test_llm`, `test_upload_disclosure_review`. | C2; `llm/social.py`, task bağlantısı ve testler. |

@@ -76,6 +76,14 @@ authentication and that configured passwords survive URL encoding unchanged:
 uv run --no-sync python -m pytest -q test/services/test_controller_video.py -k RedisConnection
 ```
 
+Pexels/Pixabay video search-cache regressions use fake HTTP responses and no API
+keys or external calls. They verify page/credential/TLS separation, bounded TTL
+storage, independent result objects and filtering after cache hits:
+
+```bash
+uv run --no-sync python -m pytest -q test/services/test_material_search_cache.py test/services/test_material_search_cache_integration.py
+```
+
 ## Docker Runtime Acceptance
 
 The CPU image installs runtime packages from `uv.lock` with `uv sync --locked
