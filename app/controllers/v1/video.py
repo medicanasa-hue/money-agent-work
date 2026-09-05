@@ -3,6 +3,7 @@ import pathlib
 import re
 import shutil
 from typing import Union
+from urllib.parse import quote
 
 from fastapi import BackgroundTasks, Depends, Path, Query, Request, UploadFile
 from fastapi.params import File
@@ -44,6 +45,13 @@ _TASK_ID_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
 )
 
+
+def _build_redis_url(host: str, port: int, db: int, password: str | None) -> str:
+    """Omit absent credentials and preserve configured passwords as URL data."""
+    auth = f":{quote(password, safe='')}@" if password else ""
+    return f"redis://{auth}{host}:{port}/{db}"
+
+
 _enable_redis = config.app.get("enable_redis", False)
 _redis_host = config.app.get("redis_host", "localhost")
 _redis_port = config.app.get("redis_port", 6379)
@@ -52,7 +60,7 @@ _redis_password = config.app.get("redis_password", None)
 _max_concurrent_tasks = config.app.get("max_concurrent_tasks", 5)
 _max_queued_tasks = config.app.get("max_queued_tasks", 100)
 
-redis_url = f"redis://:{_redis_password}@{_redis_host}:{_redis_port}/{_redis_db}"
+redis_url = _build_redis_url(_redis_host, _redis_port, _redis_db, _redis_password)
 # 根据配置选择合适的任务管理器
 if _enable_redis:
     task_manager = RedisTaskManager(

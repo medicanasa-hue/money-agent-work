@@ -1,5 +1,6 @@
 import asyncio
 import os
+import runpy
 import shutil
 import tempfile
 import unittest
@@ -7,6 +8,8 @@ from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
+
+from redis.connection import parse_url
 
 from app.config import config
 from app.controllers.manager.base_manager import TaskQueueFullError
@@ -17,6 +20,66 @@ from app.models.schema import TaskListResponse, TaskQueryResponse, TaskVideoRequ
 from app.services import material_upload
 from app.services import state as sm
 from app.utils import utils
+
+
+class TestRedisConnectionConfiguration(unittest.TestCase):
+    def test_redis_url_omits_authentication_for_missing_or_empty_password(self):
+        for password in (None, ""):
+            with self.subTest(password=password):
+                url = video_controller._build_redis_url("localhost", 6379, 0, password)
+                self.assertEqual(url, "redis://localhost:6379/0")
+                self.assertNotIn("password", parse_url(url))
+
+    def test_redis_url_preserves_password_and_connection_fields(self):
+        for password in ("fixture-value", "None", " ", "fixture@:/?#%+&= şifre"):
+            with self.subTest(password=password):
+                url = video_controller._build_redis_url("redis.example", 6380, 4, password)
+                self.assertEqual(
+                    parse_url(url),
+                    {"host": "redis.example", "port": 6380, "db": 4, "password": password},
+                )
+
+    def test_controller_initializes_redis_without_authentication(self):
+        for password_config in ({}, {"redis_password": None}, {"redis_password": ""}):
+            with self.subTest(password_config=password_config):
+                manager = self._initialize_controller(password_config)
+                self.assertNotIn(
+                    "password", manager.redis_client.connection_pool.connection_kwargs
+                )
+
+    def test_controller_initializes_redis_with_exact_password(self):
+        fixture_value = "fixture@:/?#%+&= şifre"
+        manager = self._initialize_controller({"redis_password": fixture_value})
+        self.assertEqual(
+            manager.redis_client.connection_pool.connection_kwargs["password"],
+            fixture_value,
+        )
+
+    def _initialize_controller(self, password_config):
+        settings = {
+            "enable_redis": True,
+            "redis_host": "redis.example",
+            "redis_port": 6380,
+            "redis_db": 4,
+            "max_concurrent_tasks": 2,
+            "max_queued_tasks": 7,
+            **password_config,
+        }
+        # A fresh namespace exercises startup without replacing the controller
+        # used by other tests. Redis constructs its pool without opening sockets.
+        with patch.object(config, "app", settings):
+            controller = runpy.run_path(video_controller.__file__)
+        manager = controller["task_manager"]
+        self.addCleanup(manager.redis_client.close)
+        self.assertIsInstance(manager, video_controller.RedisTaskManager)
+        self.assertEqual(manager.max_concurrent_tasks, 2)
+        self.assertEqual(manager.max_queued_tasks, 7)
+        connection = manager.redis_client.connection_pool.connection_kwargs
+        self.assertEqual(
+            (connection["host"], connection["port"], connection["db"]),
+            ("redis.example", 6380, 4),
+        )
+        return manager
 
 
 class TestVideoControllerHelpers(unittest.TestCase):

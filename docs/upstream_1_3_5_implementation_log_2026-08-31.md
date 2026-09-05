@@ -680,3 +680,27 @@ Sıradaki doğrulanmış eksik küçük hata: upstream `c88e864` parolasız Redi
 URL'sinden auth bölümünü kaldırıyor. C1 arama cache'i ve C2–C4 işleri ayrı
 dilimler olarak açık. Yeni ücretli video sağlayıcıları, tüm v1.3.6 özellikleri
 ve release sonrasındaki altyazı animasyonları bu CORS düzeltmesine dahil değil.
+
+### CORS kabulü ve Redis bağlantı düzeltmesi
+
+[PR #15](https://github.com/medicanasa-hue/money-agent-work/pull/15), son commit
+`fef81f2681ba1d4e990d902c5fefe77d837f1a73` için Linux Python 3.11/3.13,
+Windows ve iki CodeQL kontrolü geçtikten sonra `2af6822` ile birleştirildi.
+[CI koşusu](https://github.com/medicanasa-hue/money-agent-work/actions/runs/33932865721)
+ve [CodeQL koşusu](https://github.com/medicanasa-hue/money-agent-work/actions/runs/33932865707)
+bu kabulün kayıtlarıdır.
+
+[Upstream c88e864](https://github.com/harry0703/MoneyPrinterTurbo/commit/c88e864a0d3e1cddfba6604a62b2c9a039882d35)
+uyarlaması, eksik veya boş Redis parolasında URL'nin auth bölümünü kaldırıyor.
+Gerçek bir parola varsa URL ayırıcıları ve Unicode karakterleri yüzde kodlamasıyla
+korunuyor; `None` metni veya boşluk gibi bilerek ayarlanmış değerler değiştirilmez.
+Gerçek sunucuya bağlanmadan RedisTaskManager başlangıcını ve redis-py bağlantı
+havuzunu denetleyen regresyon testleri önce eski hatayı üretti, sonra geçti.
+
+Redis değişikliğinin CORS öncesi tabanda tam yerel paketi **1.566 geçti /
+14 atlandı / 12.355 subtest**, toplam coverage **%72**. CORS'un birleşmiş
+tabanına taşındıktan sonra birlikte çalışmayı doğrulayan controller, task manager
+ve ASGI paketi **70 geçti / 3 platform skip / 56 subtest**. Ruff, compile ve
+kurulu bağımlılık denetimi geçti. Birleşik tam paket GitHub PR kontrollerinde
+yeniden çalıştırılacak; yerel %72 ölçümü hedeflenen %80'in tamamlandığı anlamına
+gelmez. Kullanıcı yapılandırması, parolaları ve ana çalışma klasörü değiştirilmedi.
