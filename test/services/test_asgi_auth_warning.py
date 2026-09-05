@@ -5,7 +5,6 @@ from unittest.mock import patch
 
 from app.asgi import (
     TaskOutputStaticFiles,
-    cors_configuration,
     should_protect_task_outputs,
     warn_if_api_unprotected,
 )
@@ -23,32 +22,6 @@ class TestAsgiAuthWarning(unittest.TestCase):
 
     def test_does_not_warn_when_api_key_is_set(self):
         self.assertIsNone(warn_if_api_unprotected("secret", "0.0.0.0"))
-
-    def test_local_cors_allows_local_tools_without_browser_credentials(self):
-        origins, allow_credentials = cors_configuration("127.0.0.1", "")
-
-        self.assertEqual(origins, ["*"])
-        self.assertFalse(allow_credentials)
-
-    def test_network_cors_requires_explicit_origins(self):
-        origins, allow_credentials = cors_configuration("0.0.0.0", "")
-
-        self.assertEqual(origins, [])
-        self.assertFalse(allow_credentials)
-
-    def test_explicit_cors_origins_can_use_credentials_but_wildcard_cannot(self):
-        origins, allow_credentials = cors_configuration(
-            "0.0.0.0", " https://editor.example.test , https://review.example.test "
-        )
-        self.assertEqual(
-            origins,
-            ["https://editor.example.test", "https://review.example.test"],
-        )
-        self.assertTrue(allow_credentials)
-
-        wildcard_origins, wildcard_credentials = cors_configuration("0.0.0.0", "*")
-        self.assertEqual(wildcard_origins, ["*"])
-        self.assertFalse(wildcard_credentials)
 
     def test_task_files_are_protected_on_all_hosts_when_a_key_is_configured(self):
         self.assertFalse(should_protect_task_outputs("", "0.0.0.0"))

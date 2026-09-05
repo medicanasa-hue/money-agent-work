@@ -3,6 +3,7 @@
 import ipaddress
 import os
 from contextlib import asynccontextmanager
+from urllib.parse import urlsplit
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
@@ -74,20 +75,80 @@ def warn_if_api_unprotected(api_key: str | None, listen_host: str | None) -> str
     )
 
 
-def cors_configuration(
-    listen_host: str | None, configured_origins: str | None
-) -> tuple[list[str], bool]:
-    """Use explicit browser origins for network hosts and safe local defaults."""
-    origins = [
+def parse_cors_allowed_origins(raw_origins: str | None) -> list[str]:
+    """Parse the explicit browser cross-origin allowlist."""
+    if not raw_origins:
+        return []
+    return [
         origin.strip()
-        for origin in str(configured_origins or "").split(",")
+        for origin in raw_origins.split(",")
         if origin.strip()
     ]
-    if origins:
-        return origins, "*" not in origins
-    if _is_loopback_host(listen_host):
-        return ["*"], False
-    return [], False
+
+
+def configure_cors(instance: FastAPI, allowed_origins: list[str]) -> None:
+    """Configure CORS only when cross-origin browser access is explicit."""
+    if not allowed_origins:
+        logger.info(
+            "browser cross-origin API access is disabled; set "
+            "CORS_ALLOWED_ORIGINS to enable trusted origins"
+        )
+        return
+
+    allow_all_origins = "*" in allowed_origins
+    configured_api_key = config.app.get("api_key", "")
+    if allow_all_origins and configured_api_key in (None, ""):
+        logger.warning(
+            "CORS allows every browser origin while API key authentication is "
+            "disabled; configure app.api_key or restrict CORS_ALLOWED_ORIGINS"
+        )
+
+    instance.add_middleware(
+        CORSMiddleware,
+        allow_origins=allowed_origins,
+        allow_credentials=not allow_all_origins,
+        allow_methods=["*"],
+        allow_headers=["*"],
+        allow_private_network=not allow_all_origins,
+    )
+
+
+def is_browser_origin_allowed(
+    request: Request, allowed_origins: list[str]
+) -> bool:
+    """Allow server clients, same-origin browsers, and explicit origins."""
+    origin = request.headers.get("origin")
+    if not origin:
+        return True
+    if "*" in allowed_origins or origin in allowed_origins:
+        return True
+
+    request_url = urlsplit(str(request.url))
+    request_origin = f"{request_url.scheme}://{request_url.netloc}"
+    return origin == request_origin
+
+
+def configure_browser_access(
+    instance: FastAPI, allowed_origins: list[str]
+) -> None:
+    """Reject untrusted browser origins and add CORS for trusted origins."""
+
+    @instance.middleware("http")
+    async def reject_untrusted_browser_origin(request: Request, call_next):
+        if not is_browser_origin_allowed(request, allowed_origins):
+            logger.warning("blocked untrusted browser origin")
+            return JSONResponse(
+                status_code=403,
+                content=utils.get_response(
+                    status=403,
+                    message="cross-origin browser request is not allowed",
+                ),
+            )
+        return await call_next(request)
+
+    # Register CORS last so trusted preflights are handled before the active
+    # Origin guard. Simple cross-origin requests still pass through the guard.
+    configure_cors(instance, allowed_origins)
 
 
 def should_protect_task_outputs(api_key: str | None, listen_host: str | None) -> bool:
@@ -137,19 +198,10 @@ def get_application() -> FastAPI:
 
 app = get_application()
 
-# Configures the CORS middleware for the FastAPI app
-cors_allowed_origins_str = os.getenv("CORS_ALLOWED_ORIGINS", "")
-origins, cors_allow_credentials = cors_configuration(
-    config.listen_host,
-    cors_allowed_origins_str,
+cors_allowed_origins = parse_cors_allowed_origins(
+    os.getenv("CORS_ALLOWED_ORIGINS", "")
 )
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=origins,
-    allow_credentials=cors_allow_credentials,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+configure_browser_access(app, cors_allowed_origins)
 
 task_dir = utils.task_dir()
 app.mount(
