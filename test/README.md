@@ -68,6 +68,14 @@ above do not isolate those filesystem reads.
 Symbolic-link boundary tests may skip on Windows without symlink privileges.
 These skips should still be covered by Linux CI.
 
+Redis URL regressions run without a Redis server. The controller tests construct
+real redis-py connection pools to verify that an absent/empty password sends no
+authentication and that configured passwords survive URL encoding unchanged:
+
+```bash
+uv run --no-sync python -m pytest -q test/services/test_controller_video.py -k RedisConnection
+```
+
 ## Docker Runtime Acceptance
 
 The CPU image installs runtime packages from `uv.lock` with `uv sync --locked
